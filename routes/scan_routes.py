@@ -233,7 +233,7 @@ async def receive_scan_results(
     # Log activity
     await log_activity(
         db, user_id, 'scan_completed', 'repository', repo_id,
-        details=f"Found {vuln_count} vulnerabilities"
+        details={"message": f"Found {vuln_count} vulnerabilities", "vulnerability_count": vuln_count, "severity_counts": severity_counts}
     )
     
     # Store notification for real-time delivery

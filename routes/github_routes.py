@@ -945,18 +945,28 @@ async def refresh_repository_secrets(
         # Get repository info to get default branch
         repo_info = await service.get_repository_info(owner, repo_name)
         default_branch = repo_info.get("default_branch", "main")
+        logger.info(f"Default branch for {owner}/{repo_name}: {default_branch}")
         
         # Re-inject secrets
         token_result = await service.inject_repository_secret(
             owner, repo_name, "FIXORA_API_TOKEN", api_token
         )
+        logger.info(f"Token secret injection result: {token_result}")
         
         url_result = await service.inject_repository_secret(
             owner, repo_name, "FIXORA_API_URL", api_url
         )
+        logger.info(f"URL secret injection result: {url_result}")
         
         # Also push/update the workflow file to default branch
         workflow_result = await service.push_workflow_file(owner, repo_name, default_branch)
+        logger.info(f"Workflow file push result: {workflow_result}")
+        
+        if not workflow_result:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to push workflow file to default branch"
+            )
         
         if not (token_result and url_result):
             raise HTTPException(
