@@ -891,3 +891,92 @@ async def get_repository_commits(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
+
+@router.post('/repos/{repo_id}/refresh-secrets')
+async def refresh_repository_secrets(
+    repo_id: str,
+    current_user: TokenData = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """Re-inject GitHub secrets with updated backend URL"""
+    # Get repository
+    repo = await db.repositories.find_one({
+        "id": repo_id,
+        "user_id": current_user.user_id
+    })
+    
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Repository not found"
+        )
+    
+    # Get GitHub connection
+    connection = await db.github_connections.find_one({"user_id": current_user.user_id})
+    
+    if not connection:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="GitHub not connected"
+        )
+    
+    full_name = repo.get("full_name", "")
+    if "/" not in full_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid repository format"
+        )
+    
+    owner, repo_name = full_name.split("/", 1)
+    
+    try:
+        service = GitHubScanService(connection["access_token"])
+        
+        # Get current API token or generate new one
+        api_token = repo.get("scan_api_token")
+        if not api_token:
+            api_token = generate_repo_api_token(repo_id, current_user.user_id)
+        
+        # Get backend URL from settings
+        api_url = settings.backend_url or "http://localhost:8000"
+        
+        logger.info(f"Refreshing secrets for {owner}/{repo_name} with URL: {api_url}")
+        
+        # Re-inject secrets
+        token_result = await service.inject_repository_secret(
+            owner, repo_name, "FIXORA_API_TOKEN", api_token
+        )
+        
+        url_result = await service.inject_repository_secret(
+            owner, repo_name, "FIXORA_API_URL", api_url
+        )
+        
+        if not (token_result and url_result):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to inject one or more secrets"
+            )
+        
+        # Update repository record
+        await db.repositories.update_one(
+            {"id": repo_id},
+            {"$set": {
+                "scan_api_token": api_token,
+                "secrets_updated_at": datetime.now().isoformat()
+            }}
+        )
+        
+        return {
+            "success": True,
+            "message": f"Secrets refreshed successfully with URL: {api_url}",
+            "api_url": api_url
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to refresh secrets: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
