@@ -21,6 +21,8 @@ WORKFLOW_FILE_PATH = ".github/workflows/fixora-scan.yml"
 WORKFLOW_TEMPLATE = '''name: Fixora Security Scan
 
 on:
+  repository_dispatch:
+    types: [fixora-scan]
   workflow_dispatch:
     inputs:
       scan_mode:
@@ -50,7 +52,7 @@ jobs:
       - name: Checkout target branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.target_branch }}
+          ref: ${{ github.event.client_payload.target_branch || github.event.inputs.target_branch }}
           fetch-depth: 0
 
       - name: Setup Python
@@ -62,14 +64,15 @@ jobs:
         run: pip install semgrep
 
       - name: Run Semgrep Scan (Full)
-        if: ${{ github.event.inputs.scan_mode == 'full' }}
+        if: ${{ (github.event.client_payload.scan_mode || github.event.inputs.scan_mode) == 'full' }}
         run: |
           semgrep scan --config auto --json --output semgrep-results.json . || true
 
       - name: Run Semgrep Scan (Diff)
-        if: ${{ github.event.inputs.scan_mode == 'diff' && github.event.inputs.base_commit != '' }}
+        if: ${{ (github.event.client_payload.scan_mode || github.event.inputs.scan_mode) == 'diff' && (github.event.client_payload.base_commit || github.event.inputs.base_commit) != '' }}
         run: |
-          git diff --name-only ${{ github.event.inputs.base_commit }} HEAD > changed_files.txt
+          BASE_COMMIT="${{ github.event.client_payload.base_commit || github.event.inputs.base_commit }}"
+          git diff --name-only $BASE_COMMIT HEAD > changed_files.txt
           if [ -s changed_files.txt ]; then
             semgrep scan --config auto --json --output semgrep-results.json $(cat changed_files.txt | tr '\\n' ' ') || true
           else
@@ -78,16 +81,20 @@ jobs:
 
       - name: Send Results to Fixora
         run: |
+          SCAN_ID="${{ github.event.client_payload.scan_id || github.event.inputs.scan_id }}"
+          TARGET_BRANCH="${{ github.event.client_payload.target_branch || github.event.inputs.target_branch }}"
+          SCAN_MODE="${{ github.event.client_payload.scan_mode || github.event.inputs.scan_mode }}"
+          
           if [ -f semgrep-results.json ]; then
             echo "Sending results to Fixora backend: ${{ secrets.FIXORA_API_URL }}"
             
             # Create payload
             cat > payload.json << EOF
           {
-            "scan_id": "${{ github.event.inputs.scan_id }}",
+            "scan_id": "$SCAN_ID",
             "repository": "${{ github.repository }}",
-            "branch": "${{ github.event.inputs.target_branch }}",
-            "scan_mode": "${{ github.event.inputs.scan_mode }}",
+            "branch": "$TARGET_BRANCH",
+            "scan_mode": "$SCAN_MODE",
             "commit_sha": "${{ github.sha }}",
             "results": $(cat semgrep-results.json)
           }
@@ -528,18 +535,19 @@ Created: {datetime.now().isoformat()}
         base_commit: str = "",
         max_retries: int = 3
     ) -> bool:
-        """Trigger the Fixora scan workflow via workflow_dispatch with retry logic"""
+        """Trigger the Fixora scan workflow via repository_dispatch"""
         import asyncio
         
         for attempt in range(max_retries):
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
+                    # Use repository_dispatch which works from any branch
                     response = await client.post(
-                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows/fixora-scan.yml/dispatches",
+                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/dispatches",
                         headers=self.headers,
                         json={
-                            "ref": SHADOW_BRANCH_NAME,
-                            "inputs": {
+                            "event_type": "fixora-scan",
+                            "client_payload": {
                                 "scan_mode": scan_mode,
                                 "target_branch": target_branch,
                                 "base_commit": base_commit or "",
@@ -552,8 +560,8 @@ Created: {datetime.now().isoformat()}
                         logger.info(f"Triggered scan workflow for {owner}/{repo} (scan_id: {scan_id})")
                         return True
                     elif response.status_code == 404:
-                        # Workflow not found yet - GitHub may still be indexing
-                        logger.warning(f"Workflow not found (attempt {attempt + 1}/{max_retries}), waiting...")
+                        # Repository not found or no access
+                        logger.warning(f"Repository dispatch failed (attempt {attempt + 1}/{max_retries}): {response.text}")
                         if attempt < max_retries - 1:
                             await asyncio.sleep(3)  # Wait 3 seconds before retry
                             continue
