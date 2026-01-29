@@ -254,13 +254,15 @@ async def receive_scan_results(
         "created_at": datetime.now().isoformat()
     }
     
+    # Insert into DB (this adds _id field to the dict)
     await db.notifications.insert_one(notification)
     
-    # Send real-time WebSocket notification
+    # Send real-time WebSocket notification (remove _id to avoid serialization error)
+    notification_copy = {k: v for k, v in notification.items() if k != '_id'}
     ws_manager = get_connection_manager()
     await ws_manager.send_to_user(user_id, {
         "type": "scan_complete",
-        "notification": notification
+        "notification": notification_copy
     })
     
     logger.info(f"Scan {payload.scan_id} completed with {vuln_count} vulnerabilities")
