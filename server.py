@@ -13,7 +13,8 @@ from routes import (
     ai_pattern_router,
     activity_router,
     dashboard_router,
-    github_router
+    github_router,
+    websocket_router
 )
 
 # Configure logging
@@ -66,6 +67,9 @@ api_router.include_router(github_router)
 
 # Include API router
 app.include_router(api_router)
+
+# WebSocket router (not under /api prefix)
+app.include_router(websocket_router)
 
 @app.get('/')
 async def root():

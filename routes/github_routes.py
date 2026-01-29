@@ -770,6 +770,12 @@ async def start_repository_scan(
     
     await db.scans.insert_one(scan_record)
     
+    # If we just did the setup, wait for GitHub to index the workflow file
+    if not repo.get("scan_setup_complete"):
+        import asyncio
+        logger.info("Waiting for GitHub to index workflow file...")
+        await asyncio.sleep(5)  # Give GitHub 5 seconds to index the workflow
+    
     # Trigger the GitHub Action workflow
     try:
         service = GitHubScanService(connection["access_token"])

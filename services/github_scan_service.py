@@ -525,35 +525,51 @@ Created: {datetime.now().isoformat()}
         scan_id: str,
         target_branch: str = "main",
         scan_mode: str = "full",
-        base_commit: str = ""
+        base_commit: str = "",
+        max_retries: int = 3
     ) -> bool:
-        """Trigger the Fixora scan workflow via workflow_dispatch"""
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    f"{GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows/fixora-scan.yml/dispatches",
-                    headers=self.headers,
-                    json={
-                        "ref": SHADOW_BRANCH_NAME,
-                        "inputs": {
-                            "scan_mode": scan_mode,
-                            "target_branch": target_branch,
-                            "base_commit": base_commit or "",
-                            "scan_id": scan_id
+        """Trigger the Fixora scan workflow via workflow_dispatch with retry logic"""
+        import asyncio
+        
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.post(
+                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows/fixora-scan.yml/dispatches",
+                        headers=self.headers,
+                        json={
+                            "ref": SHADOW_BRANCH_NAME,
+                            "inputs": {
+                                "scan_mode": scan_mode,
+                                "target_branch": target_branch,
+                                "base_commit": base_commit or "",
+                                "scan_id": scan_id
+                            }
                         }
-                    }
-                )
-                
-                if response.status_code == 204:
-                    logger.info(f"Triggered scan workflow for {owner}/{repo} (scan_id: {scan_id})")
-                    return True
-                else:
-                    logger.error(f"Failed to trigger workflow: {response.status_code} - {response.text}")
-                    return False
+                    )
                     
-        except Exception as e:
-            logger.error(f"Error triggering workflow: {e}")
-            return False
+                    if response.status_code == 204:
+                        logger.info(f"Triggered scan workflow for {owner}/{repo} (scan_id: {scan_id})")
+                        return True
+                    elif response.status_code == 404:
+                        # Workflow not found yet - GitHub may still be indexing
+                        logger.warning(f"Workflow not found (attempt {attempt + 1}/{max_retries}), waiting...")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(3)  # Wait 3 seconds before retry
+                            continue
+                    else:
+                        logger.error(f"Failed to trigger workflow: {response.status_code} - {response.text}")
+                        return False
+                        
+            except Exception as e:
+                logger.error(f"Error triggering workflow (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                return False
+        
+        logger.error(f"Failed to trigger workflow after {max_retries} attempts")
+        return False
     
     async def get_commits(
         self, 

@@ -13,6 +13,7 @@ from utils.jwt import TokenData
 from schemas.scan import ScanRequest, ScanResult
 from services.scan_service import run_scan
 from services.activity_service import log_activity
+from services.websocket_manager import get_connection_manager
 
 router = APIRouter(prefix='/scan', tags=['Scans'])
 logger = logging.getLogger(__name__)
@@ -254,6 +255,13 @@ async def receive_scan_results(
     }
     
     await db.notifications.insert_one(notification)
+    
+    # Send real-time WebSocket notification
+    ws_manager = get_connection_manager()
+    await ws_manager.send_to_user(user_id, {
+        "type": "scan_complete",
+        "notification": notification
+    })
     
     logger.info(f"Scan {payload.scan_id} completed with {vuln_count} vulnerabilities")
     

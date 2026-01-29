@@ -6,6 +6,7 @@ from routes.ai_pattern_routes import router as ai_pattern_router
 from routes.activity_routes import router as activity_router
 from routes.dashboard_routes import router as dashboard_router
 from routes.github_routes import router as github_router
+from routes.websocket_routes import router as websocket_router
 
 __all__ = [
     'auth_router',
@@ -15,5 +16,6 @@ __all__ = [
     'ai_pattern_router',
     'activity_router',
     'dashboard_router',
-    'github_router'
+    'github_router',
+    'websocket_router'
 ]
