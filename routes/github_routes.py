@@ -942,6 +942,10 @@ async def refresh_repository_secrets(
         
         logger.info(f"Refreshing secrets for {owner}/{repo_name} with URL: {api_url}")
         
+        # Get repository info to get default branch
+        repo_info = await service.get_repository_info(owner, repo_name)
+        default_branch = repo_info.get("default_branch", "main")
+        
         # Re-inject secrets
         token_result = await service.inject_repository_secret(
             owner, repo_name, "FIXORA_API_TOKEN", api_token
@@ -950,6 +954,9 @@ async def refresh_repository_secrets(
         url_result = await service.inject_repository_secret(
             owner, repo_name, "FIXORA_API_URL", api_url
         )
+        
+        # Also push/update the workflow file to default branch
+        workflow_result = await service.push_workflow_file(owner, repo_name, default_branch)
         
         if not (token_result and url_result):
             raise HTTPException(
@@ -962,14 +969,16 @@ async def refresh_repository_secrets(
             {"id": repo_id},
             {"$set": {
                 "scan_api_token": api_token,
-                "secrets_updated_at": datetime.now().isoformat()
+                "secrets_updated_at": datetime.now().isoformat(),
+                "workflow_updated_at": datetime.now().isoformat()
             }}
         )
         
         return {
             "success": True,
-            "message": f"Secrets refreshed successfully with URL: {api_url}",
-            "api_url": api_url
+            "message": f"Secrets and workflow refreshed successfully with URL: {api_url}",
+            "api_url": api_url,
+            "workflow_updated": workflow_result
         }
         
     except HTTPException:

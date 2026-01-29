@@ -475,19 +475,14 @@ Created: {datetime.now().isoformat()}
             logger.error(f"Error injecting secret: {e}")
             return False
     
-    async def push_workflow_file(self, owner: str, repo: str) -> bool:
-        """Push the Semgrep workflow file to the shadow branch"""
+    async def push_workflow_file(self, owner: str, repo: str, default_branch: str = "main") -> bool:
+        """Push the Semgrep workflow file to the DEFAULT branch (required for repository_dispatch)"""
         try:
-            # Ensure shadow branch exists first
-            if not await self.check_branch_exists(owner, repo, SHADOW_BRANCH_NAME):
-                logger.error(f"Shadow branch does not exist for {owner}/{repo}")
-                return False
-            
             async with httpx.AsyncClient(timeout=30.0) as client:
-                # Check if file already exists
+                # Check if file already exists on default branch
                 check_response = await client.get(
                     f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{WORKFLOW_FILE_PATH}",
-                    params={"ref": SHADOW_BRANCH_NAME},
+                    params={"ref": default_branch},
                     headers=self.headers
                 )
                 
@@ -498,11 +493,11 @@ Created: {datetime.now().isoformat()}
                 # Encode workflow content
                 content = base64.b64encode(WORKFLOW_TEMPLATE.encode()).decode()
                 
-                # Create or update the file
+                # Create or update the file on DEFAULT branch
                 payload = {
                     "message": "chore: Add Fixora security scanning workflow",
                     "content": content,
-                    "branch": SHADOW_BRANCH_NAME
+                    "branch": default_branch
                 }
                 
                 if sha:
@@ -515,7 +510,7 @@ Created: {datetime.now().isoformat()}
                 )
                 
                 if response.status_code in [200, 201]:
-                    logger.info(f"Pushed workflow file to {owner}/{repo}")
+                    logger.info(f"Pushed workflow file to {owner}/{repo} on branch {default_branch}")
                     return True
                 else:
                     logger.error(f"Failed to push workflow: {response.text}")
@@ -661,8 +656,8 @@ Created: {datetime.now().isoformat()}
                 owner, repo, "FIXORA_API_URL", api_url
             )
             
-            # Step 4: Push workflow file
-            result["steps"]["workflow_file"] = await self.push_workflow_file(owner, repo)
+            # Step 4: Push workflow file to DEFAULT branch (required for repository_dispatch)
+            result["steps"]["workflow_file"] = await self.push_workflow_file(owner, repo, default_branch)
             
             if not result["steps"]["workflow_file"]:
                 result["error"] = "Failed to push workflow file"
