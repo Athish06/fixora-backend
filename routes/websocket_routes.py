@@ -30,9 +30,11 @@ async def websocket_notifications(
                 settings.jwt_secret_key,
                 algorithms=[settings.algorithm]
             )
-            user_id = decoded.get("user_id")
+            # JWT uses 'sub' for user_id
+            user_id = decoded.get("sub") or decoded.get("user_id")
             
             if not user_id:
+                logger.error(f"Invalid token: no user_id or sub in token. Token contents: {decoded}")
                 await websocket.close(code=4001, reason="Invalid token: no user_id")
                 return
                 
