@@ -142,9 +142,13 @@ async def receive_scan_results(
             detail="Scan not found"
         )
     
+    logger.info(f"Processing scan results for {payload.scan_id} - Repository: {payload.repository}, Branch: {payload.branch}")
+    
     # Process Semgrep results
     semgrep_results = payload.results.results
     vulnerabilities = []
+    
+    logger.info(f"Processing {len(semgrep_results)} Semgrep results")
     
     for result in semgrep_results:
         vuln_id = str(uuid.uuid4())
@@ -166,11 +170,40 @@ async def receive_scan_results(
         }
         severity = severity_map.get(severity, "medium")
         
+        # Extract vulnerability type from rule_id or metadata
+        rule_id = result.get("check_id", "")
+        vuln_type = metadata.get("category", "security")
+        
+        # Try to extract a more specific type from rule_id
+        # e.g., "javascript.express.security.audit.xss" -> "XSS"
+        if "xss" in rule_id.lower():
+            vuln_type = "XSS"
+        elif "sql-injection" in rule_id.lower() or "sqli" in rule_id.lower():
+            vuln_type = "SQL Injection"
+        elif "command-injection" in rule_id.lower():
+            vuln_type = "Command Injection"
+        elif "path-traversal" in rule_id.lower():
+            vuln_type = "Path Traversal"
+        elif "ssrf" in rule_id.lower():
+            vuln_type = "SSRF"
+        elif "hardcoded" in rule_id.lower() or "secret" in rule_id.lower():
+            vuln_type = "Hardcoded Secret"
+        elif "csrf" in rule_id.lower():
+            vuln_type = "CSRF"
+        elif "open-redirect" in rule_id.lower():
+            vuln_type = "Open Redirect"
+        elif "insecure" in rule_id.lower():
+            vuln_type = "Insecure Configuration"
+        else:
+            # Use the last part of the rule_id as type
+            vuln_type = rule_id.split(".")[-1].replace("-", " ").title()
+        
         vulnerability = {
             "id": vuln_id,
             "repository_id": repo_id,
             "scan_id": payload.scan_id,
             "user_id": user_id,
+            "type": vuln_type,
             "title": result.get("check_id", "Unknown vulnerability").split(".")[-1].replace("-", " ").title(),
             "description": extra.get("message", "No description available"),
             "severity": severity,
@@ -178,7 +211,7 @@ async def receive_scan_results(
             "line_number": result.get("start", {}).get("line", 0),
             "end_line": result.get("end", {}).get("line", 0),
             "code_snippet": extra.get("lines", ""),
-            "rule_id": result.get("check_id", ""),
+            "rule_id": rule_id,
             "cwe": metadata.get("cwe", []),
             "owasp": metadata.get("owasp", []),
             "fix_regex": extra.get("fix_regex", None),
@@ -195,7 +228,10 @@ async def receive_scan_results(
     
     # Insert vulnerabilities
     if vulnerabilities:
-        await db.vulnerabilities.insert_many(vulnerabilities)
+        result = await db.vulnerabilities.insert_many(vulnerabilities)
+        logger.info(f"Inserted {len(result.inserted_ids)} vulnerabilities into database")
+    else:
+        logger.info("No vulnerabilities found in scan results")
     
     # Update scan record
     vuln_count = len(vulnerabilities)
@@ -219,6 +255,8 @@ async def receive_scan_results(
         }}
     )
     
+    logger.info(f"Updated scan record: {payload.scan_id} - Status: completed, Vulnerabilities: {vuln_count}")
+    
     # Update repository stats
     await db.repositories.update_one(
         {"id": repo_id},
@@ -229,6 +267,8 @@ async def receive_scan_results(
             "last_commit_sha": payload.commit_sha
         }}
     )
+    
+    logger.info(f"Updated repository {repo_id} stats - Total vulnerabilities: {vuln_count}")
     
     # Log activity
     await log_activity(
