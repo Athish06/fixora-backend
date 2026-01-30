@@ -142,22 +142,37 @@ async def check_backend_config(current_user: TokenData = Depends(get_current_use
 
 @router.get('/auth')
 async def github_auth(current_user: TokenData = Depends(get_current_user)):
-    """Redirect to GitHub App installation page (not just OAuth authorization)"""
-    
-    # For GitHub Apps, we need to redirect to the INSTALLATION page
-    # This gives the app read/write access to selected repositories
-    # The installation flow is different from OAuth authorization
+    """Redirect to GitHub OAuth authorization (this redirects properly after auth)"""
     
     state = current_user.user_id
+    
+    # Build the callback URL from FRONTEND_URL
+    redirect_uri = f"{settings.frontend_url.rstrip('/')}/api/auth/callback/github"
+    
+    # Use OAuth authorization URL - this properly redirects back after authorization
+    # The app will appear in "Authorized Apps" after this
+    auth_url = (
+        f"https://github.com/login/oauth/authorize"
+        f"?client_id={settings.github_client_id}"
+        f"&redirect_uri={redirect_uri}"
+        f"&state={state}"
+        f"&scope=repo,read:user,user:email"
+    )
+    
+    return {"auth_url": auth_url}
+
+
+@router.get('/install')
+async def github_install(current_user: TokenData = Depends(get_current_user)):
+    """Get the GitHub App installation URL (for repo access permissions)"""
+    
     app_slug = settings.github_app_slug or "fixora26"
     
-    # GitHub App installation URL with state for user identification
-    # After installation, GitHub redirects to the callback URL with:
-    # - installation_id: The ID of the new installation
-    # - setup_action: 'install' for new installations
-    install_url = f"https://github.com/apps/{app_slug}/installations/new?state={state}"
+    # This URL is for installing the app on repositories
+    # User should be directed here after OAuth if they want repo write access
+    install_url = f"https://github.com/apps/{app_slug}/installations/new"
     
-    return {"auth_url": install_url}
+    return {"install_url": install_url}
 
 
 @router.post('/callback')
@@ -184,12 +199,30 @@ async def github_callback(
             detail="User state not provided"
         )
     
+    # Check for existing connection (in case user already OAuth'd and is now installing)
+    existing_connection = await db.github_connections.find_one({"user_id": user_id})
+    
     github_connection = {
-        "id": str(uuid.uuid4()),
+        "id": existing_connection.get("id") if existing_connection else str(uuid.uuid4()),
         "user_id": user_id,
-        "connected_at": datetime.now().isoformat(),
+        "connected_at": existing_connection.get("connected_at") if existing_connection else datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat()
     }
+    
+    # Preserve existing OAuth data if we have it
+    if existing_connection:
+        if existing_connection.get("access_token"):
+            github_connection["access_token"] = existing_connection["access_token"]
+        if existing_connection.get("github_username"):
+            github_connection["github_username"] = existing_connection["github_username"]
+        if existing_connection.get("github_user_id"):
+            github_connection["github_user_id"] = existing_connection["github_user_id"]
+        if existing_connection.get("github_avatar_url"):
+            github_connection["github_avatar_url"] = existing_connection["github_avatar_url"]
+        if existing_connection.get("scope"):
+            github_connection["scope"] = existing_connection["scope"]
+        if existing_connection.get("token_type"):
+            github_connection["token_type"] = existing_connection["token_type"]
     
     try:
         async with httpx.AsyncClient() as client:
@@ -286,14 +319,22 @@ async def github_callback(
             )
             
             username = github_connection.get("github_username", "Unknown")
-            logger.info(f"GitHub connected for user {user_id}: {username} (installation: {installation_id is not None}, oauth: {github_connection.get('access_token') is not None})")
+            has_installation = installation_id is not None or github_connection.get("installation_id") is not None
+            
+            logger.info(f"GitHub connected for user {user_id}: {username} (installation: {has_installation}, oauth: {github_connection.get('access_token') is not None})")
+            
+            # Build install URL with state param so we can identify user after installation
+            app_slug = settings.github_app_slug or "fixora26"
+            install_url = f"https://github.com/apps/{app_slug}/installations/new?state={user_id}"
             
             return {
                 "success": True,
                 "github_username": username,
                 "message": "GitHub connected successfully",
                 "installation_id": installation_id,
-                "has_oauth": github_connection.get("access_token") is not None
+                "has_installation": has_installation,
+                "has_oauth": github_connection.get("access_token") is not None,
+                "install_url": install_url if not has_installation else None
             }
             
     except HTTPException:
@@ -320,12 +361,111 @@ async def github_connection_status(
     if not connection:
         return {"connected": False}
     
+    app_slug = settings.github_app_slug or "fixora26"
+    has_installation = connection.get("installation_id") is not None
+    
     return {
         "connected": True,
         "github_username": connection.get("github_username"),
         "github_avatar_url": connection.get("github_avatar_url"),
-        "connected_at": connection.get("connected_at")
+        "connected_at": connection.get("connected_at"),
+        "has_installation": has_installation,
+        "install_url": f"https://github.com/apps/{app_slug}/installations/new" if not has_installation else None
     }
+
+
+@router.post('/sync-installation')
+async def sync_installation(
+    current_user: TokenData = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """Find and sync the user's GitHub App installation
+    
+    After user installs the app on GitHub, call this to find their installation_id
+    by matching their GitHub username with app installations.
+    """
+    connection = await db.github_connections.find_one({"user_id": current_user.user_id})
+    
+    if not connection:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="GitHub not connected. Please authorize first."
+        )
+    
+    github_username = connection.get("github_username")
+    if not github_username:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="GitHub username not found in connection"
+        )
+    
+    # Already has installation
+    if connection.get("installation_id"):
+        return {
+            "success": True,
+            "installation_id": connection.get("installation_id"),
+            "message": "Installation already synced"
+        }
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            # Get all installations for the app using App JWT
+            headers = await get_app_jwt_headers()
+            
+            response = await client.get(
+                f"{GITHUB_API_URL}/app/installations",
+                headers=headers
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Failed to list installations: {response.status_code}")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to fetch app installations"
+                )
+            
+            installations = response.json()
+            
+            # Find installation matching the user's GitHub username
+            for install in installations:
+                account = install.get("account", {})
+                if account.get("login", "").lower() == github_username.lower():
+                    installation_id = install.get("id")
+                    
+                    # Update the connection with installation_id
+                    await db.github_connections.update_one(
+                        {"user_id": current_user.user_id},
+                        {"$set": {
+                            "installation_id": installation_id,
+                            "account_type": account.get("type", "User"),
+                            "updated_at": datetime.now().isoformat()
+                        }}
+                    )
+                    
+                    logger.info(f"Synced installation {installation_id} for user {current_user.user_id}")
+                    
+                    return {
+                        "success": True,
+                        "installation_id": installation_id,
+                        "message": "Installation synced successfully"
+                    }
+            
+            # No installation found
+            app_slug = settings.github_app_slug or "fixora26"
+            return {
+                "success": False,
+                "message": "App not installed yet",
+                "install_url": f"https://github.com/apps/{app_slug}/installations/new"
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to sync installation: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to sync installation: {str(e)}"
+        )
 
 
 @router.get('/verify-token')
