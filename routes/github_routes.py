@@ -720,12 +720,17 @@ async def start_repository_scan(
     
     owner, repo_name = full_name.split("/", 1)
     
+    service = GitHubScanService(connection["access_token"])
+    api_url = settings.backend_url or "http://localhost:8000"
+    
+    # Get repository info to get default branch
+    repo_info = await service.get_repository_info(owner, repo_name)
+    default_branch = repo_info.get("default_branch", "main")
+    
     # Check if setup is complete, if not do it first
     if not repo.get("scan_setup_complete"):
         try:
-            service = GitHubScanService(connection["access_token"])
             api_token = generate_repo_api_token(repo_id, current_user.user_id)
-            api_url = settings.backend_url or "http://localhost:8000"
             
             setup_result = await service.setup_repository_for_scanning(
                 owner, repo_name, api_token, api_url
@@ -745,11 +750,30 @@ async def start_repository_scan(
                     "setup_at": datetime.now().isoformat()
                 }}
             )
+            
+            # Wait for GitHub to index the workflow file
+            import asyncio
+            logger.info("Waiting for GitHub to index workflow file...")
+            await asyncio.sleep(5)
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Failed to setup repository: {str(e)}"
             )
+    else:
+        # For existing setups, ensure secrets are up to date (auto-refresh)
+        api_token = repo.get("scan_api_token")
+        if not api_token:
+            api_token = generate_repo_api_token(repo_id, current_user.user_id)
+        
+        # Silently refresh secrets in background to ensure URL is correct
+        try:
+            await service.inject_repository_secret(owner, repo_name, "FIXORA_API_TOKEN", api_token)
+            await service.inject_repository_secret(owner, repo_name, "FIXORA_API_URL", api_url)
+            # Also ensure workflow file is up to date
+            await service.push_workflow_file(owner, repo_name, default_branch)
+        except Exception as e:
+            logger.warning(f"Failed to refresh secrets (non-critical): {e}")
     
     # Create scan record
     scan_id = str(uuid.uuid4())
@@ -769,12 +793,6 @@ async def start_repository_scan(
     }
     
     await db.scans.insert_one(scan_record)
-    
-    # If we just did the setup, wait for GitHub to index the workflow file
-    if not repo.get("scan_setup_complete"):
-        import asyncio
-        logger.info("Waiting for GitHub to index workflow file...")
-        await asyncio.sleep(5)  # Give GitHub 5 seconds to index the workflow
     
     # Trigger the GitHub Action workflow
     try:
