@@ -10,8 +10,10 @@ from typing import Optional, List
 from pydantic import BaseModel
 import httpx
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
+import jwt
+import time
 
 router = APIRouter(prefix='/github', tags=['GitHub'])
 logger = logging.getLogger(__name__)
@@ -21,6 +23,102 @@ settings = get_settings()
 GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
 GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
 GITHUB_API_URL = "https://api.github.com"
+
+
+async def generate_app_jwt() -> str:
+    """Generate a JWT for GitHub App authentication
+    
+    GitHub Apps authenticate using JWTs signed with the app's private key.
+    The JWT is valid for max 10 minutes.
+    """
+    if not settings.github_app_id or not settings.github_private_key:
+        logger.warning("GitHub App ID or Private Key not configured")
+        return ""
+    
+    now = int(time.time())
+    payload = {
+        "iat": now - 60,  # Issued 60 seconds ago (clock skew buffer)
+        "exp": now + (10 * 60),  # Expires in 10 minutes
+        "iss": settings.github_app_id  # GitHub App ID
+    }
+    
+    # The private key should be the full PEM content
+    # Replace escaped newlines with actual newlines
+    private_key = settings.github_private_key.replace("\\n", "\n")
+    
+    try:
+        token = jwt.encode(payload, private_key, algorithm="RS256")
+        return token
+    except Exception as e:
+        logger.error(f"Failed to generate GitHub App JWT: {e}")
+        return ""
+
+
+async def get_app_jwt_headers() -> dict:
+    """Get headers for GitHub App API requests (app-level, not installation-level)"""
+    app_jwt = await generate_app_jwt()
+    return {
+        "Authorization": f"Bearer {app_jwt}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+
+
+async def get_installation_access_token(installation_id: int) -> Optional[str]:
+    """Get an installation access token for a specific GitHub App installation
+    
+    Installation access tokens allow the app to act on behalf of the installation
+    with the permissions granted during installation.
+    """
+    app_jwt = await generate_app_jwt()
+    if not app_jwt:
+        logger.error("Cannot get installation token: No App JWT available")
+        return None
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{GITHUB_API_URL}/app/installations/{installation_id}/access_tokens",
+                headers={
+                    "Authorization": f"Bearer {app_jwt}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28"
+                }
+            )
+            
+            if response.status_code == 201:
+                token_data = response.json()
+                return token_data.get("token")
+            else:
+                logger.error(f"Failed to get installation token: {response.status_code} - {response.text}")
+                return None
+                
+    except Exception as e:
+        logger.error(f"Error getting installation access token: {e}")
+        return None
+
+
+async def get_github_access_token(connection: dict) -> Optional[str]:
+    """Get the appropriate GitHub access token from a connection.
+    
+    Prefers installation token (GitHub App) over OAuth access token.
+    Returns None if no valid token can be obtained.
+    """
+    installation_id = connection.get("installation_id")
+    
+    if installation_id:
+        # GitHub App installation - get installation access token
+        token = await get_installation_access_token(installation_id)
+        if token:
+            return token
+        logger.warning(f"Failed to get installation token for installation {installation_id}")
+    
+    # Fall back to OAuth access token
+    access_token = connection.get("access_token")
+    if access_token:
+        return access_token
+    
+    return None
 
 
 def get_github_headers(access_token: str) -> dict:
@@ -44,136 +142,219 @@ async def check_backend_config(current_user: TokenData = Depends(get_current_use
 
 @router.get('/auth')
 async def github_auth(current_user: TokenData = Depends(get_current_user)):
-    """Redirect to GitHub App OAuth authorization page"""
-    if not settings.github_client_id:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="GitHub client ID not configured"
-        )
+    """Redirect to GitHub App installation page (not just OAuth authorization)"""
     
-    # Build GitHub OAuth URL for GitHub App
-    # Using user_id as state to link back after callback
+    # For GitHub Apps, we need to redirect to the INSTALLATION page
+    # This gives the app read/write access to selected repositories
+    # The installation flow is different from OAuth authorization
+    
     state = current_user.user_id
+    app_slug = settings.github_app_slug or "fixora26"
     
-    # Request all necessary scopes for GitHub App OAuth
-    # Note: GitHub App permissions also need to be configured in App settings
-    auth_url = (
-        f"{GITHUB_AUTHORIZE_URL}"
-        f"?client_id={settings.github_client_id}"
-        f"&redirect_uri=http://localhost:3000/api/auth/callback/github"
-        f"&scope=repo workflow read:user user:email"
-        f"&state={state}"
-    )
+    # GitHub App installation URL with state for user identification
+    # After installation, GitHub redirects to the callback URL with:
+    # - installation_id: The ID of the new installation
+    # - setup_action: 'install' for new installations
+    install_url = f"https://github.com/apps/{app_slug}/installations/new?state={state}"
     
-    return {"auth_url": auth_url}
+    return {"auth_url": install_url}
 
 
 @router.post('/callback')
 async def github_callback(
-    code: str,
-    state: str,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    installation_id: Optional[str] = None,
+    setup_action: Optional[str] = None,
     db = Depends(get_database)
 ):
-    """Handle GitHub OAuth callback and exchange code for access token"""
-    if not code:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Authorization code not provided"
-        )
+    """Handle GitHub App installation callback
     
-    user_id = state  # state contains the user_id
+    GitHub App installation flow returns:
+    - installation_id: The ID of the app installation
+    - setup_action: 'install' for new installations, 'update' for updates
+    - state: Our user_id passed through
     
-    try:
-        # Exchange code for access token
-        async with httpx.AsyncClient() as client:
-            token_response = await client.post(
-                GITHUB_TOKEN_URL,
-                data={
-                    "client_id": settings.github_client_id,
-                    "client_secret": settings.github_client_secret,
-                    "code": code,
-                    "redirect_uri": "http://localhost:3000/api/auth/callback/github"
-                },
-                headers={"Accept": "application/json"}
+    GitHub OAuth flow returns:
+    - code: Authorization code to exchange for token
+    - state: Our user_id passed through
+    """
+    
+    # Handle GitHub App Installation callback
+    if installation_id:
+        user_id = state
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="User state not provided"
             )
-            
-            if token_response.status_code != 200:
-                logger.error(f"GitHub token exchange failed: {token_response.text}")
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Failed to exchange authorization code"
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                # Get installation details to find the account name
+                # We need to use JWT auth for this (app-level, not user-level)
+                # For now, we'll get the installation access token and fetch user info
+                
+                installation_token = await get_installation_access_token(int(installation_id))
+                if not installation_token:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Failed to get installation access token"
+                    )
+                
+                # Get the installation details
+                install_response = await client.get(
+                    f"{GITHUB_API_URL}/app/installations/{installation_id}",
+                    headers=await get_app_jwt_headers()
                 )
-            
-            token_data = token_response.json()
-            
-            if "error" in token_data:
-                logger.error(f"GitHub OAuth error: {token_data}")
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=token_data.get("error_description", "GitHub authentication failed")
-                )
-            
-            access_token = token_data.get("access_token")
-            
-            if not access_token:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No access token received from GitHub"
-                )
-            
-            # Get GitHub user info
-            user_response = await client.get(
-                f"{GITHUB_API_URL}/user",
-                headers={
-                    "Authorization": f"token {access_token}",
-                    "Accept": "application/vnd.github+json",
-                    "X-GitHub-Api-Version": "2022-11-28"
+                
+                if install_response.status_code != 200:
+                    logger.error(f"Failed to get installation details: {install_response.text}")
+                    # Continue anyway, we have the installation_id
+                
+                install_data = install_response.json() if install_response.status_code == 200 else {}
+                account = install_data.get("account", {})
+                
+                # Store or update GitHub connection with installation ID
+                github_connection = {
+                    "id": str(uuid.uuid4()),
+                    "user_id": user_id,
+                    "installation_id": int(installation_id),
+                    "github_username": account.get("login", "Unknown"),
+                    "github_user_id": account.get("id"),
+                    "github_avatar_url": account.get("avatar_url", ""),
+                    "account_type": account.get("type", "User"),  # User or Organization
+                    "setup_action": setup_action or "install",
+                    "connected_at": datetime.now().isoformat(),
+                    "updated_at": datetime.now().isoformat()
                 }
-            )
-            
-            if user_response.status_code != 200:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Failed to fetch GitHub user info"
+                
+                # Upsert: update if exists, insert if not
+                await db.github_connections.update_one(
+                    {"user_id": user_id},
+                    {"$set": github_connection},
+                    upsert=True
                 )
-            
-            github_user = user_response.json()
-            
-            # Store or update GitHub connection
-            github_connection = {
-                "id": str(uuid.uuid4()),
-                "user_id": user_id,
-                "github_user_id": github_user.get("id"),
-                "github_username": github_user.get("login"),
-                "github_avatar_url": github_user.get("avatar_url"),
-                "access_token": access_token,
-                "scope": token_data.get("scope", ""),
-                "token_type": token_data.get("token_type", "bearer"),
-                "connected_at": datetime.now().isoformat(),
-                "updated_at": datetime.now().isoformat()
-            }
-            
-            # Upsert: update if exists, insert if not
-            await db.github_connections.update_one(
-                {"user_id": user_id},
-                {"$set": github_connection},
-                upsert=True
+                
+                logger.info(f"GitHub App installed for user {user_id}: installation_id={installation_id}")
+                
+                return {
+                    "success": True,
+                    "github_username": account.get("login", "Unknown"),
+                    "message": "GitHub App installed successfully",
+                    "installation_id": installation_id
+                }
+                
+        except Exception as e:
+            logger.error(f"GitHub App installation callback failed: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to process GitHub App installation: {str(e)}"
             )
-            
-            logger.info(f"GitHub connected for user {user_id}: {github_user.get('login')}")
-            
-            return {
-                "success": True,
-                "github_username": github_user.get("login"),
-                "message": "GitHub connected successfully"
-            }
-            
-    except httpx.RequestError as e:
-        logger.error(f"GitHub API request failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to communicate with GitHub"
-        )
+    
+    # Handle OAuth code exchange (fallback for OAuth flow)
+    if code:
+        user_id = state
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="User state not provided"
+            )
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                token_response = await client.post(
+                    GITHUB_TOKEN_URL,
+                    data={
+                        "client_id": settings.github_client_id,
+                        "client_secret": settings.github_client_secret,
+                        "code": code,
+                        "redirect_uri": "http://localhost:3000/api/auth/callback/github"
+                    },
+                    headers={"Accept": "application/json"}
+                )
+                
+                if token_response.status_code != 200:
+                    logger.error(f"GitHub token exchange failed: {token_response.text}")
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Failed to exchange authorization code"
+                    )
+                
+                token_data = token_response.json()
+                
+                if "error" in token_data:
+                    logger.error(f"GitHub OAuth error: {token_data}")
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=token_data.get("error_description", "GitHub authentication failed")
+                    )
+                
+                access_token = token_data.get("access_token")
+                
+                if not access_token:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="No access token received from GitHub"
+                    )
+                
+                # Get GitHub user info
+                user_response = await client.get(
+                    f"{GITHUB_API_URL}/user",
+                    headers={
+                        "Authorization": f"token {access_token}",
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28"
+                    }
+                )
+                
+                if user_response.status_code != 200:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Failed to fetch GitHub user info"
+                    )
+                
+                github_user = user_response.json()
+                
+                # Store or update GitHub connection
+                github_connection = {
+                    "id": str(uuid.uuid4()),
+                    "user_id": user_id,
+                    "github_user_id": github_user.get("id"),
+                    "github_username": github_user.get("login"),
+                    "github_avatar_url": github_user.get("avatar_url"),
+                    "access_token": access_token,
+                    "scope": token_data.get("scope", ""),
+                    "token_type": token_data.get("token_type", "bearer"),
+                    "connected_at": datetime.now().isoformat(),
+                    "updated_at": datetime.now().isoformat()
+                }
+                
+                await db.github_connections.update_one(
+                    {"user_id": user_id},
+                    {"$set": github_connection},
+                    upsert=True
+                )
+                
+                logger.info(f"GitHub connected via OAuth for user {user_id}: {github_user.get('login')}")
+                
+                return {
+                    "success": True,
+                    "github_username": github_user.get("login"),
+                    "message": "GitHub connected successfully"
+                }
+                
+        except httpx.RequestError as e:
+            logger.error(f"GitHub API request failed: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to communicate with GitHub"
+            )
+    
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Neither installation_id nor code provided"
+    )
 
 
 @router.get('/status')
@@ -303,22 +484,43 @@ async def get_github_repositories(
             detail="GitHub not connected. Please connect your GitHub account first."
         )
     
+    # Prefer installation token if available (GitHub App installation)
+    # Fall back to OAuth access_token for backward compatibility
+    installation_id = connection.get("installation_id")
     access_token = connection.get("access_token")
+    
+    if installation_id:
+        # Get installation access token
+        access_token = await get_installation_access_token(installation_id)
+        if not access_token:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to get GitHub installation access token. Please reconnect GitHub."
+            )
+    elif not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No GitHub access token found. Please reconnect your GitHub account."
+        )
     
     try:
         async with httpx.AsyncClient() as client:
-            # Fetch user's repositories
+            # Fetch repositories
+            # For installation tokens, use /installation/repositories endpoint
+            # For user tokens, use /user/repos endpoint
             repos = []
             page = 1
             
+            api_url = f"{GITHUB_API_URL}/installation/repositories" if installation_id else f"{GITHUB_API_URL}/user/repos"
+            
             while True:
                 response = await client.get(
-                    f"{GITHUB_API_URL}/user/repos",
+                    api_url,
                     params={
                         "per_page": 100,
                         "page": page,
-                        "sort": "updated",
-                        "direction": "desc"
+                        "sort": "updated" if not installation_id else None,
+                        "direction": "desc" if not installation_id else None
                     },
                     headers={
                         "Authorization": f"token {access_token}",
@@ -341,7 +543,14 @@ async def get_github_repositories(
                         detail="Failed to fetch repositories from GitHub"
                     )
                 
-                page_repos = response.json()
+                response_data = response.json()
+                
+                # Installation endpoint returns {"total_count": N, "repositories": [...]}
+                # User repos endpoint returns [...]
+                if installation_id:
+                    page_repos = response_data.get("repositories", [])
+                else:
+                    page_repos = response_data
                 
                 if not page_repos:
                     break
@@ -536,7 +745,14 @@ async def get_repository_branches(
     owner, repo_name = full_name.split("/", 1)
     
     try:
-        service = GitHubScanService(connection["access_token"])
+        access_token = await get_github_access_token(connection)
+        if not access_token:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to get GitHub access token. Please reconnect GitHub."
+            )
+        
+        service = GitHubScanService(access_token)
         branches = await service.get_branches(owner, repo_name)
         
         return {
@@ -590,7 +806,14 @@ async def get_repository_file_tree(
     owner, repo_name = full_name.split("/", 1)
     
     try:
-        service = GitHubScanService(connection["access_token"])
+        access_token = await get_github_access_token(connection)
+        if not access_token:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to get GitHub access token. Please reconnect GitHub."
+            )
+        
+        service = GitHubScanService(access_token)
         file_tree = await service.get_file_tree(owner, repo_name, branch)
         
         return {
@@ -656,7 +879,24 @@ async def setup_repository_for_scanning(
     owner, repo_name = full_name.split("/", 1)
     
     try:
-        service = GitHubScanService(connection["access_token"])
+        # Get access token - prefer installation token if available
+        installation_id = connection.get("installation_id")
+        access_token = connection.get("access_token")
+        
+        if installation_id:
+            access_token = await get_installation_access_token(installation_id)
+            if not access_token:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to get GitHub installation access token. Please reconnect GitHub."
+                )
+        elif not access_token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No GitHub access token found. Please reconnect your GitHub account."
+            )
+        
+        service = GitHubScanService(access_token)
         
         # Generate API token for this repository
         api_token = generate_repo_api_token(repo_id, current_user.user_id)
@@ -730,7 +970,24 @@ async def start_repository_scan(
     
     owner, repo_name = full_name.split("/", 1)
     
-    service = GitHubScanService(connection["access_token"])
+    # Get access token - prefer installation token if available
+    installation_id = connection.get("installation_id")
+    access_token = connection.get("access_token")
+    
+    if installation_id:
+        access_token = await get_installation_access_token(installation_id)
+        if not access_token:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to get GitHub installation access token. Please reconnect GitHub."
+            )
+    elif not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No GitHub access token found. Please reconnect your GitHub account."
+        )
+    
+    service = GitHubScanService(access_token)
     api_url = settings.backend_url or "http://localhost:8000"
     
     # Get repository info to get default branch
@@ -807,7 +1064,7 @@ async def start_repository_scan(
     
     # Trigger the GitHub Action workflow
     try:
-        service = GitHubScanService(connection["access_token"])
+        service = GitHubScanService(access_token)
         
         triggered = await service.trigger_workflow(
             owner=owner,
@@ -907,7 +1164,14 @@ async def get_repository_commits(
     owner, repo_name = full_name.split("/", 1)
     
     try:
-        service = GitHubScanService(connection["access_token"])
+        access_token = await get_github_access_token(connection)
+        if not access_token:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to get GitHub access token. Please reconnect GitHub."
+            )
+        
+        service = GitHubScanService(access_token)
         commits = await service.get_commits(owner, repo_name, branch, per_page=limit)
         
         return {
@@ -959,7 +1223,14 @@ async def refresh_repository_secrets(
     owner, repo_name = full_name.split("/", 1)
     
     try:
-        service = GitHubScanService(connection["access_token"])
+        access_token = await get_github_access_token(connection)
+        if not access_token:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to get GitHub access token. Please reconnect GitHub."
+            )
+        
+        service = GitHubScanService(access_token)
         
         # Get current API token or generate new one
         api_token = repo.get("scan_api_token")

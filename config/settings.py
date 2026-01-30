@@ -24,9 +24,12 @@ class Settings(BaseSettings):
     hf_token: str = os.environ.get('HF_TOKEN', '')
     hf_model_detection: str = os.environ.get('HF_MODEL_DETECTION', 'meta-llama/Llama-2-7b-chat-hf')
     
-    # GitHub
+    # GitHub App
     github_client_id: str = os.environ.get('GITHUB_CLIENT_ID', '')
     github_client_secret: str = os.environ.get('GITHUB_CLIENT_SECRET', '')
+    github_app_id: str = os.environ.get('GITHUB_APP_ID', '')
+    github_app_slug: str = os.environ.get('GITHUB_APP_SLUG', 'fixora26')
+    github_private_key: str = os.environ.get('GITHUB_PRIVATE_KEY', '')
     
     # Backend URL for webhooks
     backend_url: str = os.environ.get('BACKEND_URL', 'http://localhost:8000')
