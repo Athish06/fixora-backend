@@ -522,6 +522,48 @@ Created: {datetime.now().isoformat()}
             logger.error(f"Error pushing workflow file: {e}")
             return False
     
+    async def delete_workflow_file(self, owner: str, repo: str, default_branch: str = "main") -> bool:
+        """Delete the Fixora workflow file after scan completion to clean up user's repository"""
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # First, get the file's SHA (required for deletion)
+                check_response = await client.get(
+                    f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{WORKFLOW_FILE_PATH}",
+                    params={"ref": default_branch},
+                    headers=self.headers
+                )
+                
+                if check_response.status_code != 200:
+                    logger.info(f"Workflow file not found in {owner}/{repo}, nothing to delete")
+                    return True  # File doesn't exist, consider it success
+                
+                sha = check_response.json().get("sha")
+                if not sha:
+                    logger.error(f"Could not get SHA for workflow file in {owner}/{repo}")
+                    return False
+                
+                # Delete the file
+                response = await client.delete(
+                    f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{WORKFLOW_FILE_PATH}",
+                    headers=self.headers,
+                    json={
+                        "message": "chore: Remove Fixora scanning workflow (scan completed)",
+                        "sha": sha,
+                        "branch": default_branch
+                    }
+                )
+                
+                if response.status_code in [200, 204]:
+                    logger.info(f"Deleted workflow file from {owner}/{repo} on branch {default_branch}")
+                    return True
+                else:
+                    logger.error(f"Failed to delete workflow: {response.status_code} - {response.text}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Error deleting workflow file: {e}")
+            return False
+    
     async def trigger_workflow(
         self, 
         owner: str, 

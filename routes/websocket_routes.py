@@ -4,6 +4,7 @@ from services.websocket_manager import get_connection_manager
 import jwt
 import logging
 from config.settings import get_settings
+from typing import Optional
 
 router = APIRouter(tags=['WebSocket'])
 logger = logging.getLogger(__name__)
@@ -13,11 +14,15 @@ settings = get_settings()
 @router.websocket("/ws/notifications")
 async def websocket_notifications(
     websocket: WebSocket,
-    token: str = Query(...)
+    token: str = Query(...),
+    scan_id: Optional[str] = Query(None)
 ):
     """
     WebSocket endpoint for real-time notifications.
-    Connect with: ws://host/ws/notifications?token=<jwt_token>
+    Connect with: ws://host/ws/notifications?token=<jwt_token>&scan_id=<optional_scan_id>
+    
+    If scan_id is provided, this creates a scan-specific connection that will be closed
+    after the scan completes. Otherwise, it creates a general user connection.
     """
     manager = get_connection_manager()
     user_id = None
@@ -45,15 +50,19 @@ async def websocket_notifications(
             await websocket.close(code=4001, reason=f"Invalid token: {str(e)}")
             return
         
-        # Accept connection
-        await manager.connect(websocket, user_id)
+        # Accept connection (with optional scan_id for scan-specific connections)
+        await manager.connect(websocket, user_id, scan_id)
         
         # Send connection confirmation
         await websocket.send_json({
             "type": "connected",
             "message": "WebSocket connected successfully",
-            "user_id": user_id
+            "user_id": user_id,
+            "scan_id": scan_id
         })
+        
+        if scan_id:
+            logger.info(f"Scan-specific WebSocket opened for scan {scan_id}")
         
         # Keep connection alive and handle incoming messages
         while True:
@@ -75,7 +84,17 @@ async def websocket_notifications(
         logger.error(f"WebSocket error: {e}")
     finally:
         if user_id:
-            await manager.disconnect(websocket, user_id)
+            await manager.disconnect(websocket, user_id, scan_id)
+
+
+@router.get("/ws/status")
+async def websocket_status():
+    """Get WebSocket connection status"""
+    manager = get_connection_manager()
+    return {
+        "total_connections": manager.get_connection_count(),
+        "scan_connections": manager.get_scan_connection_count()
+    }
 
 
 @router.get("/ws/status")

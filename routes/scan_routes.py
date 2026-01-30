@@ -14,6 +14,7 @@ from schemas.scan import ScanRequest, ScanResult
 from services.scan_service import run_scan
 from services.activity_service import log_activity
 from services.websocket_manager import get_connection_manager
+from services.github_scan_service import GitHubScanService
 
 router = APIRouter(prefix='/scan', tags=['Scans'])
 logger = logging.getLogger(__name__)
@@ -309,12 +310,53 @@ async def receive_scan_results(
     # Send real-time WebSocket notification (remove _id to avoid serialization error)
     notification_copy = {k: v for k, v in notification.items() if k != '_id'}
     ws_manager = get_connection_manager()
+    
+    # First, try to send to scan-specific socket
+    scan_socket_sent = await ws_manager.send_to_scan(payload.scan_id, {
+        "type": "scan_complete",
+        "notification": notification_copy
+    })
+    
+    # Also send to general user connections
     await ws_manager.send_to_user(user_id, {
         "type": "scan_complete",
         "notification": notification_copy
     })
     
     logger.info(f"Scan {payload.scan_id} completed with {vuln_count} vulnerabilities")
+    
+    # Clean up: Delete workflow file from repository after scan completion
+    try:
+        # Get GitHub connection for this user
+        github_connection = await db.github_connections.find_one({"user_id": user_id})
+        
+        if github_connection:
+            service = GitHubScanService(github_connection["access_token"])
+            
+            # Parse repository full_name (owner/repo)
+            owner, repo_name = payload.repository.split("/", 1)
+            
+            # Get default branch
+            repo_info = await service.get_repository_info(owner, repo_name)
+            default_branch = repo_info.get("default_branch", "main")
+            
+            # Delete the workflow file
+            delete_result = await service.delete_workflow_file(owner, repo_name, default_branch)
+            
+            if delete_result:
+                logger.info(f"Cleaned up workflow file from {payload.repository}")
+            else:
+                logger.warning(f"Failed to clean up workflow file from {payload.repository}")
+        else:
+            logger.warning(f"No GitHub connection found for user {user_id}, skipping workflow cleanup")
+            
+    except Exception as e:
+        logger.error(f"Error cleaning up workflow file: {e}")
+    
+    # Close the scan-specific WebSocket connection
+    if scan_socket_sent:
+        await ws_manager.disconnect_scan(payload.scan_id)
+        logger.info(f"Closed WebSocket for scan {payload.scan_id}")
     
     return {
         "success": True,
