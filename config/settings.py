@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     github_app_slug: str = os.environ.get('GITHUB_APP_SLUG', 'fixora26')
     github_private_key: str = os.environ.get('GITHUB_PRIVATE_KEY', '')
     
+    # Frontend URL (for OAuth callback redirects)
+    frontend_url: str = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
+    
     # Backend URL for webhooks
     backend_url: str = os.environ.get('BACKEND_URL', 'http://localhost:8000')
     
