@@ -542,8 +542,9 @@ Created: {datetime.now().isoformat()}
                     logger.error(f"Could not get SHA for workflow file in {owner}/{repo}")
                     return False
                 
-                # Delete the file
-                response = await client.delete(
+                # Use client.request("DELETE", ...) because httpx.delete() doesn't support json body
+                response = await client.request(
+                    "DELETE",
                     f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{WORKFLOW_FILE_PATH}",
                     headers=self.headers,
                     json={
