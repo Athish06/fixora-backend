@@ -142,37 +142,26 @@ async def check_backend_config(current_user: TokenData = Depends(get_current_use
 
 @router.get('/auth')
 async def github_auth(current_user: TokenData = Depends(get_current_user)):
-    """Redirect to GitHub OAuth authorization (this redirects properly after auth)"""
+    """Redirect to GitHub App installation page
+    
+    When "Request user authorization (OAuth) during installation" is enabled
+    in GitHub App settings, GitHub will:
+    1. Show app installation page (user selects repos)
+    2. Automatically show OAuth authorization 
+    3. Redirect to callback URL with BOTH installation_id AND code
+    
+    This gives us both app installation (repo access) AND OAuth (user identity) in one flow!
+    """
     
     state = current_user.user_id
-    
-    # Build the callback URL from FRONTEND_URL
-    redirect_uri = f"{settings.frontend_url.rstrip('/')}/api/auth/callback/github"
-    
-    # Use OAuth authorization URL - this properly redirects back after authorization
-    # The app will appear in "Authorized Apps" after this
-    auth_url = (
-        f"https://github.com/login/oauth/authorize"
-        f"?client_id={settings.github_client_id}"
-        f"&redirect_uri={redirect_uri}"
-        f"&state={state}"
-        f"&scope=repo,read:user,user:email"
-    )
-    
-    return {"auth_url": auth_url}
-
-
-@router.get('/install')
-async def github_install(current_user: TokenData = Depends(get_current_user)):
-    """Get the GitHub App installation URL (for repo access permissions)"""
-    
     app_slug = settings.github_app_slug or "fixora26"
     
-    # This URL is for installing the app on repositories
-    # User should be directed here after OAuth if they want repo write access
-    install_url = f"https://github.com/apps/{app_slug}/installations/new"
+    # Use the GitHub App installation URL
+    # With "Request user authorization during installation" enabled,
+    # this will do BOTH install AND OAuth in one step
+    auth_url = f"https://github.com/apps/{app_slug}/installations/new?state={state}"
     
-    return {"install_url": install_url}
+    return {"auth_url": auth_url}
 
 
 @router.post('/callback')
