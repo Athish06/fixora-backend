@@ -772,9 +772,9 @@ async def start_repository_scan(
             )
     else:
         # For existing setups, ensure secrets are up to date (auto-refresh)
-        api_token = repo.get("scan_api_token")
-        if not api_token:
-            api_token = generate_repo_api_token(repo_id, current_user.user_id)
+        # Always regenerate the token to ensure it uses the current JWT secret key
+        api_token = generate_repo_api_token(repo_id, current_user.user_id)
+        logger.info(f"Auto-refreshing secrets for {owner}/{repo_name}")
         
         # Silently refresh secrets in background to ensure URL is correct
         try:
@@ -782,6 +782,7 @@ async def start_repository_scan(
             await service.inject_repository_secret(owner, repo_name, "FIXORA_API_URL", api_url)
             # Also ensure workflow file is up to date
             await service.push_workflow_file(owner, repo_name, default_branch)
+            logger.info(f"Secrets refreshed successfully for {owner}/{repo_name}")
         except Exception as e:
             logger.warning(f"Failed to refresh secrets (non-critical): {e}")
     
