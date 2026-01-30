@@ -968,7 +968,9 @@ async def setup_repository_for_scanning(
     try:
         # Get access token - prefer installation token if available
         installation_id = connection.get("installation_id")
-        access_token = connection.get("access_token")
+        oauth_token = connection.get("access_token")
+        
+        logger.info(f"Setup repository {owner}/{repo_name}: installation_id={installation_id}, has_oauth={oauth_token is not None}")
         
         if installation_id:
             access_token = await get_installation_access_token(installation_id)
@@ -977,7 +979,11 @@ async def setup_repository_for_scanning(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="Failed to get GitHub installation access token. Please reconnect GitHub."
                 )
-        elif not access_token:
+            logger.info(f"Using installation access token for {owner}/{repo_name}")
+        elif oauth_token:
+            access_token = oauth_token
+            logger.info(f"Using OAuth token for {owner}/{repo_name} (no installation)")
+        else:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No GitHub access token found. Please reconnect your GitHub account."

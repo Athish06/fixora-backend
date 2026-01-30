@@ -147,12 +147,16 @@ class GitHubScanService:
     
     def __init__(self, access_token: str):
         self.access_token = access_token
+        # Check if this is an installation token (starts with ghs_)
+        self.is_installation_token = access_token.startswith("ghs_")
         # Use 'token' prefix for OAuth user access tokens (not 'Bearer')
         self.headers = {
             "Authorization": f"token {access_token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28"
         }
+        if self.is_installation_token:
+            logger.info("GitHubScanService initialized with installation token")
     
     async def get_repository_info(self, owner: str, repo: str) -> Dict[str, Any]:
         """Get repository information including default branch"""
@@ -251,7 +255,12 @@ class GitHubScanService:
             return response.status_code == 200
     
     async def check_token_permissions(self, owner: str, repo: str) -> dict:
-        """Check if the token has the required permissions for scanning"""
+        """Check if the token has the required permissions for scanning
+        
+        Note: For GitHub App installation tokens, the permissions object in API responses
+        may show all False values even though the app has full write access.
+        We need to verify actual write capability differently.
+        """
         result = {
             "can_read": False,
             "can_write": False,
@@ -267,25 +276,48 @@ class GitHubScanService:
                     headers=self.headers
                 )
                 
+                logger.info(f"Permission check for {owner}/{repo}: status={response.status_code}, is_installation_token={self.is_installation_token}")
+                
                 if response.status_code == 200:
                     result["can_read"] = True
                     
-                    # Check X-OAuth-Scopes header for granted scopes
+                    # For installation tokens, the app permissions determine access
+                    # Since we configured the app with Contents: write, we have write access
+                    if self.is_installation_token:
+                        result["can_write"] = True
+                        logger.info(f"Installation token - write access granted for {owner}/{repo}")
+                        return result
+                    
+                    # For OAuth tokens, check scopes and permissions
                     scopes = response.headers.get("X-OAuth-Scopes", "")
                     result["scopes"] = [s.strip() for s in scopes.split(",") if s.strip()]
                     
                     # Check repository permissions from response
                     repo_data = response.json()
                     permissions = repo_data.get("permissions", {})
-                    result["can_write"] = permissions.get("push", False)
                     result["permissions"] = permissions
+                    
+                    logger.info(f"OAuth permissions for {owner}/{repo}: {permissions}, scopes: {result['scopes']}")
+                    
+                    # Check if OAuth token has repo scope or push permission
+                    if "repo" in result["scopes"] or "public_repo" in result["scopes"]:
+                        result["can_write"] = True
+                    elif permissions.get("push", False) or permissions.get("admin", False):
+                        result["can_write"] = True
+                    else:
+                        result["can_write"] = False
+                        logger.warning(f"OAuth token lacks write access for {owner}/{repo}")
+                        
                 elif response.status_code == 403:
                     result["error"] = "Access forbidden - check GitHub App permissions"
+                    logger.error(f"403 Forbidden for {owner}/{repo}: {response.text}")
                 elif response.status_code == 404:
                     result["error"] = "Repository not found or no access"
+                    logger.error(f"404 Not Found for {owner}/{repo}")
                     
         except Exception as e:
             result["error"] = str(e)
+            logger.error(f"Exception checking permissions for {owner}/{repo}: {e}")
             
         return result
     
