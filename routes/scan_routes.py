@@ -105,6 +105,8 @@ async def receive_scan_results(
     Validates the token and processes Semgrep results.
     """
     logger.info(f"Received webhook for scan {payload.scan_id}")
+    logger.info(f"Received token: {x_fixora_token}")
+    logger.info(f"Using JWT secret key for verification (first 10 chars): {settings.jwt_secret_key[:10]}...")
     
     try:
         # Validate the token

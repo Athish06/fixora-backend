@@ -87,6 +87,7 @@ jobs:
           
           if [ -f semgrep-results.json ]; then
             echo "Sending results to Fixora backend: ${{ secrets.FIXORA_API_URL }}"
+            echo "Using API token: ${FIXORA_API_TOKEN:0:10}... (masked for security)"
             
             # Create payload
             cat > payload.json << EOF
@@ -105,6 +106,7 @@ jobs:
             RETRY_COUNT=0
             
             while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+              echo "Attempting to send results (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
               if curl -X POST "${{ secrets.FIXORA_API_URL }}/api/scan/webhook/results" \
                 -H "Content-Type: application/json" \
                 -H "X-Fixora-Token: ${{ secrets.FIXORA_API_TOKEN }}" \
@@ -692,4 +694,7 @@ def generate_repo_api_token(repo_id: str, user_id: str) -> str:
         "exp": datetime.utcnow() + timedelta(days=365)  # Long-lived token for Actions
     }
     
-    return jwt.encode(payload, settings.jwt_secret_key, algorithm="HS256")
+    token = jwt.encode(payload, settings.jwt_secret_key, algorithm="HS256")
+    logger.info(f"Generated API token for repo {repo_id}: {token}")
+    logger.info(f"Using JWT secret key (first 10 chars): {settings.jwt_secret_key[:10]}...")
+    return token
