@@ -32,6 +32,16 @@ def get_github_headers(access_token: str) -> dict:
     }
 
 
+@router.get('/config/check')
+async def check_backend_config(current_user: TokenData = Depends(get_current_user)):
+    """Check current backend configuration (for debugging)"""
+    return {
+        "backend_url": settings.backend_url or "http://localhost:8000",
+        "backend_url_source": "environment" if settings.backend_url else "default",
+        "webhook_endpoint": f"{settings.backend_url or 'http://localhost:8000'}/api/scan/webhook/results"
+    }
+
+
 @router.get('/auth')
 async def github_auth(current_user: TokenData = Depends(get_current_user)):
     """Redirect to GitHub App OAuth authorization page"""

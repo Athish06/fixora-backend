@@ -97,13 +97,15 @@ class ScanWebhookPayload(BaseModel):
 @router.post('/webhook/results')
 async def receive_scan_results(
     payload: ScanWebhookPayload,
-    x_fixora_token: str = Header(...),
+    x_fixora_token: str = Header(..., alias="X-Fixora-Token"),
     db = Depends(get_database)
 ):
     """
     Webhook endpoint to receive scan results from GitHub Actions.
     Validates the token and processes Semgrep results.
     """
+    logger.info(f"Received webhook for scan {payload.scan_id}")
+    
     try:
         # Validate the token
         decoded = jwt.decode(
@@ -112,7 +114,10 @@ async def receive_scan_results(
             algorithms=["HS256"]
         )
         
+        logger.info(f"Token decoded successfully: type={decoded.get('type')}, repo_id={decoded.get('repo_id')}")
+        
         if decoded.get("type") != "scan_webhook":
+            logger.error(f"Invalid token type: {decoded.get('type')}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid token type"
@@ -122,11 +127,13 @@ async def receive_scan_results(
         user_id = decoded.get("user_id")
         
     except jwt.ExpiredSignatureError:
+        logger.error("Token expired")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token expired"
         )
-    except jwt.InvalidTokenError:
+    except jwt.InvalidTokenError as e:
+        logger.error(f"Invalid token: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token"
