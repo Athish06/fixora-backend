@@ -543,14 +543,15 @@ Created: {datetime.now().isoformat()}
                     return False
                 
                 # Delete the file
+                import json as json_module
                 response = await client.delete(
                     f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{WORKFLOW_FILE_PATH}",
-                    headers=self.headers,
-                    json={
+                    headers={**self.headers, "Content-Type": "application/json"},
+                    content=json_module.dumps({
                         "message": "chore: Remove Fixora scanning workflow (scan completed)",
                         "sha": sha,
                         "branch": default_branch
-                    }
+                    })
                 )
                 
                 if response.status_code in [200, 204]:
