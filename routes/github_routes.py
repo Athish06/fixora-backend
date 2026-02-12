@@ -1,5 +1,5 @@
 # GitHub App routes
-from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks, Body
 from fastapi.responses import RedirectResponse
 from config.database import get_database
 from config.settings import get_settings
@@ -686,11 +686,13 @@ async def get_github_repositories(
 
 @router.post('/repos/connect')
 async def connect_github_repos(
-    repo_ids: list[int],
+    repo_ids: list[int] = Body(..., embed=True),
     current_user: TokenData = Depends(get_current_user),
     db = Depends(get_database)
 ):
     """Connect selected GitHub repositories"""
+    logger.info(f"Connecting repos for user {current_user.user_id}: {repo_ids}")
+    
     # Get GitHub connection
     connection = await db.github_connections.find_one({"user_id": current_user.user_id})
     
@@ -700,12 +702,29 @@ async def connect_github_repos(
             detail="GitHub not connected"
         )
     
-    access_token = connection.get("access_token")
+    # Get installation token instead of OAuth token
+    installation_id = connection.get("installation_id")
+    if not installation_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="GitHub App not installed"
+        )
+    
+    logger.info(f"Getting installation token for installation_id: {installation_id}")
+    access_token = await get_installation_access_token(installation_id)
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get installation access token"
+        )
+    
     connected_repos = []
     
     try:
         async with httpx.AsyncClient() as client:
             for github_id in repo_ids:
+                logger.info(f"Fetching details for repo {github_id}")
+                
                 # Check if already connected
                 existing = await db.repositories.find_one({
                     "user_id": current_user.user_id,
@@ -713,6 +732,7 @@ async def connect_github_repos(
                 })
                 
                 if existing:
+                    logger.info(f"Repo {github_id} already connected, skipping")
                     continue
                 
                 # Fetch repo details from GitHub
@@ -726,7 +746,9 @@ async def connect_github_repos(
                     }
                 )
                 
+                logger.info(f"GitHub API response status: {response.status_code}")
                 if response.status_code != 200:
+                    logger.error(f"Failed to fetch repo {github_id}: {response.text}")
                     continue
                 
                 repo = response.json()
@@ -752,8 +774,10 @@ async def connect_github_repos(
                 }
                 
                 await db.repositories.insert_one(repo_doc)
+                logger.info(f"Successfully connected repo: {repo_doc['name']}")
                 connected_repos.append(repo_doc["name"])
         
+        logger.info(f"Total repos connected: {len(connected_repos)}")
         return {
             "success": True,
             "connected_count": len(connected_repos),
@@ -770,7 +794,7 @@ async def connect_github_repos(
 
 @router.post('/repos/disconnect')
 async def disconnect_github_repos(
-    repo_ids: list[int],
+    repo_ids: list[int] = Body(..., embed=True),
     current_user: TokenData = Depends(get_current_user),
     db = Depends(get_database)
 ):
