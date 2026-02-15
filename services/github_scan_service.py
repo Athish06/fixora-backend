@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 GITHUB_API_URL = "https://api.github.com"
-SHADOW_BRANCH_NAME = "fixora-internal"
 WORKFLOW_FILE_PATH = ".github/workflows/fixora-scan.yml"
 
 # Semgrep workflow template
@@ -321,143 +320,6 @@ class GitHubScanService:
             
         return result
     
-    async def create_shadow_branch(self, owner: str, repo: str, source_branch: str) -> dict:
-        """Create the fixora-internal shadow branch from source branch
-        
-        Returns dict with success status and detailed error info if failed
-        """
-        result = {"success": False, "error": None, "details": None}
-        
-        try:
-            # First check permissions
-            perm_check = await self.check_token_permissions(owner, repo)
-            if not perm_check["can_write"]:
-                result["error"] = "No write access to repository"
-                result["details"] = {
-                    "scopes": perm_check.get("scopes", []),
-                    "permissions": perm_check.get("permissions", {}),
-                    "hint": "Your GitHub App may not have 'Contents: Read and write' permission configured. " +
-                            "Go to GitHub App settings > Permissions & events > Repository permissions > Contents > Read and write. " +
-                            "Then re-authorize by disconnecting and reconnecting GitHub in Fixora."
-                }
-                logger.error(f"No write access to {owner}/{repo}: {result['details']}")
-                return result
-            
-            # Check if shadow branch already exists
-            if await self.check_branch_exists(owner, repo, SHADOW_BRANCH_NAME):
-                logger.info(f"Shadow branch already exists for {owner}/{repo}")
-                result["success"] = True
-                return result
-            
-            # Get the SHA of the source branch
-            source_sha = await self.get_branch_sha(owner, repo, source_branch)
-            logger.info(f"Source branch '{source_branch}' SHA: {source_sha}")
-            
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                # Create new branch using refs API
-                response = await client.post(
-                    f"{GITHUB_API_URL}/repos/{owner}/{repo}/git/refs",
-                    headers=self.headers,
-                    json={
-                        "ref": f"refs/heads/{SHADOW_BRANCH_NAME}",
-                        "sha": source_sha
-                    }
-                )
-                
-                if response.status_code == 201:
-                    logger.info(f"Created shadow branch for {owner}/{repo}")
-                    result["success"] = True
-                    return result
-                elif response.status_code == 422:
-                    # Reference already exists (race condition)
-                    logger.info(f"Shadow branch already exists (422) for {owner}/{repo}")
-                    result["success"] = True
-                    return result
-                elif response.status_code == 403:
-                    error_data = response.json()
-                    error_msg = error_data.get("message", "Forbidden")
-                    
-                    if "Resource not accessible by integration" in error_msg:
-                        result["error"] = "GitHub App does not have required permissions"
-                        result["details"] = {
-                            "github_error": error_msg,
-                            "hint": "Go to your GitHub App settings (https://github.com/settings/apps/fixora26) > " +
-                                    "Permissions & events > Repository permissions > Set 'Contents' to 'Read and write'. " +
-                                    "Then disconnect and reconnect GitHub in Fixora Settings."
-                        }
-                    else:
-                        result["error"] = f"Forbidden: {error_msg}"
-                        result["details"] = {"github_error": error_msg}
-                    
-                    logger.error(f"Failed to create shadow branch (403): {result}")
-                    
-                    # Try fallback
-                    logger.info("Attempting fallback: create branch via file commit...")
-                    fallback_result = await self._create_branch_via_file(owner, repo, source_sha)
-                    if fallback_result["success"]:
-                        return fallback_result
-                    
-                    return result
-                else:
-                    result["error"] = f"GitHub API error: {response.status_code}"
-                    result["details"] = {"response": response.text}
-                    logger.error(f"Failed to create shadow branch: {response.status_code} - {response.text}")
-                    return result
-                    
-        except Exception as e:
-            result["error"] = str(e)
-            logger.error(f"Error creating shadow branch: {e}")
-            return result
-    
-    async def _create_branch_via_file(self, owner: str, repo: str, source_sha: str) -> dict:
-        """Fallback: Create branch by committing a file (implicitly creates branch)"""
-        result = {"success": False, "error": None, "details": None}
-        
-        try:
-            readme_content = f"""# Fixora Internal Branch
-
-This branch is used by Fixora for security scanning.
-Do not modify or delete this branch.
-
-Created: {datetime.now().isoformat()}
-"""
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                # Use the Contents API to create a file, which creates the branch
-                response = await client.put(
-                    f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/.fixora/README.md",
-                    headers=self.headers,
-                    json={
-                        "message": "chore: Initialize Fixora scanning branch",
-                        "content": base64.b64encode(readme_content.encode()).decode(),
-                        "branch": SHADOW_BRANCH_NAME
-                    }
-                )
-                
-                if response.status_code in [200, 201]:
-                    logger.info(f"Created shadow branch via file commit for {owner}/{repo}")
-                    result["success"] = True
-                    return result
-                elif response.status_code == 403:
-                    error_data = response.json()
-                    error_msg = error_data.get("message", "Forbidden")
-                    result["error"] = "No write permission to create files"
-                    result["details"] = {
-                        "github_error": error_msg,
-                        "hint": "Your GitHub App needs 'Contents: Read and write' permission. " +
-                                "Configure this in your GitHub App settings, then reconnect."
-                    }
-                    logger.error(f"Fallback failed (403): {error_msg}")
-                else:
-                    result["error"] = f"GitHub API error: {response.status_code}"
-                    result["details"] = {"response": response.text}
-                    logger.error(f"Fallback failed: {response.status_code} - {response.text}")
-                    
-        except Exception as e:
-            result["error"] = str(e)
-            logger.error(f"Fallback error: {e}")
-            
-        return result
-    
     async def inject_repository_secret(self, owner: str, repo: str, secret_name: str, secret_value: str) -> bool:
         """Inject a secret into the repository for GitHub Actions"""
         try:
@@ -693,14 +555,12 @@ Created: {datetime.now().isoformat()}
         """
         Complete setup process for a repository:
         1. Get repo info
-        2. Create shadow branch
-        3. Inject secrets
-        4. Push workflow file
+        2. Inject secrets
+        3. Push workflow file to main branch
         """
         result = {
             "success": False,
             "steps": {
-                "shadow_branch": False,
                 "api_token_secret": False,
                 "api_url_secret": False,
                 "workflow_file": False
@@ -714,26 +574,17 @@ Created: {datetime.now().isoformat()}
             repo_info = await self.get_repository_info(owner, repo)
             default_branch = repo_info.get("default_branch", "main")
             
-            # Step 1: Create shadow branch
-            branch_result = await self.create_shadow_branch(owner, repo, default_branch)
-            result["steps"]["shadow_branch"] = branch_result.get("success", False)
-            
-            if not result["steps"]["shadow_branch"]:
-                result["error"] = branch_result.get("error", "Failed to create shadow branch")
-                result["details"] = branch_result.get("details")
-                return result
-            
-            # Step 2: Inject API token secret
+            # Step 1: Inject API token secret
             result["steps"]["api_token_secret"] = await self.inject_repository_secret(
                 owner, repo, "FIXORA_API_TOKEN", api_token
             )
             
-            # Step 3: Inject API URL secret
+            # Step 2: Inject API URL secret
             result["steps"]["api_url_secret"] = await self.inject_repository_secret(
                 owner, repo, "FIXORA_API_URL", api_url
             )
             
-            # Step 4: Push workflow file to DEFAULT branch (required for repository_dispatch)
+            # Step 3: Push workflow file to main branch (required for repository_dispatch)
             result["steps"]["workflow_file"] = await self.push_workflow_file(owner, repo, default_branch)
             
             if not result["steps"]["workflow_file"]:

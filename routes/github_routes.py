@@ -5,7 +5,7 @@ from config.database import get_database
 from config.settings import get_settings
 from middleware.auth import get_current_user
 from utils.jwt import TokenData
-from services.github_scan_service import GitHubScanService, generate_repo_api_token, SHADOW_BRANCH_NAME
+from services.github_scan_service import GitHubScanService, generate_repo_api_token
 from typing import Optional, List
 from pydantic import BaseModel
 import httpx
