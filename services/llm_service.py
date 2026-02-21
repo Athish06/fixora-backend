@@ -1,4 +1,4 @@
-# HuggingFace LLM Service - Wrapper Hunter Analysis
+# LLM Service - Wrapper Hunter Analysis
 # Receives wrapper_hunter_results.json, returns sink_modules.json
 import logging
 import json
@@ -159,33 +159,33 @@ def build_wrapper_analysis_prompt(wrapper_data: Dict[str, Any]) -> str:
 
 async def analyze_wrappers_with_llm(wrapper_data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Send wrapper_hunter_results.json to HuggingFace LLM.
+    Send wrapper_hunter_results.json to Groq LLM.
     Returns sink_modules.json  (same structure, but only vulnerable items).
     Uses AsyncOpenAI so the event loop is never blocked.
     """
     from openai import AsyncOpenAI
 
-    hf_token = settings.hf_token
-    if not hf_token:
-        logger.error("HF_TOKEN not configured.")
-        return _empty_result(wrapper_data, error="HF_TOKEN not configured")
+    groq_token = settings.groq_api_key
+    if not groq_token:
+        logger.error("GROQ_API_KEY not configured.")
+        return _empty_result(wrapper_data, error="GROQ_API_KEY not configured")
 
     prompt = build_wrapper_analysis_prompt(wrapper_data)
 
     logger.info("=" * 80)
-    logger.info("WRAPPER HUNTER PROMPT → HuggingFace LLM")
+    logger.info("WRAPPER HUNTER PROMPT → Groq LLM")
     logger.info("=" * 80)
     logger.info(prompt)
     logger.info("=" * 80)
 
     try:
         client = AsyncOpenAI(
-            base_url="https://router.huggingface.co/hf-inference/v1",
-            api_key=hf_token,
+            base_url="https://api.groq.com/openai/v1",
+            api_key=groq_token,
         )
 
         completion = await client.chat.completions.create(
-            model="Qwen/Qwen2.5-Coder-32B-Instruct",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {
                     "role": "system",
@@ -207,7 +207,7 @@ async def analyze_wrappers_with_llm(wrapper_data: Dict[str, Any]) -> Dict[str, A
         raw_response = completion.choices[0].message.content
 
         logger.info("=" * 80)
-        logger.info("HuggingFace LLM RAW RESPONSE (sink_modules.json):")
+        logger.info("Groq LLM RAW RESPONSE (sink_modules.json):")
         logger.info("=" * 80)
         logger.info(raw_response)
         logger.info("=" * 80)
@@ -235,7 +235,7 @@ async def analyze_wrappers_with_llm(wrapper_data: Dict[str, Any]) -> Dict[str, A
         return result
 
     except Exception as exc:
-        logger.error(f"Error calling HuggingFace LLM: {exc}")
+        logger.error(f"Error calling Groq LLM: {exc}")
         return _empty_result(wrapper_data, error=str(exc))
 
 

@@ -114,7 +114,7 @@ async def receive_wrapper_hunter_results(
     Webhook endpoint to receive Wrapper Hunter results from GitHub Actions.
     1. Validates the token
     2. Logs the wrapper data
-    3. Sends to HuggingFace LLM for analysis
+    3. Sends to Groq LLM for analysis
     4. Triggers the Semgrep scan workflow
     5. Cleans up the wrapper hunter workflow file
     """
@@ -202,7 +202,7 @@ async def _process_wrapper_results_in_background(
 ):
     """
     Background task – runs after the HTTP response is already sent.
-    1. Send wrapper data to HuggingFace LLM (can take 60-120s)
+    1. Send wrapper data to Groq LLM (can take 30-60s)
     2. Store LLM result (sink_modules.json)
     3. Trigger Semgrep scan
     """

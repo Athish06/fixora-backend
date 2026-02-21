@@ -16,13 +16,8 @@ class Settings(BaseSettings):
     # CORS
     cors_origins: str = os.environ.get('CORS_ORIGINS', '*')
     
-    # Email Configuration
-    sender_email: str = os.environ.get('SENDER_EMAIL', '')
-    google_app_password: str = os.environ.get('GOOGLE_APP_PASSWORD', '')
-    
-    # Hugging Face (will be set by user later)
-    hf_token: str = os.environ.get('HF_TOKEN', '')
-    hf_model_detection: str = os.environ.get('HF_MODEL_DETECTION', 'meta-llama/Llama-2-7b-chat-hf')
+    # Groq (free LLM API - get key at console.groq.com)
+    groq_api_key: str = os.environ.get('GROQ_API_KEY', '')
     
     # GitHub App
     github_client_id: str = os.environ.get('GITHUB_CLIENT_ID', '')
