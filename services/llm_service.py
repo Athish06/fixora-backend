@@ -180,7 +180,7 @@ async def analyze_wrappers_with_llm(wrapper_data: Dict[str, Any]) -> Dict[str, A
 
     try:
         client = AsyncOpenAI(
-            base_url="https://api-inference.huggingface.co/v1/",
+            base_url="https://router.huggingface.co/hf-inference/v1",
             api_key=hf_token,
         )
 
@@ -258,16 +258,22 @@ def _empty_result(wrapper_data: Dict[str, Any], error: str = "", raw_response: s
 
 
 def _extract_json_from_response(text: str) -> Optional[Dict]:
-    """Try to extract valid JSON from LLM response text."""
+    """Bulletproof JSON extractor: handles raw JSON, markdown fences, and stray text."""
     import re
 
-    # 1. Direct parse
+    # 0. Pre-strip: remove ALL markdown code-fence wrappers first so later steps
+    #    never see backtick characters inside the candidate string.
+    clean = re.sub(r'^```(?:json)?\s*', '', text.strip(), flags=re.MULTILINE)
+    clean = re.sub(r'^```\s*$', '', clean, flags=re.MULTILINE)
+    clean = clean.strip()
+
+    # 1. Direct parse of cleaned text
     try:
-        return json.loads(text)
+        return json.loads(clean)
     except json.JSONDecodeError:
         pass
 
-    # 2. Strip markdown code fences
+    # 2. Regex-captured markdown code fences on original text (handles multi-line fences)
     fence_patterns = [
         r'```json\s*\n([\s\S]*?)\n```',
         r'```\s*\n([\s\S]*?)\n```',
@@ -282,18 +288,18 @@ def _extract_json_from_response(text: str) -> Optional[Dict]:
             except json.JSONDecodeError:
                 continue
 
-    # 3. Find the outermost { ... } block
-    start = text.find("{")
+    # 3. Find the outermost balanced { ... } block in the cleaned text
+    start = clean.find("{")
     if start != -1:
         depth = 0
-        for i in range(start, len(text)):
-            if text[i] == "{":
+        for i in range(start, len(clean)):
+            if clean[i] == "{":
                 depth += 1
-            elif text[i] == "}":
+            elif clean[i] == "}":
                 depth -= 1
                 if depth == 0:
                     try:
-                        return json.loads(text[start:i + 1])
+                        return json.loads(clean[start:i + 1])
                     except json.JSONDecodeError:
                         break
 
