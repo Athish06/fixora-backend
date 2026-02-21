@@ -5,6 +5,7 @@ from typing import Optional, Dict, Any, List
 import uuid
 import jwt
 import logging
+import asyncio
 from datetime import datetime
 from config.database import get_database
 from config.settings import get_settings
@@ -15,6 +16,7 @@ from services.scan_service import run_scan
 from services.activity_service import log_activity
 from services.websocket_manager import get_connection_manager
 from services.github_scan_service import GitHubScanService
+from services.llm_service import analyze_wrappers_with_llm, build_wrapper_analysis_prompt
 
 router = APIRouter(prefix='/scan', tags=['Scans'])
 logger = logging.getLogger(__name__)
@@ -93,6 +95,240 @@ class ScanWebhookPayload(BaseModel):
     scan_mode: str
     commit_sha: str
     results: SemgrepPayload
+
+
+class WrapperHunterPayload(BaseModel):
+    scan_id: str
+    repository: str
+    wrapper_data: Dict[str, Any]
+
+
+@router.post('/webhook/wrapper-results')
+async def receive_wrapper_hunter_results(
+    payload: WrapperHunterPayload,
+    background_tasks: BackgroundTasks,
+    x_fixora_token: str = Header(..., alias="X-Fixora-Token"),
+    db = Depends(get_database)
+):
+    """
+    Webhook endpoint to receive Wrapper Hunter results from GitHub Actions.
+    1. Validates the token
+    2. Logs the wrapper data
+    3. Sends to HuggingFace LLM for analysis
+    4. Triggers the Semgrep scan workflow
+    5. Cleans up the wrapper hunter workflow file
+    """
+    logger.info(f"Received wrapper hunter results for scan {payload.scan_id}")
+    
+    try:
+        # Validate the token
+        decoded = jwt.decode(
+            x_fixora_token,
+            settings.jwt_secret_key,
+            algorithms=["HS256"]
+        )
+        
+        if decoded.get("type") != "scan_webhook":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token type"
+            )
+        
+        repo_id = decoded.get("repo_id")
+        user_id = decoded.get("user_id")
+        
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
+    except jwt.InvalidTokenError as e:
+        logger.error(f"Invalid token: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    
+    # Get the scan record
+    scan = await db.scans.find_one({"id": payload.scan_id})
+    if not scan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
+    
+    # ===== LOG WRAPPER HUNTER RESULTS =====
+    logger.info("=" * 80)
+    logger.info("WRAPPER HUNTER RESULTS RECEIVED:")
+    logger.info("=" * 80)
+    import json as json_module
+    logger.info(json_module.dumps(payload.wrapper_data, indent=2))
+    logger.info("=" * 80)
+    
+    # Send WebSocket update: wrapper hunter completed
+    ws_manager = get_connection_manager()
+    await ws_manager.send_to_scan(payload.scan_id, {
+        "type": "wrapper_hunter_complete",
+        "scan_id": payload.scan_id,
+        "message": "Wrapper analysis completed, sending to AI..."
+    })
+    
+    # Update scan progress
+    await db.scans.update_one(
+        {"id": payload.scan_id},
+        {"$set": {
+            "status": "running",
+            "progress": 30,
+            "phase": "llm_analysis",
+            "wrapper_data": payload.wrapper_data
+        }}
+    )
+    
+    # ===== SEND TO HUGGING FACE LLM =====
+    logger.info("Sending wrapper data to HuggingFace LLM for analysis...")
+    
+    await ws_manager.send_to_scan(payload.scan_id, {
+        "type": "llm_analysis_started",
+        "scan_id": payload.scan_id,
+        "message": "AI analyzing wrapper functions..."
+    })
+    
+    llm_result = await analyze_wrappers_with_llm(payload.wrapper_data)
+    
+    logger.info("=" * 80)
+    logger.info("LLM ANALYSIS RESULT (parsed):")
+    logger.info("=" * 80)
+    logger.info(json_module.dumps(llm_result, indent=2))
+    logger.info("=" * 80)
+    
+    # Store LLM result in scan record
+    await db.scans.update_one(
+        {"id": payload.scan_id},
+        {"$set": {
+            "progress": 45,
+            "phase": "triggering_semgrep",
+            "llm_result": llm_result,
+            "wrapper_data": payload.wrapper_data
+        }}
+    )
+    
+    # Send WebSocket update: LLM analysis complete
+    custom_rules_count = len(llm_result.get("custom_rules", []))
+    await ws_manager.send_to_scan(payload.scan_id, {
+        "type": "llm_analysis_complete",
+        "scan_id": payload.scan_id,
+        "custom_rules_count": custom_rules_count,
+        "message": f"AI analysis complete. Found {custom_rules_count} custom rule(s). Starting Semgrep scan..."
+    })
+    
+    # ===== NOW TRIGGER SEMGREP SCAN =====
+    # Run in background so we can return immediately
+    background_tasks.add_task(
+        _trigger_semgrep_after_wrapper_analysis,
+        payload.scan_id, payload.repository, repo_id, user_id, scan, db
+    )
+    
+    return {
+        "success": True,
+        "scan_id": payload.scan_id,
+        "custom_rules_count": custom_rules_count,
+        "message": "Wrapper analysis received, Semgrep scan being triggered"
+    }
+
+
+async def _trigger_semgrep_after_wrapper_analysis(
+    scan_id: str,
+    repository: str,
+    repo_id: str, 
+    user_id: str,
+    scan: dict,
+    db
+):
+    """Background task: trigger the Semgrep scan after wrapper analysis is done"""
+    try:
+        # Get GitHub connection
+        github_connection = await db.github_connections.find_one({"user_id": user_id})
+        if not github_connection:
+            logger.error(f"No GitHub connection for user {user_id}")
+            await db.scans.update_one(
+                {"id": scan_id},
+                {"$set": {"status": "failed", "error": "No GitHub connection"}}
+            )
+            return
+        
+        installation_id = github_connection.get("installation_id")
+        if not installation_id:
+            logger.error("No installation ID found")
+            await db.scans.update_one(
+                {"id": scan_id},
+                {"$set": {"status": "failed", "error": "No GitHub App installation"}}
+            )
+            return
+        
+        # Import here to avoid circular imports
+        from routes.github_routes import get_installation_access_token
+        access_token = await get_installation_access_token(installation_id)
+        if not access_token:
+            logger.error("Failed to get installation access token")
+            await db.scans.update_one(
+                {"id": scan_id},
+                {"$set": {"status": "failed", "error": "Failed to get access token"}}
+            )
+            return
+        
+        owner, repo_name = repository.split("/", 1)
+        service = GitHubScanService(access_token)
+        
+        # Get default branch
+        repo_info = await service.get_repository_info(owner, repo_name)
+        default_branch = repo_info.get("default_branch", "main")
+        
+        # Delete wrapper hunter workflow file (cleanup)
+        logger.info(f"Cleaning up wrapper hunter workflow from {repository}")
+        await service.delete_wrapper_hunter_workflow(owner, repo_name, default_branch)
+        
+        # Ensure Semgrep workflow is in place
+        await service.push_workflow_file(owner, repo_name, default_branch)
+        
+        # Wait for GitHub to index the workflow file
+        await asyncio.sleep(5)
+        
+        # Trigger the Semgrep scan
+        scan_branch = scan.get("branch", default_branch)
+        scan_mode = scan.get("scan_mode", "full")
+        base_commit = scan.get("base_commit", "")
+        
+        triggered = await service.trigger_workflow(
+            owner=owner,
+            repo=repo_name,
+            scan_id=scan_id,
+            target_branch=scan_branch,
+            scan_mode=scan_mode,
+            base_commit=base_commit or ""
+        )
+        
+        if triggered:
+            await db.scans.update_one(
+                {"id": scan_id},
+                {"$set": {
+                    "progress": 55,
+                    "phase": "semgrep_running",
+                    "status": "running"
+                }}
+            )
+            
+            ws_manager = get_connection_manager()
+            await ws_manager.send_to_scan(scan_id, {
+                "type": "semgrep_started",
+                "scan_id": scan_id,
+                "message": "Semgrep security scan running..."
+            })
+            
+            logger.info(f"Semgrep scan triggered for {repository} (scan_id: {scan_id})")
+        else:
+            await db.scans.update_one(
+                {"id": scan_id},
+                {"$set": {"status": "failed", "error": "Failed to trigger Semgrep workflow"}}
+            )
+            logger.error(f"Failed to trigger Semgrep scan for {repository}")
+    
+    except Exception as e:
+        logger.error(f"Error in _trigger_semgrep_after_wrapper_analysis: {e}")
+        await db.scans.update_one(
+            {"id": scan_id},
+            {"$set": {"status": "failed", "error": str(e)}}
+        )
 
 
 @router.post('/webhook/results')
@@ -325,13 +561,23 @@ async def receive_scan_results(
     
     logger.info(f"Scan {payload.scan_id} completed with {vuln_count} vulnerabilities")
     
-    # Clean up: Delete workflow file from repository after scan completion
+    # Clean up: Delete BOTH workflow files from repository after scan completion
     try:
         # Get GitHub connection for this user
         github_connection = await db.github_connections.find_one({"user_id": user_id})
         
         if github_connection:
-            service = GitHubScanService(github_connection["access_token"])
+            # Use installation token for proper access
+            installation_id = github_connection.get("installation_id")
+            if installation_id:
+                from routes.github_routes import get_installation_access_token
+                access_token = await get_installation_access_token(installation_id)
+                if access_token:
+                    service = GitHubScanService(access_token)
+                else:
+                    service = GitHubScanService(github_connection.get("access_token", ""))
+            else:
+                service = GitHubScanService(github_connection.get("access_token", ""))
             
             # Parse repository full_name (owner/repo)
             owner, repo_name = payload.repository.split("/", 1)
@@ -340,13 +586,15 @@ async def receive_scan_results(
             repo_info = await service.get_repository_info(owner, repo_name)
             default_branch = repo_info.get("default_branch", "main")
             
-            # Delete the workflow file
+            # Delete the Semgrep workflow file
             delete_result = await service.delete_workflow_file(owner, repo_name, default_branch)
-            
             if delete_result:
-                logger.info(f"Cleaned up workflow file from {payload.repository}")
-            else:
-                logger.warning(f"Failed to clean up workflow file from {payload.repository}")
+                logger.info(f"Cleaned up Semgrep workflow from {payload.repository}")
+            
+            # Also delete wrapper hunter workflow if it exists
+            wh_delete_result = await service.delete_wrapper_hunter_workflow(owner, repo_name, default_branch)
+            if wh_delete_result:
+                logger.info(f"Cleaned up wrapper hunter workflow from {payload.repository}")
         else:
             logger.warning(f"No GitHub connection found for user {user_id}, skipping workflow cleanup")
             

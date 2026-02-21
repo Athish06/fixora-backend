@@ -1171,47 +1171,66 @@ async def start_repository_scan(
         "base_commit": scan_request.base_commit,
         "status": "pending",
         "progress": 0,
+        "phase": "wrapper_hunter",
         "started_at": datetime.now().isoformat(),
         "completed_at": None,
         "results": None,
-        "error": None
+        "error": None,
+        "wrapper_data": None,
+        "llm_result": None
     }
     
     await db.scans.insert_one(scan_record)
     
-    # Trigger the GitHub Action workflow
+    # STEP 1: Push wrapper hunter workflow and trigger it
+    # (Semgrep scan happens AFTER wrapper hunter results come back)
     try:
         service = GitHubScanService(access_token)
         
-        triggered = await service.trigger_workflow(
+        # Push the wrapper hunter workflow
+        logger.info(f"Pushing wrapper hunter workflow to {owner}/{repo_name}")
+        wh_pushed = await service.push_wrapper_hunter_workflow(owner, repo_name, default_branch)
+        
+        if not wh_pushed:
+            raise Exception("Failed to push wrapper hunter workflow")
+        
+        # Wait for GitHub to index the workflow file
+        import asyncio
+        logger.info("Waiting for GitHub to index wrapper hunter workflow...")
+        await asyncio.sleep(5)
+        
+        # Trigger the wrapper hunter workflow
+        triggered = await service.trigger_wrapper_hunter(
             owner=owner,
             repo=repo_name,
             scan_id=scan_id,
-            target_branch=scan_request.branch,
-            scan_mode=scan_request.scan_mode,
-            base_commit=scan_request.base_commit or ""
+            target_branch=scan_request.branch
         )
         
         if triggered:
             await db.scans.update_one(
                 {"id": scan_id},
-                {"$set": {"status": "running", "progress": 10}}
+                {"$set": {
+                    "status": "running",
+                    "progress": 10,
+                    "phase": "wrapper_hunter"
+                }}
             )
             
             return {
                 "success": True,
                 "scan_id": scan_id,
-                "message": "Scan started successfully",
+                "message": "Wrapper hunter started, Semgrep scan will follow",
                 "status": "running"
             }
         else:
             await db.scans.update_one(
                 {"id": scan_id},
-                {"$set": {"status": "failed", "error": "Failed to trigger workflow"}}
+                {"$set": {"status": "failed", "error": "Failed to trigger wrapper hunter workflow"}}
             )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to trigger scan workflow"
+                detail="Failed to trigger wrapper hunter workflow"
             )
             
     except Exception as e:
