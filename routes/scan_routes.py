@@ -204,12 +204,22 @@ async def receive_wrapper_hunter_results(
     )
     
     # Send WebSocket update: LLM analysis complete
-    custom_rules_count = len(llm_result.get("custom_rules", []))
+    # Count vulnerable wrappers and sink modules from sink_modules.json format
+    sink_results = llm_result.get("results", {})
+    vuln_wrapper_count = sum(
+        len(section.get("wrapper_functions", []))
+        for section in sink_results.values()
+    )
+    sink_module_count = sum(
+        len(section.get("modules", {}).get("sink_modules", []))
+        for section in sink_results.values()
+    )
     await ws_manager.send_to_scan(payload.scan_id, {
         "type": "llm_analysis_complete",
         "scan_id": payload.scan_id,
-        "custom_rules_count": custom_rules_count,
-        "message": f"AI analysis complete. Found {custom_rules_count} custom rule(s). Starting Semgrep scan..."
+        "vulnerable_wrappers_count": vuln_wrapper_count,
+        "sink_modules_count": sink_module_count,
+        "message": f"AI analysis complete. Found {vuln_wrapper_count} vulnerable wrapper(s) across {sink_module_count} sink module(s). Starting Semgrep scan..."
     })
     
     # ===== NOW TRIGGER SEMGREP SCAN =====
@@ -222,7 +232,8 @@ async def receive_wrapper_hunter_results(
     return {
         "success": True,
         "scan_id": payload.scan_id,
-        "custom_rules_count": custom_rules_count,
+        "vulnerable_wrappers_count": vuln_wrapper_count,
+        "sink_modules_count": sink_module_count,
         "message": "Wrapper analysis received, Semgrep scan being triggered"
     }
 

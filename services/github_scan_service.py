@@ -52,65 +52,10 @@ jobs:
         run: |
           cat > /tmp/wrapper_hunter.py << 'HUNTER_SCRIPT'
           #!/usr/bin/env python3
-          """
-          Fixora Wrapper Hunter - Dependency Mapping & Custom Wrapper Detection
-          Analyzes a project to find all dependencies, default modules,
-          and custom wrapper functions that call external libraries.
-          """
           import ast
           import os
           import re
           import json
-          import sys
-
-          # ============ PHASE 0: KNOWN DEFAULT / STDLIB MODULES ============
-
-          PYTHON_STDLIB = {
-              "abc", "aifc", "argparse", "array", "ast", "asynchat", "asyncio",
-              "asyncore", "atexit", "audioop", "base64", "bdb", "binascii",
-              "binhex", "bisect", "builtins", "bz2", "calendar", "cgi", "cgitb",
-              "chunk", "cmath", "cmd", "code", "codecs", "codeop", "collections",
-              "colorsys", "compileall", "concurrent", "configparser", "contextlib",
-              "contextvars", "copy", "copyreg", "cProfile", "crypt", "csv",
-              "ctypes", "curses", "dataclasses", "datetime", "dbm", "decimal",
-              "difflib", "dis", "distutils", "doctest", "email", "encodings",
-              "enum", "errno", "faulthandler", "fcntl", "filecmp", "fileinput",
-              "fnmatch", "fractions", "ftplib", "functools", "gc", "getopt",
-              "getpass", "gettext", "glob", "grp", "gzip", "hashlib", "heapq",
-              "hmac", "html", "http", "idlelib", "imaplib", "imghdr", "imp",
-              "importlib", "inspect", "io", "ipaddress", "itertools", "json",
-              "keyword", "lib2to3", "linecache", "locale", "logging", "lzma",
-              "mailbox", "mailcap", "marshal", "math", "mimetypes", "mmap",
-              "modulefinder", "multiprocessing", "netrc", "nis", "nntplib",
-              "numbers", "operator", "optparse", "os", "ossaudiodev",
-              "pathlib", "pdb", "pickle", "pickletools", "pipes", "pkgutil",
-              "platform", "plistlib", "poplib", "posix", "posixpath", "pprint",
-              "profile", "pstats", "pty", "pwd", "py_compile", "pyclbr",
-              "pydoc", "queue", "quopri", "random", "re", "readline", "reprlib",
-              "resource", "rlcompleter", "runpy", "sched", "secrets", "select",
-              "selectors", "shelve", "shlex", "shutil", "signal", "site",
-              "smtpd", "smtplib", "sndhdr", "socket", "socketserver", "sqlite3",
-              "ssl", "stat", "statistics", "string", "stringprep", "struct",
-              "subprocess", "sunau", "symtable", "sys", "sysconfig", "syslog",
-              "tabnanny", "tarfile", "telnetlib", "tempfile", "termios", "test",
-              "textwrap", "threading", "time", "timeit", "tkinter", "token",
-              "tokenize", "trace", "traceback", "tracemalloc", "tty", "turtle",
-              "turtledemo", "types", "typing", "unicodedata", "unittest",
-              "urllib", "uu", "uuid", "venv", "warnings", "wave", "weakref",
-              "webbrowser", "winreg", "winsound", "wsgiref", "xdrlib", "xml",
-              "xmlrpc", "zipapp", "zipfile", "zipimport", "zlib",
-              "_thread", "__future__",
-          }
-
-          NODE_BUILTINS = {
-              "assert", "buffer", "child_process", "cluster", "console",
-              "constants", "crypto", "dgram", "dns", "domain", "events",
-              "fs", "http", "https", "module", "net", "os", "path",
-              "perf_hooks", "process", "punycode", "querystring", "readline",
-              "repl", "stream", "string_decoder", "timers", "tls", "tty",
-              "url", "util", "v8", "vm", "worker_threads", "zlib",
-              "react", "react-dom", "react/jsx-runtime",
-          }
 
           IGNORE_DIRS = {
               "node_modules", "venv", ".venv", "env", ".env", ".git",
@@ -119,208 +64,110 @@ jobs:
               ".github", ".vscode",
           }
 
-          # ============ PHASE 1: DEPENDENCY MAPPING ============
+          # ─── LANGUAGE DETECTION ───────────────────────────────────────────────────────
+          def detect_language(repo_root):
+              has_py = os.path.isfile(os.path.join(repo_root, "requirements.txt"))
+              has_js = os.path.isfile(os.path.join(repo_root, "package.json"))
+              if has_py and has_js:
+                  return "both"
+              if has_py:
+                  return "python"
+              if has_js:
+                  return "react"
+              for dirpath, dirnames, filenames in os.walk(repo_root):
+                  dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+                  for fn in filenames:
+                      if fn.endswith(".py"):
+                          return "python"
+                      if fn.endswith((".js", ".jsx", ".ts", ".tsx")):
+                          return "react"
+              return "unknown"
 
+          # ─── MANIFEST PARSERS ─────────────────────────────────────────────────────────
           def parse_requirements_txt(repo_root):
-              """Parse requirements.txt and return set of package names"""
-              deps = set()
+              # Parse requirements.txt -> clean package names (strip >=, <=, ==, etc.)
+              pkgs = []
               req_path = os.path.join(repo_root, "requirements.txt")
               if not os.path.isfile(req_path):
-                  return deps
+                  return pkgs
               with open(req_path, "r", errors="ignore") as f:
                   for line in f:
                       line = line.strip()
-                      if not line or line.startswith("#") or line.startswith("-"):
+                      if not line or line.startswith(("#", "-", "git+", "http")):
                           continue
-                      # Strip version specifiers
-                      pkg = re.split(r"[><=!~;@\[]", line)[0].strip()
-                      if pkg:
-                          deps.add(pkg.lower().replace("-", "_"))
-              return deps
+                      name = re.split(r"[><=!~;@\[#\s]", line)[0].strip()
+                      if name:
+                          pkgs.append(name.lower().replace("-", "_"))
+              return sorted(set(pkgs))
 
           def parse_package_json(repo_root):
-              """Parse package.json and return set of dependency names"""
-              deps = set()
-              pj_path = os.path.join(repo_root, "package.json")
-              if not os.path.isfile(pj_path):
-                  return deps
+              # Parse package.json -> all dependency names
+              pkgs = []
+              pj = os.path.join(repo_root, "package.json")
+              if not os.path.isfile(pj):
+                  return pkgs
               try:
-                  with open(pj_path, "r", errors="ignore") as f:
+                  with open(pj, "r", errors="ignore") as f:
                       data = json.load(f)
                   for key in ("dependencies", "devDependencies", "peerDependencies"):
                       if key in data and isinstance(data[key], dict):
-                          deps.update(data[key].keys())
+                          pkgs.extend(data[key].keys())
               except Exception:
                   pass
-              return deps
+              return sorted(set(pkgs))
 
-          # ============ PHASE 2: IMPORT EXTRACTION ============
+          # ─── IMPORT COLLECTORS ────────────────────────────────────────────────────────
+          def collect_python_imports(repo_root):
+              # Walk all .py files; collect every top-level module name imported
+              found = set()
+              for dirpath, dirnames, filenames in os.walk(repo_root):
+                  dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+                  for fn in filenames:
+                      if not fn.endswith(".py"):
+                          continue
+                      fp = os.path.join(dirpath, fn)
+                      try:
+                          with open(fp, "r", errors="ignore") as f:
+                              source = f.read()
+                          tree = ast.parse(source, filename=fp)
+                      except Exception:
+                          continue
+                      for node in ast.walk(tree):
+                          if isinstance(node, ast.Import):
+                              for alias in node.names:
+                                  found.add(alias.name.split(".")[0])
+                          elif isinstance(node, ast.ImportFrom):
+                              if node.module:
+                                  found.add(node.module.split(".")[0])
+              return sorted(found)
 
-          def extract_python_imports(filepath):
-              """Use AST to extract all imports from a Python file"""
-              imports = []
-              try:
-                  with open(filepath, "r", errors="ignore") as f:
-                      source = f.read()
-                  tree = ast.parse(source, filename=filepath)
-              except (SyntaxError, UnicodeDecodeError, ValueError):
-                  return imports
+          def collect_js_imports(repo_root):
+              # Walk all JS/TS files; collect every imported module name via import/require
+              found = set()
+              JS_EXTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+              for dirpath, dirnames, filenames in os.walk(repo_root):
+                  dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+                  for fn in filenames:
+                      if not any(fn.endswith(ext) for ext in JS_EXTS):
+                          continue
+                      fp = os.path.join(dirpath, fn)
+                      try:
+                          with open(fp, "r", errors="ignore") as f:
+                              source = f.read()
+                      except Exception:
+                          continue
+                      for m in re.finditer(r'import\s+(?:[^\'"]*\s+from\s+)?[\'"]([^\'"]+)[\'"]', source):
+                          mod = m.group(1)
+                          if not mod.startswith("."):
+                              found.add(mod.split("/")[0] if not mod.startswith("@") else "/".join(mod.split("/")[:2]))
+                      for m in re.finditer(r'require\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)', source):
+                          mod = m.group(1)
+                          if not mod.startswith("."):
+                              found.add(mod.split("/")[0] if not mod.startswith("@") else "/".join(mod.split("/")[:2]))
+              return sorted(found)
 
-              for node in ast.walk(tree):
-                  if isinstance(node, ast.Import):
-                      for alias in node.names:
-                          imports.append({
-                              "module": alias.name,
-                              "names": [alias.asname or alias.name],
-                              "type": "import"
-                          })
-                  elif isinstance(node, ast.ImportFrom):
-                      module = node.module or ""
-                      names = [a.name for a in node.names]
-                      imports.append({
-                          "module": module,
-                          "names": names,
-                          "type": "from_import"
-                      })
-              return imports
-
-          # Regex patterns for JS/TS imports
-          RE_ES6_IMPORT = re.compile(
-              r"""import\\s+(?:"""
-              r"""(?P<default>[\\w$]+)"""              # default import
-              r"""|\\{\\s*(?P<named>[^}]+)\\s*\\}"""   # named imports
-              r"""|(?P<def2>[\\w$]+)\\s*,\\s*\\{\\s*(?P<named2>[^}]+)\\s*\\}"""  # default + named
-              r"""|\\*\\s+as\\s+(?P<star>[\\w$]+)"""   # namespace import
-              r""")\\s+from\\s+['\"](?P<source>[^'\"]+)['\"]""",
-              re.MULTILINE,
-          )
-          RE_REQUIRE = re.compile(
-              r"""(?:const|let|var)\\s+(?:"""
-              r"""(?P<name>[\\w$]+)"""
-              r"""|\\{\\s*(?P<destructured>[^}]+)\\s*\\}"""
-              r""")\\s*=\\s*require\\(['\"](?P<source>[^'\"]+)['\"]\\)""",
-              re.MULTILINE,
-          )
-
-          def extract_js_imports(filepath):
-              """Use regex to extract imports from JS/TS files"""
-              imports = []
-              try:
-                  with open(filepath, "r", errors="ignore") as f:
-                      source = f.read()
-              except Exception:
-                  return imports
-
-              for m in RE_ES6_IMPORT.finditer(source):
-                  src = m.group("source")
-                  names = []
-                  if m.group("default"):
-                      names.append(m.group("default"))
-                  if m.group("named"):
-                      names.extend([n.strip().split(" as ")[0].strip() for n in m.group("named").split(",")])
-                  if m.group("def2"):
-                      names.append(m.group("def2"))
-                  if m.group("named2"):
-                      names.extend([n.strip().split(" as ")[0].strip() for n in m.group("named2").split(",")])
-                  if m.group("star"):
-                      names.append(m.group("star"))
-                  imports.append({"module": src, "names": names, "type": "es6_import"})
-
-              for m in RE_REQUIRE.finditer(source):
-                  src = m.group("source")
-                  names = []
-                  if m.group("name"):
-                      names.append(m.group("name"))
-                  if m.group("destructured"):
-                      names.extend([n.strip().split(":")[0].strip() for n in m.group("destructured").split(",")])
-                  imports.append({"module": src, "names": names, "type": "require"})
-
-              return imports
-
-          # ============ PHASE 3: WRAPPER FUNCTION DETECTION (Python) ============
-
-          def classify_import(module_name, user_deps, stdlib_set):
-              """Classify a module as user-installed, stdlib, or local"""
-              top = module_name.split(".")[0].lower().replace("-", "_")
-              if top in {d.lower().replace("-", "_") for d in user_deps}:
-                  return "user_installed"
-              if top in stdlib_set:
-                  return "stdlib"
-              return "local"
-
-          def classify_js_import(module_name, user_deps, builtins):
-              """Classify a JS module"""
-              # Relative imports are local
-              if module_name.startswith(".") or module_name.startswith("/"):
-                  return "local"
-              # Scoped packages: @scope/pkg -> check @scope/pkg
-              top = module_name.split("/")[0] if not module_name.startswith("@") else "/".join(module_name.split("/")[:2])
-              if top in user_deps:
-                  return "user_installed"
-              if top in builtins:
-                  return "stdlib"
-              return "user_installed"  # assume npm package if not builtin
-
-          def extract_python_wrappers(filepath, user_deps):
-              """
-              Use AST to find functions that call any module listed in user_deps.
-              Returns list of wrapper function dicts with source code.
-              """
-              wrappers = []
-              try:
-                  with open(filepath, "r", errors="ignore") as f:
-                      source = f.read()
-                  tree = ast.parse(source, filename=filepath)
-                  lines = source.splitlines()
-              except (SyntaxError, UnicodeDecodeError, ValueError):
-                  return wrappers
-
-              # Collect imported names that map to user-installed deps
-              imported_names = set()
-              for node in ast.walk(tree):
-                  if isinstance(node, ast.Import):
-                      for alias in node.names:
-                          top = alias.name.split(".")[0].lower().replace("-", "_")
-                          if top in {d.lower().replace("-", "_") for d in user_deps}:
-                              imported_names.add(alias.asname or alias.name)
-                  elif isinstance(node, ast.ImportFrom):
-                      module = (node.module or "").split(".")[0].lower().replace("-", "_")
-                      if module in {d.lower().replace("-", "_") for d in user_deps}:
-                          for alias in node.names:
-                              imported_names.add(alias.name)
-
-              if not imported_names:
-                  return wrappers
-
-              # Find function definitions that call any imported name
-              for node in ast.walk(tree):
-                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                      calls_dep = set()
-                      for child in ast.walk(node):
-                          if isinstance(child, ast.Call):
-                              call_name = _get_call_name(child)
-                              if call_name:
-                                  # Check if the call references an imported dep name
-                                  root_name = call_name.split(".")[0]
-                                  if root_name in imported_names:
-                                      calls_dep.add(call_name)
-                      if calls_dep:
-                          # Extract full function source
-                          start = node.lineno - 1
-                          end = node.end_lineno if hasattr(node, "end_lineno") and node.end_lineno else start + 1
-                          func_source = "\\n".join(lines[start:end])
-                          wrappers.append({
-                              "function_name": node.name,
-                              "calls": list(calls_dep),
-                              "line_start": node.lineno,
-                              "line_end": end,
-                              "source_code": func_source,
-                              "file": filepath
-                          })
-              return wrappers
-
+          # ─── PYTHON WRAPPER EXTRACTION (AST) ─────────────────────────────────────────
           def _get_call_name(call_node):
-              """Extract the full dotted name from a Call node"""
               func = call_node.func
               if isinstance(func, ast.Name):
                   return func.id
@@ -335,78 +182,126 @@ jobs:
                   return ".".join(reversed(parts))
               return None
 
-          def extract_js_wrappers(filepath, user_deps):
-              """
-              Simple heuristic: find exported functions that use imported dep names.
-              Uses regex since full JS AST is heavy.
-              """
+          def extract_python_wrappers(repo_root, all_modules):
+              # Find every function in .py files that calls any module from all_modules
               wrappers = []
-              try:
-                  with open(filepath, "r", errors="ignore") as f:
-                      source = f.read()
-                      lines = source.splitlines()
-              except Exception:
-                  return wrappers
+              target = set(all_modules)
+              dangerous_builtins = {"eval", "exec", "__import__", "compile", "open", "globals", "locals"}
+              for dirpath, dirnames, filenames in os.walk(repo_root):
+                  dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+                  for fn in filenames:
+                      if not fn.endswith(".py"):
+                          continue
+                      fp = os.path.join(dirpath, fn)
+                      try:
+                          with open(fp, "r", errors="ignore") as f:
+                              source = f.read()
+                          tree = ast.parse(source, filename=fp)
+                      except Exception:
+                          continue
+                      # Per-file: alias -> root module name
+                      imported_names = {}
+                      for node in ast.walk(tree):
+                          if isinstance(node, ast.Import):
+                              for alias in node.names:
+                                  root = alias.name.split(".")[0]
+                                  if root in target:
+                                      imported_names[alias.asname or alias.name.split(".")[0]] = root
+                          elif isinstance(node, ast.ImportFrom):
+                              module = (node.module or "").split(".")[0]
+                              if module in target:
+                                  for alias in node.names:
+                                      imported_names[alias.asname or alias.name] = module
+                      rel = os.path.relpath(fp, repo_root)
+                      for node in ast.walk(tree):
+                          if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                              calls_found = {}
+                              for child in ast.walk(node):
+                                  if isinstance(child, ast.Call):
+                                      call_str = _get_call_name(child)
+                                      if not call_str:
+                                          continue
+                                      root = call_str.split(".")[0]
+                                      if root in imported_names:
+                                          calls_found[call_str] = imported_names[root]
+                                      elif root in dangerous_builtins:
+                                          calls_found[call_str] = "builtins"
+                              if calls_found:
+                                  func_src = ast.get_source_segment(source, node) or ""
+                                  wrappers.append({
+                                      "function_name": node.name,
+                                      "file": rel,
+                                      "line_start": node.lineno,
+                                      "line_end": node.end_lineno,
+                                      "calls": list(calls_found.keys()),
+                                      "modules_used": list(set(calls_found.values())),
+                                      "source_code": func_src,
+                                  })
+              return wrappers
 
-              # Gather imported names tied to user_deps
-              imported_names = set()
-              for m in RE_ES6_IMPORT.finditer(source):
-                  src = m.group("source")
-                  if src.startswith(".") or src.startswith("/"):
-                      continue
-                  top = src.split("/")[0] if not src.startswith("@") else "/".join(src.split("/")[:2])
-                  if top in user_deps:
-                      if m.group("default"):
-                          imported_names.add(m.group("default"))
-                      if m.group("named"):
-                          for n in m.group("named").split(","):
-                              imported_names.add(n.strip().split(" as ")[-1].strip())
-                      if m.group("def2"):
-                          imported_names.add(m.group("def2"))
-                      if m.group("named2"):
-                          for n in m.group("named2").split(","):
-                              imported_names.add(n.strip().split(" as ")[-1].strip())
-
-              for m in RE_REQUIRE.finditer(source):
-                  src = m.group("source")
-                  if src.startswith(".") or src.startswith("/"):
-                      continue
-                  top = src.split("/")[0] if not src.startswith("@") else "/".join(src.split("/")[:2])
-                  if top in user_deps:
-                      if m.group("name"):
-                          imported_names.add(m.group("name"))
-                      if m.group("destructured"):
-                          for n in m.group("destructured").split(","):
-                              imported_names.add(n.strip().split(":")[0].strip())
-
-              if not imported_names:
-                  return wrappers
-
-              # Find function declarations that reference those names
-              func_pattern = re.compile(
-                  r"(?:^|\\n)"
-                  r"(?:export\\s+)?(?:async\\s+)?function\\s+(\\w+)\\s*\\([^)]*\\)\\s*\\{",
-                  re.MULTILINE,
-              )
-              arrow_pattern = re.compile(
-                  r"(?:^|\\n)"
-                  r"(?:export\\s+)?(?:const|let|var)\\s+(\\w+)\\s*=\\s*(?:async\\s+)?(?:\\([^)]*\\)|\\w+)\\s*=>",
-                  re.MULTILINE,
-              )
-
-              for pattern in [func_pattern, arrow_pattern]:
-                  for m in pattern.finditer(source):
-                      func_name = m.group(1)
-                      start_pos = m.start()
-                      start_line = source[:start_pos].count("\\n")
-
-                      # Find matching closing brace (simple brace counting)
-                      brace_pos = source.find("{", m.end() - 1)
-                      if brace_pos == -1:
-                          # Arrow function without braces - take single line
-                          end_line = start_line
-                          func_body = lines[start_line] if start_line < len(lines) else ""
-                      else:
+          # ─── JS/REACT WRAPPER EXTRACTION (regex) ─────────────────────────────────────
+          def extract_js_wrappers(repo_root, all_modules):
+              # Find functions in JS/TS files that call any module from all_modules
+              wrappers = []
+              JS_EXTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+              target = set(all_modules)
+              SKIP_NAMES = {"if", "for", "while", "switch", "catch", "constructor", "else", "try"}
+              for dirpath, dirnames, filenames in os.walk(repo_root):
+                  dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+                  for fn in filenames:
+                      if not any(fn.endswith(ext) for ext in JS_EXTS):
+                          continue
+                      fp = os.path.join(dirpath, fn)
+                      try:
+                          with open(fp, "r", errors="ignore") as f:
+                              source = f.read()
+                      except Exception:
+                          continue
+                      # Build alias -> module map for modules in target
+                      alias_map = {}
+                      for m in re.finditer(r'import\s+(\w+)\s+from\s+[\'"]([^\'"]+)[\'"]', source):
+                          raw_mod = m.group(2)
+                          mod = raw_mod.split("/")[0] if not raw_mod.startswith("@") else "/".join(raw_mod.split("/")[:2])
+                          if mod in target:
+                              alias_map[m.group(1)] = mod
+                      for m in re.finditer(r'import\s+\{([^}]+)\}\s+from\s+[\'"]([^\'"]+)[\'"]', source):
+                          raw_mod = m.group(2)
+                          mod = raw_mod.split("/")[0] if not raw_mod.startswith("@") else "/".join(raw_mod.split("/")[:2])
+                          if mod in target:
+                              for part in m.group(1).split(","):
+                                  part = part.strip()
+                                  if " as " in part:
+                                      _, alias = part.split(" as ", 1)
+                                      alias_map[alias.strip()] = mod
+                                  else:
+                                      alias_map[part] = mod
+                      for m in re.finditer(r'(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)', source):
+                          raw_mod = m.group(2)
+                          mod = raw_mod.split("/")[0] if not raw_mod.startswith("@") else "/".join(raw_mod.split("/")[:2])
+                          if mod in target:
+                              alias_map[m.group(1)] = mod
+                      for m in re.finditer(r'(?:const|let|var)\s+\{([^}]+)\}\s*=\s*require\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)', source):
+                          raw_mod = m.group(2)
+                          mod = raw_mod.split("/")[0] if not raw_mod.startswith("@") else "/".join(raw_mod.split("/")[:2])
+                          if mod in target:
+                              for part in m.group(1).split(","):
+                                  alias_map[part.strip()] = mod
+                      if not alias_map:
+                          continue
+                      rel = os.path.relpath(fp, repo_root)
+                      FUNC_RE = re.compile(
+                          r'(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\([^)]*\)\s*\{'
+                          r'|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>\s*\{'
+                          r'|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?function\s*\([^)]*\)\s*\{'
+                      )
+                      for m in FUNC_RE.finditer(source):
+                          func_name = next((g for g in m.groups() if g), None)
+                          if not func_name or func_name in SKIP_NAMES:
+                              continue
+                          try:
+                              brace_pos = source.index("{", m.start())
+                          except ValueError:
+                              continue
                           depth = 0
                           end_pos = brace_pos
                           for i in range(brace_pos, len(source)):
@@ -417,122 +312,57 @@ jobs:
                                   if depth == 0:
                                       end_pos = i
                                       break
-                          end_line = source[:end_pos + 1].count("\\n")
-                          func_body = "\\n".join(lines[start_line:end_line + 1])
-
-                      # Check if function body references any imported dep names
-                      found_calls = set()
-                      for name in imported_names:
-                          if name in func_body:
-                              found_calls.add(name)
-
-                      if found_calls:
-                          wrappers.append({
-                              "function_name": func_name,
-                              "calls": list(found_calls),
-                              "line_start": start_line + 1,
-                              "line_end": end_line + 1,
-                              "source_code": func_body,
-                              "file": filepath
-                          })
-
+                          func_body = source[m.start():end_pos + 1]
+                          calls_found = {}
+                          for alias, mod in alias_map.items():
+                              for cm in re.finditer(r'\b' + re.escape(alias) + r'\.(\w+)\s*\(', func_body):
+                                  calls_found[alias + "." + cm.group(1)] = mod
+                              if re.search(r'\b' + re.escape(alias) + r'\s*\(', func_body):
+                                  if alias not in calls_found:
+                                      calls_found[alias] = mod
+                          if calls_found:
+                              line_start = source[:m.start()].count("\n") + 1
+                              line_end = line_start + func_body.count("\n")
+                              wrappers.append({
+                                  "function_name": func_name,
+                                  "file": rel,
+                                  "line_start": line_start,
+                                  "line_end": line_end,
+                                  "calls": list(calls_found.keys()),
+                                  "modules_used": list(set(calls_found.values())),
+                                  "source_code": func_body,
+                              })
               return wrappers
 
-          # ============ MAIN RUNNER ============
-
+          # ─── ORCHESTRATOR ─────────────────────────────────────────────────────────────
           def run_wrapper_hunter(repo_root="."):
-              result = {
-                  "python": None,
-                  "react": None,
-              }
-
-              # Check what exists
-              has_python = os.path.isfile(os.path.join(repo_root, "requirements.txt"))
-              has_react = os.path.isfile(os.path.join(repo_root, "package.json"))
-
-              # --- PYTHON ---
-              if has_python:
-                  py_user_deps = parse_requirements_txt(repo_root)
-                  py_section = {
-                      "packages": {
-                          "user_installed": sorted(py_user_deps),
-                          "stdlib": sorted(PYTHON_STDLIB),
+              lang = detect_language(repo_root)
+              results = {}
+              if lang in ("python", "both"):
+                  manifest_pkgs = parse_requirements_txt(repo_root)
+                  import_mods = collect_python_imports(repo_root)
+                  all_modules = sorted(set(manifest_pkgs) | set(import_mods))
+                  results["python"] = {
+                      "modules": {
+                          "from_manifest": manifest_pkgs,
+                          "from_imports": import_mods,
+                          "all": all_modules,
                       },
-                      "file_analysis": [],
-                      "wrapper_functions": [],
+                      "wrapper_functions": extract_python_wrappers(repo_root, all_modules),
                   }
-
-                  for dirpath, dirnames, filenames in os.walk(repo_root):
-                      dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
-                      for fn in filenames:
-                          if not fn.endswith(".py"):
-                              continue
-                          fp = os.path.join(dirpath, fn)
-                          rel = os.path.relpath(fp, repo_root)
-                          imports = extract_python_imports(fp)
-                          if not imports:
-                              continue
-
-                          classified = []
-                          for imp in imports:
-                              cat = classify_import(imp["module"], py_user_deps, PYTHON_STDLIB)
-                              classified.append({**imp, "classification": cat})
-
-                          py_section["file_analysis"].append({
-                              "file": rel,
-                              "imports": classified,
-                          })
-
-                          wrappers = extract_python_wrappers(fp, py_user_deps)
-                          for w in wrappers:
-                              w["file"] = rel
-                              py_section["wrapper_functions"].append(w)
-
-                  result["python"] = py_section
-
-              # --- REACT / JS ---
-              if has_react:
-                  js_user_deps = parse_package_json(repo_root)
-                  js_section = {
-                      "packages": {
-                          "user_installed": sorted(js_user_deps),
-                          "builtin": sorted(NODE_BUILTINS),
+              if lang in ("react", "both"):
+                  manifest_pkgs = parse_package_json(repo_root)
+                  import_mods = collect_js_imports(repo_root)
+                  all_modules = sorted(set(manifest_pkgs) | set(import_mods))
+                  results["react"] = {
+                      "modules": {
+                          "from_manifest": manifest_pkgs,
+                          "from_imports": import_mods,
+                          "all": all_modules,
                       },
-                      "file_analysis": [],
-                      "wrapper_functions": [],
+                      "wrapper_functions": extract_js_wrappers(repo_root, all_modules),
                   }
-
-                  for dirpath, dirnames, filenames in os.walk(repo_root):
-                      dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
-                      for fn in filenames:
-                          if not any(fn.endswith(ext) for ext in (".js", ".jsx", ".ts", ".tsx")):
-                              continue
-                          fp = os.path.join(dirpath, fn)
-                          rel = os.path.relpath(fp, repo_root)
-                          imports = extract_js_imports(fp)
-                          if not imports:
-                              continue
-
-                          classified = []
-                          for imp in imports:
-                              cat = classify_js_import(imp["module"], js_user_deps, NODE_BUILTINS)
-                              classified.append({**imp, "classification": cat})
-
-                          js_section["file_analysis"].append({
-                              "file": rel,
-                              "imports": classified,
-                          })
-
-                          wrappers = extract_js_wrappers(fp, js_user_deps)
-                          for w in wrappers:
-                              w["file"] = rel
-                              js_section["wrapper_functions"].append(w)
-
-                  result["react"] = js_section
-
-              # Remove null sections
-              result = {k: v for k, v in result.items() if v is not None}
-              return result
+              return {"language": lang, "results": results}
 
           if __name__ == "__main__":
               output = run_wrapper_hunter(".")
