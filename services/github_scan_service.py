@@ -389,19 +389,21 @@ jobs:
             
             while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
               echo "Attempt $((RETRY_COUNT + 1))/$MAX_RETRIES..."
-              if curl -X POST "${{ secrets.FIXORA_API_URL }}/api/scan/webhook/wrapper-results" \\
+              HTTP_STATUS=$(curl -s -o /tmp/wh-response.txt -w "%{http_code}" \\
+                -X POST "${{ secrets.FIXORA_API_URL }}/api/scan/webhook/wrapper-results" \\
                 -H "Content-Type: application/json" \\
                 -H "X-Fixora-Token: ${{ secrets.FIXORA_API_TOKEN }}" \\
                 -d @wh-payload.json \\
-                --max-time 30 \\
-                --retry 2 \\
-                --retry-delay 5; then
-                echo "\\n✅ Wrapper hunter results sent successfully"
+                --max-time 60)
+              echo "HTTP status: $HTTP_STATUS"
+              cat /tmp/wh-response.txt || true
+              if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+                echo "✅ Wrapper hunter results sent successfully (HTTP $HTTP_STATUS)"
                 exit 0
               else
                 RETRY_COUNT=$((RETRY_COUNT + 1))
-                echo "⚠️  Attempt $RETRY_COUNT failed. Retrying..."
-                sleep 5
+                echo "⚠️  Attempt $RETRY_COUNT failed (HTTP $HTTP_STATUS). Retrying in 10s..."
+                sleep 10
               fi
             done
             

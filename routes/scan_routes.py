@@ -152,19 +152,18 @@ async def receive_wrapper_hunter_results(
     logger.info("=" * 80)
     logger.info("WRAPPER HUNTER RESULTS RECEIVED:")
     logger.info("=" * 80)
-    import json as json_module
-    logger.info(json_module.dumps(payload.wrapper_data, indent=2))
+    logger.info(str(payload.wrapper_data)[:2000])  # truncated log
     logger.info("=" * 80)
     
-    # Send WebSocket update: wrapper hunter completed
+    # Send WebSocket update: wrapper hunter results received
     ws_manager = get_connection_manager()
     await ws_manager.send_to_scan(payload.scan_id, {
         "type": "wrapper_hunter_complete",
         "scan_id": payload.scan_id,
-        "message": "Wrapper analysis completed, sending to AI..."
+        "message": "Wrapper analysis completed. Starting AI analysis..."
     })
-    
-    # Update scan progress
+
+    # Update scan status — wrapper results received, AI analysis starting
     await db.scans.update_one(
         {"id": payload.scan_id},
         {"$set": {
@@ -174,68 +173,107 @@ async def receive_wrapper_hunter_results(
             "wrapper_data": payload.wrapper_data
         }}
     )
-    
-    # ===== SEND TO HUGGING FACE LLM =====
-    logger.info("Sending wrapper data to HuggingFace LLM for analysis...")
-    
-    await ws_manager.send_to_scan(payload.scan_id, {
-        "type": "llm_analysis_started",
-        "scan_id": payload.scan_id,
-        "message": "AI analyzing wrapper functions..."
-    })
-    
-    llm_result = await analyze_wrappers_with_llm(payload.wrapper_data)
-    
-    logger.info("=" * 80)
-    logger.info("LLM ANALYSIS RESULT (parsed):")
-    logger.info("=" * 80)
-    logger.info(json_module.dumps(llm_result, indent=2))
-    logger.info("=" * 80)
-    
-    # Store LLM result in scan record
-    await db.scans.update_one(
-        {"id": payload.scan_id},
-        {"$set": {
-            "progress": 45,
-            "phase": "triggering_semgrep",
-            "llm_result": llm_result,
-            "wrapper_data": payload.wrapper_data
-        }}
-    )
-    
-    # Send WebSocket update: LLM analysis complete
-    # Count vulnerable wrappers and sink modules from sink_modules.json format
-    sink_results = llm_result.get("results", {})
-    vuln_wrapper_count = sum(
-        len(section.get("wrapper_functions", []))
-        for section in sink_results.values()
-    )
-    sink_module_count = sum(
-        len(section.get("modules", {}).get("sink_modules", []))
-        for section in sink_results.values()
-    )
-    await ws_manager.send_to_scan(payload.scan_id, {
-        "type": "llm_analysis_complete",
-        "scan_id": payload.scan_id,
-        "vulnerable_wrappers_count": vuln_wrapper_count,
-        "sink_modules_count": sink_module_count,
-        "message": f"AI analysis complete. Found {vuln_wrapper_count} vulnerable wrapper(s) across {sink_module_count} sink module(s). Starting Semgrep scan..."
-    })
-    
-    # ===== NOW TRIGGER SEMGREP SCAN =====
-    # Run in background so we can return immediately
+
+    # ===== OFFLOAD ALL HEAVY WORK TO BACKGROUND — return 200 immediately =====
+    # The LLM call can take 60-120 seconds; the GitHub Actions curl has a
+    # --max-time limit.  Returning here lets the workflow step succeed while
+    # all processing (LLM analysis + Semgrep trigger) happens in the background.
     background_tasks.add_task(
-        _trigger_semgrep_after_wrapper_analysis,
-        payload.scan_id, payload.repository, repo_id, user_id, scan, db
+        _process_wrapper_results_in_background,
+        payload.scan_id, payload.repository, repo_id, user_id,
+        payload.wrapper_data, scan, db
     )
-    
+
     return {
         "success": True,
         "scan_id": payload.scan_id,
-        "vulnerable_wrappers_count": vuln_wrapper_count,
-        "sink_modules_count": sink_module_count,
-        "message": "Wrapper analysis received, Semgrep scan being triggered"
+        "message": "Wrapper hunter results received. AI analysis + Semgrep scan starting in background."
     }
+
+
+async def _process_wrapper_results_in_background(
+    scan_id: str,
+    repository: str,
+    repo_id: str,
+    user_id: str,
+    wrapper_data: dict,
+    scan: dict,
+    db
+):
+    """
+    Background task – runs after the HTTP response is already sent.
+    1. Send wrapper data to HuggingFace LLM (can take 60-120s)
+    2. Store LLM result (sink_modules.json)
+    3. Trigger Semgrep scan
+    """
+    import json as json_module
+    ws_manager = get_connection_manager()
+
+    try:
+        # ── LLM ANALYSIS ──────────────────────────────────────────────────────
+        logger.info(f"[BG] Starting LLM analysis for scan {scan_id}")
+        await ws_manager.send_to_scan(scan_id, {
+            "type": "llm_analysis_started",
+            "scan_id": scan_id,
+            "message": "AI analyzing wrapper functions for security sinks..."
+        })
+
+        llm_result = await analyze_wrappers_with_llm(wrapper_data)
+
+        logger.info("=" * 80)
+        logger.info("LLM ANALYSIS RESULT (sink_modules.json):")
+        logger.info("=" * 80)
+        logger.info(json_module.dumps(llm_result, indent=2))
+        logger.info("=" * 80)
+
+        # Count findings for WebSocket message
+        sink_results = llm_result.get("results", {})
+        vuln_wrapper_count = sum(
+            len(section.get("wrapper_functions", []))
+            for section in sink_results.values()
+        )
+        sink_module_count = sum(
+            len(section.get("modules", {}).get("sink_modules", []))
+            for section in sink_results.values()
+        )
+
+        await db.scans.update_one(
+            {"id": scan_id},
+            {"$set": {
+                "progress": 45,
+                "phase": "triggering_semgrep",
+                "llm_result": llm_result,
+            }}
+        )
+
+        await ws_manager.send_to_scan(scan_id, {
+            "type": "llm_analysis_complete",
+            "scan_id": scan_id,
+            "vulnerable_wrappers_count": vuln_wrapper_count,
+            "sink_modules_count": sink_module_count,
+            "message": (
+                f"AI analysis complete. Found {vuln_wrapper_count} vulnerable wrapper(s) "
+                f"across {sink_module_count} sink module(s). Starting Semgrep scan..."
+            )
+        })
+
+        # ── TRIGGER SEMGREP ──────────────────────────────────────────────────
+        await _trigger_semgrep_after_wrapper_analysis(
+            scan_id, repository, repo_id, user_id, scan, db
+        )
+
+    except Exception as exc:
+        logger.error(f"[BG] Error processing wrapper results for scan {scan_id}: {exc}")
+        await db.scans.update_one(
+            {"id": scan_id},
+            {"$set": {"status": "failed", "error": str(exc)}}
+        )
+        await ws_manager.send_to_scan(scan_id, {
+            "type": "scan_failed",
+            "scan_id": scan_id,
+            "message": f"Error during AI analysis: {str(exc)}"
+        })
+
 
 
 async def _trigger_semgrep_after_wrapper_analysis(

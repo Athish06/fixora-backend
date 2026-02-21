@@ -132,8 +132,12 @@ def build_wrapper_analysis_prompt(wrapper_data: Dict[str, Any]) -> str:
                      f"{', '.join(modules.get('from_manifest', [])) or 'none'}\n")
         parts.append(f"from_imports  ({len(modules.get('from_imports', []))} modules): "
                      f"{', '.join(modules.get('from_imports', [])) or 'none'}\n")
-        parts.append(f"all modules   ({len(modules.get('all', []))} total): "
-                     f"{', '.join(modules.get('all', [])) or 'none'}\n\n")
+        # Cap 'all' list to 150 entries to avoid blowing input token budget
+        all_mods = modules.get('all', [])
+        shown = all_mods[:150]
+        truncated = len(all_mods) - len(shown)
+        all_display = ', '.join(shown) + (f" ... (+{truncated} more)" if truncated else "")
+        parts.append(f"all modules   ({len(all_mods)} total): {all_display or 'none'}\n\n")
 
         if wrappers:
             parts.append(f"Wrapper functions ({len(wrappers)} found):\n\n")
@@ -157,8 +161,9 @@ async def analyze_wrappers_with_llm(wrapper_data: Dict[str, Any]) -> Dict[str, A
     """
     Send wrapper_hunter_results.json to HuggingFace LLM.
     Returns sink_modules.json  (same structure, but only vulnerable items).
+    Uses AsyncOpenAI so the event loop is never blocked.
     """
-    from openai import OpenAI
+    from openai import AsyncOpenAI
 
     hf_token = settings.hf_token
     if not hf_token:
@@ -174,12 +179,12 @@ async def analyze_wrappers_with_llm(wrapper_data: Dict[str, Any]) -> Dict[str, A
     logger.info("=" * 80)
 
     try:
-        client = OpenAI(
+        client = AsyncOpenAI(
             base_url="https://api-inference.huggingface.co/v1/",
             api_key=hf_token,
         )
 
-        completion = client.chat.completions.create(
+        completion = await client.chat.completions.create(
             model="Qwen/Qwen2.5-Coder-32B-Instruct",
             messages=[
                 {
@@ -222,7 +227,11 @@ async def analyze_wrappers_with_llm(wrapper_data: Dict[str, Any]) -> Dict[str, A
         result.setdefault("results", {})
         result.setdefault("analysis_summary", "Analysis complete")
 
-        logger.info("Parsed sink_modules.json successfully.")
+        logger.info("=" * 80)
+        logger.info("PARSED sink_modules.json (final LLM output):")
+        logger.info("=" * 80)
+        logger.info(json.dumps(result, indent=2))
+        logger.info("=" * 80)
         return result
 
     except Exception as exc:
