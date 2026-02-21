@@ -156,11 +156,11 @@ jobs:
                               source = f.read()
                       except Exception:
                           continue
-                      for m in re.finditer(r'import\s+(?:[^\'"]*\s+from\s+)?[\'"]([^\'"]+)[\'"]', source):
+                      for m in re.finditer(r'import\s+(?:[^\\x22\\x27]*\s+from\s+)?[\\x22\\x27]([^\\x22\\x27]+)[\\x22\\x27]', source):
                           mod = m.group(1)
                           if not mod.startswith("."):
                               found.add(mod.split("/")[0] if not mod.startswith("@") else "/".join(mod.split("/")[:2]))
-                      for m in re.finditer(r'require\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)', source):
+                      for m in re.finditer(r'require\s*\(\s*[\\x22\\x27]([^\\x22\\x27]+)[\\x22\\x27]\s*\)', source):
                           mod = m.group(1)
                           if not mod.startswith("."):
                               found.add(mod.split("/")[0] if not mod.startswith("@") else "/".join(mod.split("/")[:2]))
@@ -259,12 +259,12 @@ jobs:
                           continue
                       # Build alias -> module map for modules in target
                       alias_map = {}
-                      for m in re.finditer(r'import\s+(\w+)\s+from\s+[\'"]([^\'"]+)[\'"]', source):
+                      for m in re.finditer(r'import\s+(\w+)\s+from\s+[\\x22\\x27]([^\\x22\\x27]+)[\\x22\\x27]', source):
                           raw_mod = m.group(2)
                           mod = raw_mod.split("/")[0] if not raw_mod.startswith("@") else "/".join(raw_mod.split("/")[:2])
                           if mod in target:
                               alias_map[m.group(1)] = mod
-                      for m in re.finditer(r'import\s+\{([^}]+)\}\s+from\s+[\'"]([^\'"]+)[\'"]', source):
+                      for m in re.finditer(r'import\s+\{([^}]+)\}\s+from\s+[\\x22\\x27]([^\\x22\\x27]+)[\\x22\\x27]', source):
                           raw_mod = m.group(2)
                           mod = raw_mod.split("/")[0] if not raw_mod.startswith("@") else "/".join(raw_mod.split("/")[:2])
                           if mod in target:
@@ -275,12 +275,12 @@ jobs:
                                       alias_map[alias.strip()] = mod
                                   else:
                                       alias_map[part] = mod
-                      for m in re.finditer(r'(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)', source):
+                      for m in re.finditer(r'(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*[\\x22\\x27]([^\\x22\\x27]+)[\\x22\\x27]\s*\)', source):
                           raw_mod = m.group(2)
                           mod = raw_mod.split("/")[0] if not raw_mod.startswith("@") else "/".join(raw_mod.split("/")[:2])
                           if mod in target:
                               alias_map[m.group(1)] = mod
-                      for m in re.finditer(r'(?:const|let|var)\s+\{([^}]+)\}\s*=\s*require\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)', source):
+                      for m in re.finditer(r'(?:const|let|var)\s+\{([^}]+)\}\s*=\s*require\s*\(\s*[\\x22\\x27]([^\\x22\\x27]+)[\\x22\\x27]\s*\)', source):
                           raw_mod = m.group(2)
                           mod = raw_mod.split("/")[0] if not raw_mod.startswith("@") else "/".join(raw_mod.split("/")[:2])
                           if mod in target:
