@@ -315,14 +315,14 @@ jobs:
                           func_body = source[m.start():end_pos + 1]
                           calls_found = {}
                           for alias, mod in alias_map.items():
-                              for cm in re.finditer(r'\b' + re.escape(alias) + r'\.(\w+)\s*\(', func_body):
+                              for cm in re.finditer(r'\\b' + re.escape(alias) + r'\.(\w+)\s*\(', func_body):
                                   calls_found[alias + "." + cm.group(1)] = mod
-                              if re.search(r'\b' + re.escape(alias) + r'\s*\(', func_body):
+                              if re.search(r'\\b' + re.escape(alias) + r'\s*\(', func_body):
                                   if alias not in calls_found:
                                       calls_found[alias] = mod
                           if calls_found:
-                              line_start = source[:m.start()].count("\n") + 1
-                              line_end = line_start + func_body.count("\n")
+                              line_start = source[:m.start()].count("\\n") + 1
+                              line_end = line_start + func_body.count("\\n")
                               wrappers.append({
                                   "function_name": func_name,
                                   "file": rel,
