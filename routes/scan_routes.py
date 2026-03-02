@@ -17,6 +17,7 @@ from services.activity_service import log_activity
 from services.websocket_manager import get_connection_manager
 from services.github_scan_service import GitHubScanService
 from services.llm_service import analyze_wrappers_with_llm, build_wrapper_analysis_prompt
+from services.semgrep_rule_generator import generate_custom_rules, count_generated_rules
 
 router = APIRouter(prefix='/scan', tags=['Scans'])
 logger = logging.getLogger(__name__)
@@ -204,7 +205,9 @@ async def _process_wrapper_results_in_background(
     Background task – runs after the HTTP response is already sent.
     1. Send wrapper data to Groq LLM (can take 30-60s)
     2. Store LLM result (sink_modules.json)
-    3. Trigger Semgrep scan
+    3. Generate custom Semgrep rules from LLM output
+    4. Store LLM-identified wrappers as AI patterns
+    5. Trigger Semgrep scan (with custom rules)
     """
     import json as json_module
     ws_manager = get_connection_manager()
@@ -237,12 +240,23 @@ async def _process_wrapper_results_in_background(
             for section in sink_results.values()
         )
 
+        # ── GENERATE CUSTOM SEMGREP RULES ─────────────────────────────────────
+        custom_rules_yaml = ""
+        if vuln_wrapper_count > 0:
+            logger.info(f"[BG] Generating custom Semgrep rules for {vuln_wrapper_count} vulnerable wrapper(s)")
+            custom_rules_yaml = generate_custom_rules(llm_result)
+            rules_count = count_generated_rules(llm_result)
+            logger.info(f"[BG] Generated {rules_count} custom Semgrep rules")
+        else:
+            logger.info("[BG] No vulnerable wrappers found — skipping custom rule generation")
+
         await db.scans.update_one(
             {"id": scan_id},
             {"$set": {
                 "progress": 45,
                 "phase": "triggering_semgrep",
                 "llm_result": llm_result,
+                "custom_rules_yaml": custom_rules_yaml,
             }}
         )
 
@@ -251,15 +265,22 @@ async def _process_wrapper_results_in_background(
             "scan_id": scan_id,
             "vulnerable_wrappers_count": vuln_wrapper_count,
             "sink_modules_count": sink_module_count,
+            "custom_rules_count": count_generated_rules(llm_result),
             "message": (
                 f"AI analysis complete. Found {vuln_wrapper_count} vulnerable wrapper(s) "
-                f"across {sink_module_count} sink module(s). Starting Semgrep scan..."
+                f"across {sink_module_count} sink module(s). "
+                f"Generated {count_generated_rules(llm_result)} custom Semgrep rule(s). "
+                f"Starting Semgrep scan..."
             )
         })
 
+        # ── STORE LLM-IDENTIFIED WRAPPERS AS AI PATTERNS ─────────────────────
+        await _store_llm_patterns(scan_id, repo_id, llm_result, db)
+
         # ── TRIGGER SEMGREP ──────────────────────────────────────────────────
         await _trigger_semgrep_after_wrapper_analysis(
-            scan_id, repository, repo_id, user_id, scan, db
+            scan_id, repository, repo_id, user_id, scan, db,
+            custom_rules_yaml=custom_rules_yaml
         )
 
     except Exception as exc:
@@ -275,6 +296,86 @@ async def _process_wrapper_results_in_background(
         })
 
 
+async def _store_llm_patterns(
+    scan_id: str,
+    repo_id: str,
+    llm_result: Dict[str, Any],
+    db
+):
+    """Store LLM-identified sink modules and vulnerable wrappers as AI patterns in the DB.
+    
+    These are displayed in the AI Knowledge Base and provide context for findings
+    even if Semgrep doesn't detect callers of these wrappers.
+    """
+    try:
+        results = llm_result.get("results", {})
+        patterns_to_insert = []
+
+        for lang_key in ("python", "react"):
+            section = results.get(lang_key)
+            if not section:
+                continue
+
+            # Store sink modules as patterns
+            modules_info = section.get("modules", {})
+            sink_modules = modules_info.get("sink_modules", [])
+            for mod_name in sink_modules:
+                patterns_to_insert.append({
+                    "id": str(uuid.uuid4()),
+                    "repository_id": repo_id,
+                    "scan_id": scan_id,
+                    "pattern_type": "sink",
+                    "pattern_name": mod_name,
+                    "language": lang_key,
+                    "description": f"Sink module identified by AI: {mod_name}",
+                    "confidence": 0.85,
+                    "source": "llm_analysis",
+                    "is_verified": False,
+                    "created_at": datetime.now().isoformat()
+                })
+
+            # Store vulnerable wrapper functions as patterns
+            for wrapper in section.get("wrapper_functions", []):
+                func_name = wrapper.get("function_name", "unknown")
+                vuln_type = wrapper.get("vulnerability_type", "Unknown")
+                severity = wrapper.get("severity", "MEDIUM")
+                reason = wrapper.get("reason", "")
+                file_path = wrapper.get("file", "")
+                calls = wrapper.get("calls", [])
+
+                # Map severity to confidence score
+                severity_to_confidence = {"HIGH": 0.95, "MEDIUM": 0.80, "LOW": 0.60, "CRITICAL": 0.98}
+                confidence = severity_to_confidence.get(severity.upper(), 0.75)
+
+                patterns_to_insert.append({
+                    "id": str(uuid.uuid4()),
+                    "repository_id": repo_id,
+                    "scan_id": scan_id,
+                    "pattern_type": "wrapper",
+                    "pattern_name": f"{func_name}()",
+                    "language": lang_key,
+                    "description": f"{vuln_type}: {reason}",
+                    "file_path": file_path,
+                    "calls": calls,
+                    "modules_used": wrapper.get("modules_used", []),
+                    "vulnerability_type": vuln_type,
+                    "severity": severity,
+                    "confidence": confidence,
+                    "source": "llm_analysis",
+                    "is_verified": False,
+                    "created_at": datetime.now().isoformat()
+                })
+
+        if patterns_to_insert:
+            await db.ai_patterns.insert_many(patterns_to_insert)
+            logger.info(f"Stored {len(patterns_to_insert)} AI patterns for scan {scan_id}")
+        else:
+            logger.info(f"No AI patterns to store for scan {scan_id}")
+
+    except Exception as e:
+        logger.error(f"Error storing LLM patterns for scan {scan_id}: {e}")
+        # Non-fatal — don't fail the scan over this
+
 
 async def _trigger_semgrep_after_wrapper_analysis(
     scan_id: str,
@@ -282,9 +383,14 @@ async def _trigger_semgrep_after_wrapper_analysis(
     repo_id: str, 
     user_id: str,
     scan: dict,
-    db
+    db,
+    custom_rules_yaml: str = ""
 ):
-    """Background task: trigger the Semgrep scan after wrapper analysis is done"""
+    """Background task: trigger the Semgrep scan after wrapper analysis is done.
+    
+    If custom_rules_yaml is provided, pushes .fixora-rules.yml to the repo
+    so Semgrep picks up AI-generated rules alongside --config auto.
+    """
     try:
         # Get GitHub connection
         github_connection = await db.github_connections.find_one({"user_id": user_id})
@@ -327,6 +433,17 @@ async def _trigger_semgrep_after_wrapper_analysis(
         logger.info(f"Cleaning up wrapper hunter workflow from {repository}")
         await service.delete_wrapper_hunter_workflow(owner, repo_name, default_branch)
         
+        # ── PUSH CUSTOM RULES (AI-GENERATED) ────────────────────────────────
+        if custom_rules_yaml:
+            logger.info(f"Pushing AI-generated custom Semgrep rules to {repository}")
+            rules_pushed = await service.push_custom_rules_file(
+                owner, repo_name, default_branch, custom_rules_yaml
+            )
+            if rules_pushed:
+                logger.info(f"Custom rules pushed successfully to {repository}")
+            else:
+                logger.warning(f"Failed to push custom rules to {repository} — Semgrep will run with built-in rules only")
+        
         # Ensure Semgrep workflow is in place
         await service.push_workflow_file(owner, repo_name, default_branch)
         
@@ -358,10 +475,12 @@ async def _trigger_semgrep_after_wrapper_analysis(
             )
             
             ws_manager = get_connection_manager()
+            rules_msg = " (with AI-enhanced rules)" if custom_rules_yaml else ""
             await ws_manager.send_to_scan(scan_id, {
                 "type": "semgrep_started",
                 "scan_id": scan_id,
-                "message": "Semgrep security scan running..."
+                "has_custom_rules": bool(custom_rules_yaml),
+                "message": f"Semgrep security scan running{rules_msg}..."
             })
             
             logger.info(f"Semgrep scan triggered for {repository} (scan_id: {scan_id})")
@@ -610,45 +729,64 @@ async def receive_scan_results(
     
     logger.info(f"Scan {payload.scan_id} completed with {vuln_count} vulnerabilities")
     
-    # Clean up: Delete BOTH workflow files from repository after scan completion
+    # Clean up: Delete ALL Fixora files from the repository after scan completes.
+    # Each deletion is independent — a failure on one does NOT stop the others.
     try:
         # Get GitHub connection for this user
         github_connection = await db.github_connections.find_one({"user_id": user_id})
         
-        if github_connection:
-            # Use installation token for proper access
+        if not github_connection:
+            logger.warning(f"No GitHub connection found for user {user_id}, skipping cleanup")
+        else:
             installation_id = github_connection.get("installation_id")
             if installation_id:
                 from routes.github_routes import get_installation_access_token
                 access_token = await get_installation_access_token(installation_id)
-                if access_token:
-                    service = GitHubScanService(access_token)
-                else:
-                    service = GitHubScanService(github_connection.get("access_token", ""))
+                if not access_token:
+                    access_token = github_connection.get("access_token", "")
             else:
-                service = GitHubScanService(github_connection.get("access_token", ""))
-            
-            # Parse repository full_name (owner/repo)
-            owner, repo_name = payload.repository.split("/", 1)
-            
-            # Get default branch
-            repo_info = await service.get_repository_info(owner, repo_name)
-            default_branch = repo_info.get("default_branch", "main")
-            
-            # Delete the Semgrep workflow file
-            delete_result = await service.delete_workflow_file(owner, repo_name, default_branch)
-            if delete_result:
-                logger.info(f"Cleaned up Semgrep workflow from {payload.repository}")
-            
-            # Also delete wrapper hunter workflow if it exists
-            wh_delete_result = await service.delete_wrapper_hunter_workflow(owner, repo_name, default_branch)
-            if wh_delete_result:
-                logger.info(f"Cleaned up wrapper hunter workflow from {payload.repository}")
-        else:
-            logger.warning(f"No GitHub connection found for user {user_id}, skipping workflow cleanup")
-            
+                access_token = github_connection.get("access_token", "")
+
+            if not access_token:
+                logger.error("No access token available for cleanup, skipping")
+            else:
+                service = GitHubScanService(access_token)
+                owner, repo_name = payload.repository.split("/", 1)
+                repo_info = await service.get_repository_info(owner, repo_name)
+                default_branch = repo_info.get("default_branch", "main")
+
+                # 1. Delete Semgrep workflow (.github/workflows/fixora-scan.yml)
+                try:
+                    ok = await service.delete_workflow_file(owner, repo_name, default_branch)
+                    if ok:
+                        logger.info(f"✅ Deleted Semgrep workflow from {payload.repository}")
+                    else:
+                        logger.warning(f"⚠️  Semgrep workflow not deleted from {payload.repository}")
+                except Exception as e:
+                    logger.error(f"Error deleting Semgrep workflow: {e}")
+
+                # 2. Delete Wrapper Hunter workflow (.github/workflows/fixora-wrapper-hunter.yml)
+                try:
+                    ok = await service.delete_wrapper_hunter_workflow(owner, repo_name, default_branch)
+                    if ok:
+                        logger.info(f"✅ Deleted Wrapper Hunter workflow from {payload.repository}")
+                    else:
+                        logger.warning(f"⚠️  Wrapper Hunter workflow not deleted from {payload.repository}")
+                except Exception as e:
+                    logger.error(f"Error deleting Wrapper Hunter workflow: {e}")
+
+                # 3. Delete AI-generated custom rules (.fixora-rules.yml)
+                try:
+                    ok = await service.delete_custom_rules_file(owner, repo_name, default_branch)
+                    if ok:
+                        logger.info(f"✅ Deleted custom rules file from {payload.repository}")
+                    else:
+                        logger.warning(f"⚠️  Custom rules file not deleted from {payload.repository}")
+                except Exception as e:
+                    logger.error(f"Error deleting custom rules file: {e}")
+
     except Exception as e:
-        logger.error(f"Error cleaning up workflow file: {e}")
+        logger.error(f"Unexpected error during post-scan cleanup: {e}")
     
     # Close the scan-specific WebSocket connection
     if scan_socket_sent:

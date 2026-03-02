@@ -16,6 +16,7 @@ settings = get_settings()
 GITHUB_API_URL = "https://api.github.com"
 WORKFLOW_FILE_PATH = ".github/workflows/fixora-scan.yml"
 WRAPPER_WORKFLOW_FILE_PATH = ".github/workflows/fixora-wrapper-hunter.yml"
+CUSTOM_RULES_FILE_PATH = ".fixora-rules.yml"
 
 # ============== WRAPPER HUNTER WORKFLOW TEMPLATE ==============
 WRAPPER_HUNTER_TEMPLATE = '''name: Fixora Wrapper Hunter
@@ -471,15 +472,25 @@ jobs:
       - name: Run Semgrep Scan (Full)
         if: ${{ (github.event.client_payload.scan_mode || github.event.inputs.scan_mode) == 'full' }}
         run: |
-          semgrep scan --config auto --json --output semgrep-results.json . || true
+          EXTRA_CONFIG=""
+          if [ -f .fixora-rules.yml ]; then
+            echo "Found Fixora custom rules from AI analysis, including in scan..."
+            EXTRA_CONFIG="--config .fixora-rules.yml"
+          fi
+          semgrep scan --config auto $EXTRA_CONFIG --json --output semgrep-results.json . || true
 
       - name: Run Semgrep Scan (Diff)
         if: ${{ (github.event.client_payload.scan_mode || github.event.inputs.scan_mode) == 'diff' && (github.event.client_payload.base_commit || github.event.inputs.base_commit) != '' }}
         run: |
+          EXTRA_CONFIG=""
+          if [ -f .fixora-rules.yml ]; then
+            echo "Found Fixora custom rules from AI analysis, including in scan..."
+            EXTRA_CONFIG="--config .fixora-rules.yml"
+          fi
           BASE_COMMIT="${{ github.event.client_payload.base_commit || github.event.inputs.base_commit }}"
           git diff --name-only $BASE_COMMIT HEAD > changed_files.txt
           if [ -s changed_files.txt ]; then
-            semgrep scan --config auto --json --output semgrep-results.json $(cat changed_files.txt | tr '\\n' ' ') || true
+            semgrep scan --config auto $EXTRA_CONFIG --json --output semgrep-results.json $(cat changed_files.txt | tr '\\n' ' ') || true
           else
             echo '{"results": [], "errors": []}' > semgrep-results.json
           fi
@@ -946,6 +957,98 @@ class GitHubScanService:
                     
         except Exception as e:
             logger.error(f"Error deleting wrapper hunter workflow: {e}")
+            return False
+    
+    async def push_custom_rules_file(self, owner: str, repo: str, default_branch: str, rules_yaml: str) -> bool:
+        """Push .fixora-rules.yml (AI-generated Semgrep rules) to the repository.
+        
+        This file is picked up by the Semgrep workflow alongside --config auto,
+        letting Semgrep catch calls to project-specific dangerous wrappers that
+        built-in rules wouldn't know about.
+        """
+        if not rules_yaml or not rules_yaml.strip():
+            logger.info("No custom rules to push (empty YAML)")
+            return True  # Not an error — just nothing to push
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Check if file already exists
+                check_response = await client.get(
+                    f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{CUSTOM_RULES_FILE_PATH}",
+                    params={"ref": default_branch},
+                    headers=self.headers
+                )
+                
+                sha = None
+                if check_response.status_code == 200:
+                    sha = check_response.json().get("sha")
+                
+                content = base64.b64encode(rules_yaml.encode()).decode()
+                
+                payload = {
+                    "message": "chore: Add Fixora AI-generated Semgrep rules for scan",
+                    "content": content,
+                    "branch": default_branch
+                }
+                
+                if sha:
+                    payload["sha"] = sha
+                
+                response = await client.put(
+                    f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{CUSTOM_RULES_FILE_PATH}",
+                    headers=self.headers,
+                    json=payload
+                )
+                
+                if response.status_code in [200, 201]:
+                    logger.info(f"Pushed custom Semgrep rules to {owner}/{repo} ({CUSTOM_RULES_FILE_PATH})")
+                    return True
+                else:
+                    logger.error(f"Failed to push custom rules: {response.status_code} - {response.text}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Error pushing custom rules file: {e}")
+            return False
+    
+    async def delete_custom_rules_file(self, owner: str, repo: str, default_branch: str = "main") -> bool:
+        """Delete .fixora-rules.yml after scan completion to keep the repo clean."""
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                check_response = await client.get(
+                    f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{CUSTOM_RULES_FILE_PATH}",
+                    params={"ref": default_branch},
+                    headers=self.headers
+                )
+                
+                if check_response.status_code != 200:
+                    logger.info(f"Custom rules file not found in {owner}/{repo}, nothing to delete")
+                    return True
+                
+                sha = check_response.json().get("sha")
+                if not sha:
+                    return False
+                
+                response = await client.request(
+                    "DELETE",
+                    f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{CUSTOM_RULES_FILE_PATH}",
+                    headers=self.headers,
+                    json={
+                        "message": "chore: Remove Fixora AI-generated rules (scan completed)",
+                        "sha": sha,
+                        "branch": default_branch
+                    }
+                )
+                
+                if response.status_code in [200, 204]:
+                    logger.info(f"Deleted custom rules file from {owner}/{repo}")
+                    return True
+                else:
+                    logger.error(f"Failed to delete custom rules: {response.status_code} - {response.text}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Error deleting custom rules file: {e}")
             return False
     
     async def trigger_wrapper_hunter(
