@@ -74,6 +74,60 @@ async def get_scan_status(
     return ScanResult(**scan)
 
 
+@router.get('/debug/latest/{repo_id}')
+async def get_latest_scan_debug(
+    repo_id: str,
+    current_user: TokenData = Depends(get_current_user),
+    db = Depends(get_database)
+):
+    """
+    Return full debug data for the latest scan of a repository:
+    - wrapper_hunter_results  (raw output from GitHub Actions)
+    - llm_prompt              (exact prompt sent to Groq)
+    - llm_result              (sink_modules.json from Groq)
+    - custom_rules_yaml       (Semgrep rules generated from LLM output)
+    - scan metadata           (scan_id, status, phase, timestamps)
+    """
+    # Verify user owns the repo
+    repo = await db.repositories.find_one({'id': repo_id, 'user_id': current_user.user_id})
+    if not repo:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Repository not found')
+
+    # Get the most recent scan that has data (has wrapper_data or llm_result)
+    scan = await db.scans.find_one(
+        {'repository_id': repo_id},
+        {'_id': 0},
+        sort=[('started_at', -1)]
+    )
+
+    if not scan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='No scans found for this repository')
+
+    wrapper_data = scan.get('wrapper_data')
+    llm_result   = scan.get('llm_result')
+    custom_rules = scan.get('custom_rules_yaml', '')
+
+    # Rebuild the exact prompt that was sent to Groq (if wrapper data is present)
+    llm_prompt = None
+    if wrapper_data:
+        try:
+            llm_prompt = build_wrapper_analysis_prompt(wrapper_data)
+        except Exception as e:
+            llm_prompt = f"(Could not rebuild prompt: {e})"
+
+    return {
+        "scan_id":              scan.get('id') or scan.get('scan_id', 'unknown'),
+        "status":               scan.get('status', 'unknown'),
+        "phase":                scan.get('phase', 'unknown'),
+        "started_at":           scan.get('started_at'),
+        "completed_at":         scan.get('completed_at'),
+        "wrapper_hunter_results": wrapper_data,
+        "llm_prompt":           llm_prompt,
+        "llm_result":           llm_result,
+        "custom_rules_yaml":    custom_rules,
+    }
+
+
 # ============== WEBHOOK ENDPOINTS FOR GITHUB ACTIONS ==============
 
 class SemgrepResult(BaseModel):
