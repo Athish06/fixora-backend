@@ -74,60 +74,6 @@ async def get_scan_status(
     return ScanResult(**scan)
 
 
-@router.get('/debug/latest/{repo_id}')
-async def get_latest_scan_debug(
-    repo_id: str,
-    current_user: TokenData = Depends(get_current_user),
-    db = Depends(get_database)
-):
-    """
-    Return full debug data for the latest scan of a repository:
-    - wrapper_hunter_results  (raw output from GitHub Actions)
-    - llm_prompt              (exact prompt sent to Groq)
-    - llm_result              (sink_modules.json from Groq)
-    - custom_rules_yaml       (Semgrep rules generated from LLM output)
-    - scan metadata           (scan_id, status, phase, timestamps)
-    """
-    # Verify user owns the repo
-    repo = await db.repositories.find_one({'id': repo_id, 'user_id': current_user.user_id})
-    if not repo:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Repository not found')
-
-    # Get the most recent scan that has data (has wrapper_data or llm_result)
-    scan = await db.scans.find_one(
-        {'repository_id': repo_id},
-        {'_id': 0},
-        sort=[('started_at', -1)]
-    )
-
-    if not scan:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='No scans found for this repository')
-
-    wrapper_data = scan.get('wrapper_data')
-    llm_result   = scan.get('llm_result')
-    custom_rules = scan.get('custom_rules_yaml', '')
-
-    # Rebuild the exact prompt that was sent to Groq (if wrapper data is present)
-    llm_prompt = None
-    if wrapper_data:
-        try:
-            llm_prompt = build_wrapper_analysis_prompt(wrapper_data)
-        except Exception as e:
-            llm_prompt = f"(Could not rebuild prompt: {e})"
-
-    return {
-        "scan_id":              scan.get('id') or scan.get('scan_id', 'unknown'),
-        "status":               scan.get('status', 'unknown'),
-        "phase":                scan.get('phase', 'unknown'),
-        "started_at":           scan.get('started_at'),
-        "completed_at":         scan.get('completed_at'),
-        "wrapper_hunter_results": wrapper_data,
-        "llm_prompt":           llm_prompt,
-        "llm_result":           llm_result,
-        "custom_rules_yaml":    custom_rules,
-    }
-
-
 # ============== WEBHOOK ENDPOINTS FOR GITHUB ACTIONS ==============
 
 class SemgrepResult(BaseModel):
@@ -296,6 +242,7 @@ async def _process_wrapper_results_in_background(
 
         # ── GENERATE CUSTOM SEMGREP RULES ─────────────────────────────────────
         custom_rules_yaml = ""
+        rules_count = 0
         if vuln_wrapper_count > 0:
             logger.info(f"[BG] Generating custom Semgrep rules for {vuln_wrapper_count} vulnerable wrapper(s)")
             custom_rules_yaml = generate_custom_rules(llm_result)
@@ -328,8 +275,11 @@ async def _process_wrapper_results_in_background(
             )
         })
 
-        # ── STORE LLM-IDENTIFIED WRAPPERS AS AI PATTERNS ─────────────────────
-        await _store_llm_patterns(scan_id, repo_id, llm_result, db)
+        # ── STORE FULL AI PIPELINE DEBUG DATA ─────────────────────────────────
+        await _store_ai_debug(
+            scan_id, repo_id, wrapper_data, llm_result,
+            custom_rules_yaml, vuln_wrapper_count, sink_module_count, rules_count, db
+        )
 
         # ── TRIGGER SEMGREP ──────────────────────────────────────────────────
         await _trigger_semgrep_after_wrapper_analysis(
@@ -350,84 +300,56 @@ async def _process_wrapper_results_in_background(
         })
 
 
-async def _store_llm_patterns(
+async def _store_ai_debug(
     scan_id: str,
     repo_id: str,
+    wrapper_data: Dict[str, Any],
     llm_result: Dict[str, Any],
+    custom_rules_yaml: str,
+    vuln_wrapper_count: int,
+    sink_module_count: int,
+    rules_count: int,
     db
 ):
-    """Store LLM-identified sink modules and vulnerable wrappers as AI patterns in the DB.
-    
-    These are displayed in the AI Knowledge Base and provide context for findings
-    even if Semgrep doesn't detect callers of these wrappers.
+    """
+    Store the full AI pipeline debug data (Wrapper Hunter → LLM → Semgrep rules)
+    into the ai_debug collection.  One document per scan, upserted by scan_id.
     """
     try:
-        results = llm_result.get("results", {})
-        patterns_to_insert = []
+        # Rebuild the exact prompt that was sent to Groq
+        llm_prompt = None
+        if wrapper_data:
+            try:
+                llm_prompt = build_wrapper_analysis_prompt(wrapper_data)
+            except Exception as e:
+                llm_prompt = f"(Could not rebuild prompt: {e})"
 
-        for lang_key in ("python", "react"):
-            section = results.get(lang_key)
-            if not section:
-                continue
+        doc = {
+            "id": str(uuid.uuid4()),
+            "repository_id": repo_id,
+            "scan_id": scan_id,
+            "created_at": datetime.now().isoformat(),
+            # Full pipeline data
+            "wrapper_hunter_results": wrapper_data,
+            "llm_prompt": llm_prompt,
+            "llm_result": llm_result,
+            "custom_rules_yaml": custom_rules_yaml,
+            # Summary counts for quick list views
+            "vuln_wrapper_count": vuln_wrapper_count,
+            "sink_module_count": sink_module_count,
+            "rules_count": rules_count,
+        }
 
-            # Store sink modules as patterns
-            modules_info = section.get("modules", {})
-            sink_modules = modules_info.get("sink_modules", [])
-            for mod_name in sink_modules:
-                patterns_to_insert.append({
-                    "id": str(uuid.uuid4()),
-                    "repository_id": repo_id,
-                    "scan_id": scan_id,
-                    "pattern_type": "sink",
-                    "pattern_name": mod_name,
-                    "language": lang_key,
-                    "description": f"Sink module identified by AI: {mod_name}",
-                    "confidence": 0.85,
-                    "source": "llm_analysis",
-                    "is_verified": False,
-                    "created_at": datetime.now().isoformat()
-                })
-
-            # Store vulnerable wrapper functions as patterns
-            for wrapper in section.get("wrapper_functions", []):
-                func_name = wrapper.get("function_name", "unknown")
-                vuln_type = wrapper.get("vulnerability_type", "Unknown")
-                severity = wrapper.get("severity", "MEDIUM")
-                reason = wrapper.get("reason", "")
-                file_path = wrapper.get("file", "")
-                calls = wrapper.get("calls", [])
-
-                # Map severity to confidence score
-                severity_to_confidence = {"HIGH": 0.95, "MEDIUM": 0.80, "LOW": 0.60, "CRITICAL": 0.98}
-                confidence = severity_to_confidence.get(severity.upper(), 0.75)
-
-                patterns_to_insert.append({
-                    "id": str(uuid.uuid4()),
-                    "repository_id": repo_id,
-                    "scan_id": scan_id,
-                    "pattern_type": "wrapper",
-                    "pattern_name": f"{func_name}()",
-                    "language": lang_key,
-                    "description": f"{vuln_type}: {reason}",
-                    "file_path": file_path,
-                    "calls": calls,
-                    "modules_used": wrapper.get("modules_used", []),
-                    "vulnerability_type": vuln_type,
-                    "severity": severity,
-                    "confidence": confidence,
-                    "source": "llm_analysis",
-                    "is_verified": False,
-                    "created_at": datetime.now().isoformat()
-                })
-
-        if patterns_to_insert:
-            await db.ai_patterns.insert_many(patterns_to_insert)
-            logger.info(f"Stored {len(patterns_to_insert)} AI patterns for scan {scan_id}")
-        else:
-            logger.info(f"No AI patterns to store for scan {scan_id}")
+        # Upsert: one record per scan_id (replace if reprocessed)
+        await db.ai_debug.replace_one(
+            {"scan_id": scan_id},
+            doc,
+            upsert=True
+        )
+        logger.info(f"Stored AI debug data for scan {scan_id} in ai_debug collection")
 
     except Exception as e:
-        logger.error(f"Error storing LLM patterns for scan {scan_id}: {e}")
+        logger.error(f"Error storing AI debug data for scan {scan_id}: {e}")
         # Non-fatal — don't fail the scan over this
 
 
@@ -852,44 +774,3 @@ async def receive_scan_results(
         "processed": vuln_count,
         "scan_id": payload.scan_id
     }
-
-
-@router.get('/notifications')
-async def get_notifications(
-    unread_only: bool = True,
-    limit: int = 20,
-    current_user: TokenData = Depends(get_current_user),
-    db = Depends(get_database)
-):
-    """Get notifications for the current user"""
-    query = {"user_id": current_user.user_id}
-    if unread_only:
-        query["read"] = False
-    
-    notifications = await db.notifications.find(
-        query,
-        {"_id": 0}
-    ).sort("created_at", -1).limit(limit).to_list(limit)
-    
-    return notifications
-
-
-@router.post('/notifications/{notification_id}/read')
-async def mark_notification_read(
-    notification_id: str,
-    current_user: TokenData = Depends(get_current_user),
-    db = Depends(get_database)
-):
-    """Mark a notification as read"""
-    result = await db.notifications.update_one(
-        {"id": notification_id, "user_id": current_user.user_id},
-        {"$set": {"read": True}}
-    )
-    
-    if result.modified_count == 0:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Notification not found"
-        )
-    
-    return {"success": True}

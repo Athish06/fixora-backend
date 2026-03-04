@@ -3,7 +3,6 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
-from schemas.ai_pattern import AIPattern, AIPatternCreate
 from schemas.vulnerability import Vulnerability, VulnerabilityCreate, VulnerabilitySeverity
 
 logger = logging.getLogger(__name__)
@@ -18,34 +17,10 @@ async def run_scan(scan_id: str, repository_id: str, db):
         )
         await asyncio.sleep(2)
         
-        # Create mock AI patterns
-        patterns = [
-            AIPatternCreate(
-                repository_id=repository_id,
-                pattern_type='sink',
-                pattern_name='db.execute()',
-                description='Database execution sink detected',
-                confidence=0.92
-            ),
-            AIPatternCreate(
-                repository_id=repository_id,
-                pattern_type='wrapper',
-                pattern_name='safe_query()',
-                description='Safe query wrapper function',
-                confidence=0.88
-            )
-        ]
-        
-        for pattern_data in patterns:
-            pattern = AIPattern(**pattern_data.model_dump())
-            doc = pattern.model_dump()
-            doc['created_at'] = doc['created_at'].isoformat()
-            await db.ai_patterns.insert_one(doc)
-        
         # Phase 2: Scanning
         await db.scans.update_one(
             {'scan_id': scan_id},
-            {'$set': {'phase': 'scanning', 'progress': 40, 'patterns_discovered': len(patterns)}}
+            {'$set': {'phase': 'scanning', 'progress': 40}}
         )
         await asyncio.sleep(3)
         

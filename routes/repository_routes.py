@@ -68,5 +68,5 @@ async def delete_repository(
     
     # Delete associated data
     await db.vulnerabilities.delete_many({'repository_id': repo_id})
-    await db.ai_patterns.delete_many({'repository_id': repo_id})
+    await db.ai_debug.delete_many({'repository_id': repo_id})
     await db.pull_requests.delete_many({'repository_id': repo_id})

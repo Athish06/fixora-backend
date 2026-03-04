@@ -10,7 +10,7 @@ from routes import (
     repository_router,
     vulnerability_router,
     scan_router,
-    ai_pattern_router,
+    ai_debug_router,
     activity_router,
     dashboard_router,
     github_router,
@@ -60,7 +60,7 @@ api_router.include_router(auth_router)
 api_router.include_router(repository_router)
 api_router.include_router(vulnerability_router)
 api_router.include_router(scan_router)
-api_router.include_router(ai_pattern_router)
+api_router.include_router(ai_debug_router)
 api_router.include_router(activity_router)
 api_router.include_router(dashboard_router)
 api_router.include_router(github_router)
