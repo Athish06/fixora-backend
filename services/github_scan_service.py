@@ -135,7 +135,7 @@ jobs:
                       content = f.read()
                   m = re.search(r"install_requires\s*=\s*\[(.*?)\]", content, re.DOTALL)
                   if m:
-                      for pkg in re.findall(r"['\"]([^'\"]+)['\"]", m.group(1)):
+                      for pkg in re.findall(r"""["']([^"']+)["']""", m.group(1)):
                           name = re.split(r"[><=!~;\[#\s]", pkg)[0].strip()
                           if name:
                               pkgs.append(name.lower().replace("-", "_"))
@@ -155,7 +155,7 @@ jobs:
                   # [project] dependencies = [...]
                   m = re.search(r"\[project\].*?dependencies\s*=\s*\[(.*?)\]", content, re.DOTALL)
                   if m:
-                      for pkg in re.findall(r"['\"]([^'\"]+)['\"]", m.group(1)):
+                      for pkg in re.findall(r"""["']([^"']+)["']""", m.group(1)):
                           name = re.split(r"[><=!~;\[#\s]", pkg)[0].strip()
                           if name:
                               pkgs.append(name.lower().replace("-", "_"))
