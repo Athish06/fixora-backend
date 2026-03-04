@@ -67,7 +67,13 @@ jobs:
 
           # ─── LANGUAGE DETECTION ───────────────────────────────────────────────────────
           def detect_language(repo_root):
-              has_py = os.path.isfile(os.path.join(repo_root, "requirements.txt"))
+              has_py = (
+                  os.path.isfile(os.path.join(repo_root, "requirements.txt"))
+                  or os.path.isfile(os.path.join(repo_root, "setup.py"))
+                  or os.path.isfile(os.path.join(repo_root, "pyproject.toml"))
+                  or os.path.isfile(os.path.join(repo_root, "Pipfile"))
+                  or os.path.isfile(os.path.join(repo_root, "setup.cfg"))
+              )
               has_js = os.path.isfile(os.path.join(repo_root, "package.json"))
               if has_py and has_js:
                   return "both"
@@ -85,13 +91,12 @@ jobs:
               return "unknown"
 
           # ─── MANIFEST PARSERS ─────────────────────────────────────────────────────────
-          def parse_requirements_txt(repo_root):
-              # Parse requirements.txt -> clean package names (strip >=, <=, ==, etc.)
+          def _parse_single_requirements_file(path):
+              # Parse a single requirements file -> clean package names
               pkgs = []
-              req_path = os.path.join(repo_root, "requirements.txt")
-              if not os.path.isfile(req_path):
+              if not os.path.isfile(path):
                   return pkgs
-              with open(req_path, "r", errors="ignore") as f:
+              with open(path, "r", errors="ignore") as f:
                   for line in f:
                       line = line.strip()
                       if not line or line.startswith(("#", "-", "git+", "http")):
@@ -99,6 +104,95 @@ jobs:
                       name = re.split(r"[><=!~;@\[#\s]", line)[0].strip()
                       if name:
                           pkgs.append(name.lower().replace("-", "_"))
+              return pkgs
+
+          def parse_requirements_txt(repo_root):
+              # Parse requirements.txt AND any requirements-*.txt / requirements/*.txt
+              pkgs = set()
+              # Main file
+              main = os.path.join(repo_root, "requirements.txt")
+              pkgs.update(_parse_single_requirements_file(main))
+              # Extra files at root: requirements-dev.txt, requirements_test.txt, etc.
+              for fn in os.listdir(repo_root):
+                  if re.match(r"requirements[_-].+\.txt$", fn, re.IGNORECASE):
+                      pkgs.update(_parse_single_requirements_file(os.path.join(repo_root, fn)))
+              # Subdirectory: requirements/*.txt
+              req_dir = os.path.join(repo_root, "requirements")
+              if os.path.isdir(req_dir):
+                  for fn in os.listdir(req_dir):
+                      if fn.endswith(".txt"):
+                          pkgs.update(_parse_single_requirements_file(os.path.join(req_dir, fn)))
+              return sorted(pkgs)
+
+          def parse_setup_py(repo_root):
+              # Extract install_requires from setup.py using regex
+              pkgs = []
+              sp = os.path.join(repo_root, "setup.py")
+              if not os.path.isfile(sp):
+                  return pkgs
+              try:
+                  with open(sp, "r", errors="ignore") as f:
+                      content = f.read()
+                  m = re.search(r"install_requires\s*=\s*\[(.*?)\]", content, re.DOTALL)
+                  if m:
+                      for pkg in re.findall(r"['\"]([^'\"]+)['\"]", m.group(1)):
+                          name = re.split(r"[><=!~;\[#\s]", pkg)[0].strip()
+                          if name:
+                              pkgs.append(name.lower().replace("-", "_"))
+              except Exception:
+                  pass
+              return sorted(set(pkgs))
+
+          def parse_pyproject_toml(repo_root):
+              # Extract dependencies from pyproject.toml using regex (no toml lib needed)
+              pkgs = []
+              pp = os.path.join(repo_root, "pyproject.toml")
+              if not os.path.isfile(pp):
+                  return pkgs
+              try:
+                  with open(pp, "r", errors="ignore") as f:
+                      content = f.read()
+                  # [project] dependencies = [...]
+                  m = re.search(r"\[project\].*?dependencies\s*=\s*\[(.*?)\]", content, re.DOTALL)
+                  if m:
+                      for pkg in re.findall(r"['\"]([^'\"]+)['\"]", m.group(1)):
+                          name = re.split(r"[><=!~;\[#\s]", pkg)[0].strip()
+                          if name:
+                              pkgs.append(name.lower().replace("-", "_"))
+                  # [tool.poetry.dependencies]
+                  m2 = re.search(r"\[tool\.poetry\.dependencies\](.*?)(?:\[|\Z)", content, re.DOTALL)
+                  if m2:
+                      for line in m2.group(1).strip().splitlines():
+                          line = line.strip()
+                          if line and not line.startswith(("#", "[")) and "=" in line:
+                              name = line.split("=")[0].strip().strip('"').strip("'")
+                              if name and name != "python":
+                                  pkgs.append(name.lower().replace("-", "_"))
+              except Exception:
+                  pass
+              return sorted(set(pkgs))
+
+          def parse_pipfile(repo_root):
+              # Extract packages from Pipfile [packages] section
+              pkgs = []
+              pf = os.path.join(repo_root, "Pipfile")
+              if not os.path.isfile(pf):
+                  return pkgs
+              try:
+                  with open(pf, "r", errors="ignore") as f:
+                      content = f.read()
+                  for section_name in ("packages", "dev-packages"):
+                      pat = rf"\[{re.escape(section_name)}\](.*?)(?:\[|\Z)"
+                      m = re.search(pat, content, re.DOTALL)
+                      if m:
+                          for line in m.group(1).strip().splitlines():
+                              line = line.strip()
+                              if line and not line.startswith("#") and "=" in line:
+                                  name = line.split("=")[0].strip().strip('"').strip("'")
+                                  if name:
+                                      pkgs.append(name.lower().replace("-", "_"))
+              except Exception:
+                  pass
               return sorted(set(pkgs))
 
           def parse_package_json(repo_root):
@@ -183,8 +277,27 @@ jobs:
                   return ".".join(reversed(parts))
               return None
 
+          # Known dangerous method names — indicate security-relevant operations
+          # even when called on LOCAL objects (e.g. cursor.execute, proc.communicate).
+          # These catch cases where the AST can't trace variable origin back to a module.
+          DANGEROUS_SINK_METHODS = {
+              # Database / SQL
+              "execute", "executemany", "executescript", "mogrify", "callproc",
+              "raw", "extra",
+              # OS / Command execution
+              "system", "popen",
+              # Request / SSRF
+              "urlopen", "urlretrieve",
+              # Deserialization (when on unknown objects)
+              "loads", "load",
+          }
+
           def extract_python_wrappers(repo_root, all_modules):
-              # Find every function in .py files that calls any module from all_modules
+              # Find every function that:
+              #   1. Calls any module from all_modules (existing), OR
+              #   2. Calls a method on a variable derived from an imported module
+              #      (e.g. cursor.execute where cursor = conn.cursor()), OR
+              #   3. Calls a known dangerous method on ANY object (fallback)
               wrappers = []
               target = set(all_modules)
               dangerous_builtins = {"eval", "exec", "__import__", "compile", "open", "globals", "locals"}
@@ -216,6 +329,59 @@ jobs:
                       rel = os.path.relpath(fp, repo_root)
                       for node in ast.walk(tree):
                           if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                              # ── Pass 1: Track variables derived from imports ──
+                              # Handles chains like:
+                              #   conn = sqlite3.connect(...)   → conn linked to sqlite3
+                              #   cursor = conn.cursor()        → cursor linked to sqlite3
+                              # Two iterations catch A→B→C chains.
+                              import_derived = {}
+                              for _pass in range(2):
+                                  for child in ast.walk(node):
+                                      # Simple assignments: x = something.method()
+                                      if isinstance(child, ast.Assign):
+                                          if isinstance(child.value, ast.Call):
+                                              cn = _get_call_name(child.value)
+                                              if cn:
+                                                  cr = cn.split(".")[0]
+                                                  linked = imported_names.get(cr) or import_derived.get(cr)
+                                                  if linked:
+                                                      for tgt in child.targets:
+                                                          if isinstance(tgt, ast.Name):
+                                                              import_derived[tgt.id] = linked
+                                          # x = something (non-call assignment from import alias)
+                                          elif isinstance(child.value, ast.Attribute):
+                                              cn = _get_call_name(ast.Call(func=child.value, args=[], keywords=[]))  # reuse helper
+                                              if cn:
+                                                  cr = cn.split(".")[0]
+                                                  linked = imported_names.get(cr) or import_derived.get(cr)
+                                                  if linked:
+                                                      for tgt in child.targets:
+                                                          if isinstance(tgt, ast.Name):
+                                                              import_derived[tgt.id] = linked
+                                          elif isinstance(child.value, ast.Name):
+                                              if child.value.id in imported_names:
+                                                  for tgt in child.targets:
+                                                      if isinstance(tgt, ast.Name):
+                                                          import_derived[tgt.id] = imported_names[child.value.id]
+                                              elif child.value.id in import_derived:
+                                                  for tgt in child.targets:
+                                                      if isinstance(tgt, ast.Name):
+                                                          import_derived[tgt.id] = import_derived[child.value.id]
+                                      # with-statement context managers:
+                                      #   with sqlite3.connect("db") as conn:
+                                      #   async with aiohttp.ClientSession() as session:
+                                      if isinstance(child, (ast.With, ast.AsyncWith)):
+                                          for item in child.items:
+                                              ctx = item.context_expr
+                                              if isinstance(ctx, ast.Call) and item.optional_vars:
+                                                  cn = _get_call_name(ctx)
+                                                  if cn:
+                                                      cr = cn.split(".")[0]
+                                                      linked = imported_names.get(cr) or import_derived.get(cr)
+                                                      if linked and isinstance(item.optional_vars, ast.Name):
+                                                          import_derived[item.optional_vars.id] = linked
+
+                              # ── Pass 2: Collect calls ──────────────────────────
                               calls_found = {}
                               for child in ast.walk(node):
                                   if isinstance(child, ast.Call):
@@ -223,10 +389,20 @@ jobs:
                                       if not call_str:
                                           continue
                                       root = call_str.split(".")[0]
+                                      # Direct import call (existing)
                                       if root in imported_names:
                                           calls_found[call_str] = imported_names[root]
+                                      # Dangerous builtins (existing)
                                       elif root in dangerous_builtins:
                                           calls_found[call_str] = "builtins"
+                                      # NEW: Variable derived from an import (cursor.execute, conn.commit)
+                                      elif root in import_derived:
+                                          calls_found[call_str] = import_derived[root]
+                                      # NEW: Known dangerous method on any object (fallback)
+                                      elif "." in call_str:
+                                          method = call_str.rsplit(".", 1)[-1]
+                                          if method in DANGEROUS_SINK_METHODS:
+                                              calls_found[call_str] = f"<object>.{method}"
                               if calls_found:
                                   func_src = ast.get_source_segment(source, node) or ""
                                   wrappers.append({
@@ -340,7 +516,13 @@ jobs:
               lang = detect_language(repo_root)
               results = {}
               if lang in ("python", "both"):
-                  manifest_pkgs = parse_requirements_txt(repo_root)
+                  # Collect from ALL manifest sources
+                  manifest_pkgs = sorted(set(
+                      parse_requirements_txt(repo_root)
+                      + parse_setup_py(repo_root)
+                      + parse_pyproject_toml(repo_root)
+                      + parse_pipfile(repo_root)
+                  ))
                   import_mods = collect_python_imports(repo_root)
                   all_modules = sorted(set(manifest_pkgs) | set(import_mods))
                   results["python"] = {

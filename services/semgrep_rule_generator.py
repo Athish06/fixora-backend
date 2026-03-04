@@ -68,10 +68,14 @@ def generate_custom_rules(llm_result: Dict[str, Any]) -> str:
     Generate custom Semgrep YAML rules from the LLM's sink_modules.json output.
 
     For each vulnerable wrapper function identified by the LLM, we create a
-    Semgrep 'pattern' rule that catches any CALL to that wrapper anywhere in
-    the codebase.  Semgrep's built-in rules already catch direct usage of
-    dangerous APIs (e.g. subprocess.run(shell=True)), but they can't see
-    through project-specific wrapper abstractions — that's our value-add.
+    Semgrep rule that flags the DEFINITION of the vulnerable function itself.
+    Standard call-pattern rules (func(...)) fail for framework endpoints
+    (e.g. FastAPI route handlers) that are never called directly in code.
+    By matching `def func(...): ...` we catch the vulnerable code block.
+
+    Semgrep's built-in rules already catch direct usage of dangerous APIs
+    (e.g. subprocess.run(shell=True)), but they can't see through
+    project-specific wrapper abstractions — that's our value-add.
 
     Returns:
         YAML string ready to write to .fixora-rules.yml, or "" if no rules.
@@ -149,32 +153,56 @@ def _build_wrapper_rule(
 
     wraps_text = ", ".join(calls) if calls else "dangerous sink calls"
     message = (
-        f"Call to '{func_name}()' which wraps {wraps_text}. "
+        f"Vulnerable function '{func_name}()' wraps {wraps_text}. "
         f"Vulnerability: {vuln_type}. {reason}"
     )
 
-    rule: Dict[str, Any] = {
-        "id": rule_id,
-        "pattern": f"{func_name}(...)",
-        "message": message,
-        "severity": semgrep_severity,
-        "languages": list(semgrep_langs),  # copy to avoid YAML anchors
-        "metadata": {
-            "category": "security",
-            "technology": list(semgrep_langs),  # separate copy
-            "source": "fixora-ai-analysis",
-            "vulnerability_type": vuln_type,
-            "confidence": severity,
-            "wrapper_defined_in": file_path,
-            "wraps": calls,
-            "modules_used": modules,
-        },
+    metadata: Dict[str, Any] = {
+        "category": "security",
+        "technology": list(semgrep_langs),
+        "source": "fixora-ai-analysis",
+        "vulnerability_type": vuln_type,
+        "confidence": severity,
+        "wrapper_defined_in": file_path,
+        "wraps": calls,
+        "modules_used": modules,
     }
-
     if cwe:
-        rule["metadata"]["cwe"] = cwe
+        metadata["cwe"] = cwe
     if owasp:
-        rule["metadata"]["owasp"] = owasp
+        metadata["owasp"] = owasp
+
+    # ── Build language-specific patterns matching the DEFINITION, not calls ──
+    if lang_key == "python":
+        rule: Dict[str, Any] = {
+            "id": rule_id,
+            # Match the function definition itself so Semgrep flags
+            # the vulnerable code block even for framework endpoints
+            # (FastAPI routes, Django views, etc.) that are never
+            # called explicitly in user code.
+            "pattern": f"def {func_name}(...):\n  ...",
+            "message": message,
+            "severity": semgrep_severity,
+            "languages": ["python"],
+            "metadata": metadata,
+        }
+    else:
+        # JavaScript / TypeScript — cover standard forms:
+        #   function name(...) { ... }
+        #   const name = (...) => { ... }
+        #   name(...) { ... }  (class method / object shorthand)
+        rule: Dict[str, Any] = {
+            "id": rule_id,
+            "pattern-either": [
+                {"pattern": f"function {func_name}(...) {{ ... }}"},
+                {"pattern": f"const {func_name} = (...) => {{ ... }}"},
+                {"pattern": f"{func_name}(...) {{ ... }}"},
+            ],
+            "message": message,
+            "severity": semgrep_severity,
+            "languages": ["javascript", "typescript"],
+            "metadata": metadata,
+        }
 
     return rule
 
