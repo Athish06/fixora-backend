@@ -1142,7 +1142,7 @@ class GitHubScanService:
                 
                 # Create or update the file on DEFAULT branch
                 payload = {
-                    "message": "chore: Add Fixora security scanning workflow",
+                    "message": "chore: Add Fixora security scanning workflow [skip ci]",
                     "content": content,
                     "branch": default_branch
                 }
@@ -1193,7 +1193,7 @@ class GitHubScanService:
                     f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{WORKFLOW_FILE_PATH}",
                     headers=self.headers,
                     json={
-                        "message": "chore: Remove Fixora scanning workflow (scan completed)",
+                        "message": "chore: Remove Fixora scanning workflow (scan completed) [skip ci]",
                         "sha": sha,
                         "branch": default_branch
                     }
@@ -1228,7 +1228,7 @@ class GitHubScanService:
                 content = base64.b64encode(WRAPPER_HUNTER_TEMPLATE.encode()).decode()
                 
                 payload = {
-                    "message": "chore: Add Fixora wrapper hunter workflow",
+                    "message": "chore: Add Fixora wrapper hunter workflow [skip ci]",
                     "content": content,
                     "branch": default_branch
                 }
@@ -1276,7 +1276,7 @@ class GitHubScanService:
                     f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{WRAPPER_WORKFLOW_FILE_PATH}",
                     headers=self.headers,
                     json={
-                        "message": "chore: Remove Fixora wrapper hunter workflow (completed)",
+                        "message": "chore: Remove Fixora wrapper hunter workflow (completed) [skip ci]",
                         "sha": sha,
                         "branch": default_branch
                     }
@@ -1320,7 +1320,7 @@ class GitHubScanService:
                 content = base64.b64encode(rules_yaml.encode()).decode()
                 
                 payload = {
-                    "message": "chore: Add Fixora AI-generated Semgrep rules for scan",
+                    "message": "chore: Add Fixora AI-generated Semgrep rules for scan [skip ci]",
                     "content": content,
                     "branch": default_branch
                 }
@@ -1368,7 +1368,7 @@ class GitHubScanService:
                     f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{CUSTOM_RULES_FILE_PATH}",
                     headers=self.headers,
                     json={
-                        "message": "chore: Remove Fixora AI-generated rules (scan completed)",
+                        "message": "chore: Remove Fixora AI-generated rules (scan completed) [skip ci]",
                         "sha": sha,
                         "branch": default_branch
                     }

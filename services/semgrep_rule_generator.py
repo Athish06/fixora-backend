@@ -192,16 +192,28 @@ def _build_wrapper_rule(
             "metadata": metadata,
         }
     else:
-        # JavaScript / TypeScript — cover standard forms:
+        # JavaScript / TypeScript — cover all common assignment forms:
         #   function name(...) { ... }
-        #   const name = (...) => { ... }
-        #   name(...) { ... }  (class method / object shorthand)
+        #   const/let/var name = (...) => { ... }
+        #   this.name = (...) => { ... }   ← NodeGoat / Express style
+        #   this.name = function(...) { ... }
+        #   name: (...) => { ... }          ← object property
+        #   name: function(...) { ... }
+        #   name(...) { ... }               ← class method shorthand
+        # Strip any accidental trailing () the Wrapper Hunter may have included.
+        clean_name = func_name.replace("()", "").strip()
         rule: Dict[str, Any] = {
             "id": rule_id,
             "pattern-either": [
-                {"pattern": f"function {func_name}(...) {{ ... }}"},
-                {"pattern": f"const {func_name} = (...) => {{ ... }}"},
-                {"pattern": f"{func_name}(...) {{ ... }}"},
+                {"pattern": f"function {clean_name}(...) {{ ... }}"},
+                {"pattern": f"const {clean_name} = (...) => {{ ... }}"},
+                {"pattern": f"let {clean_name} = (...) => {{ ... }}"},
+                {"pattern": f"var {clean_name} = (...) => {{ ... }}"},
+                {"pattern": f"this.{clean_name} = (...) => {{ ... }}"},
+                {"pattern": f"this.{clean_name} = function(...) {{ ... }}"},
+                {"pattern": f"{clean_name}: (...) => {{ ... }}"},
+                {"pattern": f"{clean_name}: function(...) {{ ... }}"},
+                {"pattern": f"{clean_name}(...) {{ ... }}"},
             ],
             "message": message,
             "severity": semgrep_severity,
