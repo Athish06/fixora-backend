@@ -11,5 +11,6 @@ class ScanResult(BaseModel):
     progress: int = 0  # 0-100
     message: Optional[str] = None
     vulnerabilities_found: int = 0
+    patterns_discovered: int = 0
     started_at: datetime = Field(default_factory=lambda: datetime.now())
     completed_at: Optional[datetime] = None

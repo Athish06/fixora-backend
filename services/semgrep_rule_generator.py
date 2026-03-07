@@ -43,7 +43,7 @@ LANG_TO_SEMGREP = {
     "react":  ["javascript", "typescript"],
 }
 
-# All JS-family key names the LLM might use regardless of our instruction
+# All JS-family key names the LLM might use regardless of instruction
 _JS_LANG_KEYS = {"react", "javascript", "js", "node", "nodejs", "typescript", "ts"}
 
 # Vulnerability type → OWASP Top 10 (2021) mapping
@@ -86,8 +86,8 @@ def generate_custom_rules(llm_result: Dict[str, Any]) -> str:
     rules: List[Dict[str, Any]] = []
     results = llm_result.get("results", {})
 
-    # Iterate over every key the LLM returned instead of hardcoding ("python", "react").
-    # The LLM may use "javascript", "node", "react", etc. for JS sections.
+    # Iterate every key the LLM returned — never hardcode ("python", "react").
+    # The LLM may use "javascript", "node", etc. for the JS section.
     for lang_key, section in results.items():
         if not section or not isinstance(section, dict):
             continue
@@ -177,7 +177,7 @@ def _build_wrapper_rule(
         metadata["owasp"] = owasp
 
     # ── Build language-specific patterns matching the DEFINITION, not calls ──
-    # Any non-python key (react, javascript, node, etc.) gets JS patterns
+    # Any non-python key (react, javascript, node, etc.) uses JS patterns.
     if lang_key == "python":
         rule: Dict[str, Any] = {
             "id": rule_id,
@@ -232,5 +232,4 @@ def _semgrep_langs_for_key(lang_key: str) -> List[str]:
         return ["python"]
     if lang_key.lower() in _JS_LANG_KEYS:
         return ["javascript", "typescript"]
-    # Unknown key: use as-is and let Semgrep validate
     return [lang_key]

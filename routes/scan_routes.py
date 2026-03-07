@@ -628,18 +628,42 @@ async def receive_scan_results(
         details={"message": f"Found {vuln_count} vulnerabilities", "vulnerability_count": vuln_count, "severity_counts": severity_counts}
     )
     
-    # Send real-time WebSocket notification
-    ws_manager = get_connection_manager()
+    # Store notification for real-time delivery
     notification = {
+        "id": str(uuid.uuid4()),
+        "user_id": user_id,
         "type": "scan_complete",
-        "scan_id": payload.scan_id,
-        "repository_id": repo_id,
-        "repository": payload.repository,
-        "vulnerability_count": vuln_count,
-        "severity_counts": severity_counts
+        "title": "Scan Completed",
+        "message": f"Security scan for {payload.repository} found {vuln_count} vulnerabilities",
+        "data": {
+            "scan_id": payload.scan_id,
+            "repository_id": repo_id,
+            "repository": payload.repository,
+            "vulnerability_count": vuln_count,
+            "severity_counts": severity_counts
+        },
+        "read": False,
+        "created_at": datetime.now().isoformat()
     }
-    await ws_manager.send_to_scan(payload.scan_id, notification)
-    await ws_manager.send_to_user(user_id, notification)
+    
+    # Insert into DB (this adds _id field to the dict)
+    await db.notifications.insert_one(notification)
+    
+    # Send real-time WebSocket notification (remove _id to avoid serialization error)
+    notification_copy = {k: v for k, v in notification.items() if k != '_id'}
+    ws_manager = get_connection_manager()
+    
+    # First, try to send to scan-specific socket
+    scan_socket_sent = await ws_manager.send_to_scan(payload.scan_id, {
+        "type": "scan_complete",
+        "notification": notification_copy
+    })
+    
+    # Also send to general user connections
+    await ws_manager.send_to_user(user_id, {
+        "type": "scan_complete",
+        "notification": notification_copy
+    })
     
     logger.info(f"Scan {payload.scan_id} completed with {vuln_count} vulnerabilities")
     
