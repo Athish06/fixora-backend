@@ -192,19 +192,22 @@ def _build_wrapper_rule(
             "metadata": metadata,
         }
     else:
-        # JavaScript / TypeScript — cover all common assignment forms:
-        #   function name(...) { ... }
-        #   const/let/var name = (...) => { ... }
-        #   this.name = (...) => { ... }   ← NodeGoat / Express style
-        #   this.name = function(...) { ... }
-        #   name: (...) => { ... }          ← object property
-        #   name: function(...) { ... }
-        #   name(...) { ... }               ← class method shorthand
+        # JavaScript / TypeScript — build patterns based on whether the name
+        # is a plain identifier or a dotted path (e.g. module.exports.userSearch).
+        #
+        # IMPORTANT: patterns like `function module.exports.x(...)` are invalid
+        # JavaScript syntax.  Semgrep silently drops the ENTIRE rules file when
+        # it encounters even one syntactically invalid pattern, falling back to
+        # built-in rules only.  So dotted names must only use assignment forms.
+        #
         # Strip any accidental trailing () the Wrapper Hunter may have included.
         clean_name = func_name.replace("()", "").strip()
-        rule: Dict[str, Any] = {
-            "id": rule_id,
-            "pattern-either": [
+        is_dotted = "." in clean_name
+
+        patterns = []
+        if not is_dotted:
+            # Simple identifier — all forms are valid JS
+            patterns += [
                 {"pattern": f"function {clean_name}(...) {{ ... }}"},
                 {"pattern": f"const {clean_name} = (...) => {{ ... }}"},
                 {"pattern": f"let {clean_name} = (...) => {{ ... }}"},
@@ -214,7 +217,17 @@ def _build_wrapper_rule(
                 {"pattern": f"{clean_name}: (...) => {{ ... }}"},
                 {"pattern": f"{clean_name}: function(...) {{ ... }}"},
                 {"pattern": f"{clean_name}(...) {{ ... }}"},
-            ],
+            ]
+        # Assignment patterns work for ANY name form, including dotted paths
+        # like module.exports.userSearch = function(req, res) { ... }
+        patterns += [
+            {"pattern": f"{clean_name} = (...) => {{ ... }}"},
+            {"pattern": f"{clean_name} = function(...) {{ ... }}"},
+        ]
+
+        rule: Dict[str, Any] = {
+            "id": rule_id,
+            "pattern-either": patterns,
             "message": message,
             "severity": semgrep_severity,
             "languages": ["javascript", "typescript"],
