@@ -200,7 +200,7 @@ async def analyze_wrappers_with_llm(wrapper_data: Dict[str, Any]) -> Dict[str, A
                     "content": prompt,
                 },
             ],
-            max_tokens=4096,
+            max_tokens=8000,
             temperature=0.1,  # Low temperature for more deterministic/accurate output
         )
 
