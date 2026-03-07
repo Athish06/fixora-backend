@@ -147,13 +147,17 @@ def build_wrapper_analysis_prompt(wrapper_data: Dict[str, Any]) -> str:
         modules = section.get("modules", {})
         wrappers = section.get("wrapper_functions", [])
 
+        # Sanitise all module lists: drop None entries and coerce to str
+        from_manifest = [str(m) for m in modules.get('from_manifest', []) if m is not None]
+        from_imports  = [str(m) for m in modules.get('from_imports', [])  if m is not None]
+        all_mods      = [str(m) for m in modules.get('all', [])           if m is not None]
+
         parts.append(f"--- {lang_label} ---\n")
-        parts.append(f"from_manifest ({len(modules.get('from_manifest', []))} packages): "
-                     f"{', '.join(modules.get('from_manifest', [])) or 'none'}\n")
-        parts.append(f"from_imports  ({len(modules.get('from_imports', []))} modules): "
-                     f"{', '.join(modules.get('from_imports', [])) or 'none'}\n")
+        parts.append(f"from_manifest ({len(from_manifest)} packages): "
+                     f"{', '.join(from_manifest) or 'none'}\n")
+        parts.append(f"from_imports  ({len(from_imports)} modules): "
+                     f"{', '.join(from_imports) or 'none'}\n")
         # Cap 'all' list to 150 entries to avoid blowing input token budget
-        all_mods = modules.get('all', [])
         shown = all_mods[:150]
         truncated = len(all_mods) - len(shown)
         all_display = ', '.join(shown) + (f" ... (+{truncated} more)" if truncated else "")
@@ -162,10 +166,13 @@ def build_wrapper_analysis_prompt(wrapper_data: Dict[str, Any]) -> str:
         if wrappers:
             parts.append(f"Wrapper functions ({len(wrappers)} found):\n\n")
             for i, w in enumerate(wrappers, 1):
+                # Sanitise calls/modules_used: drop None, coerce to str
+                calls       = [str(c) for c in w.get('calls', [])        if c is not None]
+                modules_used = [str(m) for m in w.get('modules_used', []) if m is not None]
                 parts.append(f"[{i}] {w.get('function_name', '?')} "
                               f"({w.get('file', '?')} L{w.get('line_start', '?')}-{w.get('line_end', '?')})\n")
-                parts.append(f"    calls       : {', '.join(w.get('calls', []))}\n")
-                parts.append(f"    modules_used: {', '.join(w.get('modules_used', []))}\n")
+                parts.append(f"    calls       : {', '.join(calls)}\n")
+                parts.append(f"    modules_used: {', '.join(modules_used)}\n")
                 parts.append(f"    source:\n```{code_fence}\n{w.get('source_code', '')}\n```\n\n")
         else:
             parts.append("No wrapper functions found (no functions call any imported module).\n\n")
