@@ -79,6 +79,8 @@ def build_wrapper_analysis_prompt(wrapper_data: Dict[str, Any]) -> str:
         "  MEDIUM - Partial sanitization or indirect path\n"
         "  LOW    - Theoretical risk, unlikely to be exploitable\n\n"
         "RESPOND WITH ONLY VALID JSON. No markdown, no explanation outside the JSON.\n"
+        "IMPORTANT: Do NOT include \"source_code\" in your output — I already have it.\n"
+        "Keep your output compact so the full JSON fits within token limits.\n\n"
         "Use this EXACT structure (sink_modules.json):\n\n"
         "{\n"
         '  "language": "<same as input>",\n'
@@ -96,7 +98,6 @@ def build_wrapper_analysis_prompt(wrapper_data: Dict[str, Any]) -> str:
         '          "severity": "HIGH",\n'
         '          "calls": ["sqlite3.execute"],\n'
         '          "modules_used": ["sqlite3"],\n'
-        '          "source_code": "...",\n'
         '          "reason": "User input concatenated directly into SQL query"\n'
         '        }\n'
         '      ]\n'
@@ -192,7 +193,8 @@ async def analyze_wrappers_with_llm(wrapper_data: Dict[str, Any]) -> Dict[str, A
                     "content": (
                         "You are an expert application-security engineer. "
                         "You analyze code for vulnerabilities and respond ONLY with valid JSON. "
-                        "Never include markdown code fences or any text outside the JSON object."
+                        "Never include markdown code fences or any text outside the JSON object. "
+                        "Do NOT include a \"source_code\" field in your output."
                     ),
                 },
                 {
@@ -200,8 +202,9 @@ async def analyze_wrappers_with_llm(wrapper_data: Dict[str, Any]) -> Dict[str, A
                     "content": prompt,
                 },
             ],
-            max_tokens=8000,
+            max_tokens=16384,
             temperature=0.1,  # Low temperature for more deterministic/accurate output
+            response_format={"type": "json_object"},
         )
 
         raw_response = completion.choices[0].message.content
@@ -302,5 +305,82 @@ def _extract_json_from_response(text: str) -> Optional[Dict]:
                         return json.loads(clean[start:i + 1])
                     except json.JSONDecodeError:
                         break
+
+    # 4. Truncated JSON repair: LLM hit max_tokens and the JSON was cut off.
+    #    Try to close all open brackets/braces so we salvage whatever was parsed.
+    if start is not None and start != -1:
+        repaired = _repair_truncated_json(clean[start:])
+        if repaired is not None:
+            return repaired
+
+    return None
+
+
+def _repair_truncated_json(text: str) -> Optional[Dict]:
+    """Attempt to repair truncated JSON by closing open strings, arrays, and objects."""
+    # Strip any trailing incomplete key-value (e.g. '"reason": "some text that was cu')
+    # by removing everything after the last complete comma or opening bracket.
+    import re
+
+    # Remove trailing whitespace
+    t = text.rstrip()
+
+    # If we're inside an unclosed string, close it
+    # Count unescaped quotes
+    in_string = False
+    last_good = 0
+    i = 0
+    while i < len(t):
+        ch = t[i]
+        if ch == '\\' and in_string:
+            i += 2  # skip escaped char
+            continue
+        if ch == '"':
+            in_string = not in_string
+        if not in_string:
+            last_good = i
+        i += 1
+
+    if in_string:
+        # Close the dangling string
+        t = t[:last_good + 1]
+
+    # Remove any trailing comma or colon (invalid before closing brackets)
+    t = re.sub(r'[,:]+\s*$', '', t)
+
+    # Remove any trailing incomplete key (e.g. '"some_key"' with no value)
+    t = re.sub(r',?\s*"[^"]*"\s*$', '', t)
+
+    # Now count open brackets and braces and close them
+    opens = []
+    in_str = False
+    for i, ch in enumerate(t):
+        if ch == '\\' and in_str:
+            continue
+        if ch == '"' and (i == 0 or t[i-1] != '\\'):
+            in_str = not in_str
+        if in_str:
+            continue
+        if ch in ('{', '['):
+            opens.append(ch)
+        elif ch == '}':
+            if opens and opens[-1] == '{':
+                opens.pop()
+        elif ch == ']':
+            if opens and opens[-1] == '[':
+                opens.pop()
+
+    # Close in reverse order
+    closers = {'[': ']', '{': '}'}
+    suffix = ''.join(closers[b] for b in reversed(opens))
+    t = t + suffix
+
+    try:
+        result = json.loads(t)
+        if isinstance(result, dict):
+            logger.warning(f"Repaired truncated JSON (closed {len(opens)} bracket(s))")
+            return result
+    except json.JSONDecodeError:
+        pass
 
     return None
