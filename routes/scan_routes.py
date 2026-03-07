@@ -1,5 +1,5 @@
 # Scan routes
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Header, Request
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Header
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 import uuid
@@ -11,8 +11,7 @@ from config.database import get_database
 from config.settings import get_settings
 from middleware.auth import get_current_user
 from utils.jwt import TokenData
-from schemas.scan import ScanRequest, ScanResult
-from services.scan_service import run_scan
+from schemas.scan import ScanResult
 from services.activity_service import log_activity
 from services.websocket_manager import get_connection_manager
 from services.github_scan_service import GitHubScanService
@@ -22,43 +21,6 @@ from services.semgrep_rule_generator import generate_custom_rules, count_generat
 router = APIRouter(prefix='/scan', tags=['Scans'])
 logger = logging.getLogger(__name__)
 settings = get_settings()
-
-@router.post('', response_model=ScanResult)
-async def start_scan(
-    scan_request: ScanRequest,
-    background_tasks: BackgroundTasks,
-    current_user: TokenData = Depends(get_current_user),
-    db = Depends(get_database)
-):
-    """Start a vulnerability scan for a repository"""
-    # Verify repository ownership
-    repo = await db.repositories.find_one({
-        'id': scan_request.repository_id,
-        'user_id': current_user.user_id
-    })
-    if not repo:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Repository not found')
-    
-    # Create scan result
-    scan_result = ScanResult(
-        scan_id=str(uuid.uuid4()),
-        repository_id=scan_request.repository_id,
-        status='pending',
-        phase='discovery'
-    )
-    
-    doc = scan_result.model_dump()
-    doc['started_at'] = doc['started_at'].isoformat()
-    
-    await db.scans.insert_one(doc)
-    
-    # Start background scan
-    background_tasks.add_task(run_scan, scan_result.scan_id, scan_request.repository_id, db)
-    
-    # Log activity
-    await log_activity(db, current_user.user_id, 'scan_started', 'repository', scan_request.repository_id)
-    
-    return scan_result
 
 @router.get('/{scan_id}', response_model=ScanResult)
 async def get_scan_status(
@@ -666,42 +628,18 @@ async def receive_scan_results(
         details={"message": f"Found {vuln_count} vulnerabilities", "vulnerability_count": vuln_count, "severity_counts": severity_counts}
     )
     
-    # Store notification for real-time delivery
-    notification = {
-        "id": str(uuid.uuid4()),
-        "user_id": user_id,
-        "type": "scan_complete",
-        "title": "Scan Completed",
-        "message": f"Security scan for {payload.repository} found {vuln_count} vulnerabilities",
-        "data": {
-            "scan_id": payload.scan_id,
-            "repository_id": repo_id,
-            "repository": payload.repository,
-            "vulnerability_count": vuln_count,
-            "severity_counts": severity_counts
-        },
-        "read": False,
-        "created_at": datetime.now().isoformat()
-    }
-    
-    # Insert into DB (this adds _id field to the dict)
-    await db.notifications.insert_one(notification)
-    
-    # Send real-time WebSocket notification (remove _id to avoid serialization error)
-    notification_copy = {k: v for k, v in notification.items() if k != '_id'}
+    # Send real-time WebSocket notification
     ws_manager = get_connection_manager()
-    
-    # First, try to send to scan-specific socket
-    scan_socket_sent = await ws_manager.send_to_scan(payload.scan_id, {
+    notification = {
         "type": "scan_complete",
-        "notification": notification_copy
-    })
-    
-    # Also send to general user connections
-    await ws_manager.send_to_user(user_id, {
-        "type": "scan_complete",
-        "notification": notification_copy
-    })
+        "scan_id": payload.scan_id,
+        "repository_id": repo_id,
+        "repository": payload.repository,
+        "vulnerability_count": vuln_count,
+        "severity_counts": severity_counts
+    }
+    await ws_manager.send_to_scan(payload.scan_id, notification)
+    await ws_manager.send_to_user(user_id, notification)
     
     logger.info(f"Scan {payload.scan_id} completed with {vuln_count} vulnerabilities")
     
