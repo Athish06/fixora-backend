@@ -712,19 +712,19 @@ jobs:
               echo "HTTP status: $HTTP_STATUS"
               cat /tmp/wh-response.txt || true
               if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
-                echo "âœ… Wrapper hunter results sent successfully (HTTP $HTTP_STATUS)"
+                echo "[OK] Wrapper hunter results sent successfully (HTTP $HTTP_STATUS)"
                 exit 0
               else
                 RETRY_COUNT=$((RETRY_COUNT + 1))
-                echo "âš ï¸  Attempt $RETRY_COUNT failed (HTTP $HTTP_STATUS). Retrying in 10s..."
+                echo "[WARNING] Attempt $RETRY_COUNT failed (HTTP $HTTP_STATUS). Retrying in 10s..."
                 sleep 10
               fi
             done
             
-            echo "âŒ Failed to send wrapper hunter results after $MAX_RETRIES attempts"
+            echo "[FAIL] Failed to send wrapper hunter results after $MAX_RETRIES attempts"
             exit 1
           else
-            echo "âš ï¸  No wrapper hunter results file found"
+            echo "[WARNING] No wrapper hunter results file found"
           fi
 
       - name: Upload Wrapper Hunter Artifacts
@@ -847,22 +847,22 @@ jobs:
                 --max-time 30 \
                 --retry 2 \
                 --retry-delay 5; then
-                echo "âœ… Results sent successfully"
+                echo "[OK] Results sent successfully"
                 exit 0
               else
                 RETRY_COUNT=$((RETRY_COUNT + 1))
-                echo "âš ï¸  Attempt $RETRY_COUNT failed. Retrying..."
+                echo "[WARNING] Attempt $RETRY_COUNT failed. Retrying..."
                 sleep 5
               fi
             done
             
-            echo "âŒ Failed to send results after $MAX_RETRIES attempts"
+            echo "[FAIL] Failed to send results after $MAX_RETRIES attempts"
             echo "This usually means your Fixora backend is not publicly accessible."
             echo "For local development, use ngrok or similar to expose your backend."
             echo "Backend URL configured: ${{ secrets.FIXORA_API_URL }}"
             exit 1
           else
-            echo "âš ï¸  No results file found"
+            echo "[WARNING] No results file found"
           fi
 
       - name: Upload Scan Artifacts

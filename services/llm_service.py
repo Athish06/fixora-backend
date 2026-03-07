@@ -101,10 +101,29 @@ def build_wrapper_analysis_prompt(wrapper_data: Dict[str, Any]) -> str:
         '          "reason": "User input concatenated directly into SQL query"\n'
         '        }\n'
         '      ]\n'
+        '    },\n'
+        '    "react": {\n'
+        '      "modules": {\n'
+        '        "sink_modules": ["mongodb", "child_process", ...],\n'
+        '        "reason": "Brief explanation of why these are sinks"\n'
+        '      },\n'
+        '      "wrapper_functions": [\n'
+        '        {\n'
+        '          "function_name": "...",\n'
+        '          "file": "...",\n'
+        '          "vulnerability_type": "NoSQL Injection",\n'
+        '          "severity": "HIGH",\n'
+        '          "calls": ["usersCol.find"],\n'
+        '          "modules_used": ["mongodb"],\n'
+        '          "reason": "User input passed directly into MongoDB query"\n'
+        '        }\n'
+        '      ]\n'
         '    }\n'
         '  },\n'
         '  "analysis_summary": "X vulnerable wrappers found across Y files."\n'
         "}\n\n"
+        "CRITICAL: Use EXACTLY these key names in \"results\": \"python\" for Python "
+        "sections and \"react\" for JavaScript/Node.js/React sections.\n"
         "If a language section has no vulnerable wrappers, still include the key but with "
         "wrapper_functions as an empty list and sink_modules as the dangerous subset.\n"
         "If NO vulnerabilities are found at all, return:\n"
