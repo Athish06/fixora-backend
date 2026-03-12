@@ -710,10 +710,18 @@ jobs:
           if [ -f wrapper-hunter-results.json ]; then
             echo "Sending wrapper hunter results to Fixora backend..."
             
-            # Build payload
-            jq -n --arg scan_id "$SCAN_ID" --arg repo "${{ github.repository }}" \\
-              --slurpfile results wrapper-hunter-results.json \\
-              '{scan_id: $scan_id, repository: $repo, wrapper_data: $results[0]}' > wh-payload.json
+            # Use Python to compress, base64 encode, and build the payload
+            # This completely bypasses Bash 'Argument list too long' (ARG_MAX) limits
+            python3 -c '
+          import json, sys, base64
+          with open("wrapper-hunter-results.json", "rb") as f:
+              data = json.load(f)
+              compressed = json.dumps(data, separators=(",", ":")).encode("utf-8")
+          encoded = base64.b64encode(compressed).decode("utf-8")
+          payload = {"scan_id": sys.argv[1], "repository": sys.argv[2], "encoded_data": encoded}
+          with open("wh-payload.json", "w") as f:
+              json.dump(payload, f)
+          ' "$SCAN_ID" "${{ github.repository }}"
             
             MAX_RETRIES=3
             RETRY_COUNT=0

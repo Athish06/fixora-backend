@@ -66,15 +66,23 @@ VULN_TYPE_TO_OWASP: Dict[str, List[str]] = {
 # RULE GENERATOR
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_custom_rules(llm_result: Dict[str, Any]) -> str:
+def generate_custom_rules(
+    llm_result: Dict[str, Any],
+    manual_review_required: List[Dict[str, Any]] | None = None,
+) -> str:
     """
-    Generate custom Semgrep YAML rules from the LLM's sink_modules.json output.
+    Generate custom Semgrep YAML rules from the LLM's sink_modules.json output
+    and optionally from functions that could not be AI-analysed.
 
     For each vulnerable wrapper function identified by the LLM, we create a
     Semgrep rule that flags the DEFINITION of the vulnerable function itself.
     Standard call-pattern rules (func(...)) fail for framework endpoints
     (e.g. FastAPI route handlers) that are never called directly in code.
     By matching `def func(...): ...` we catch the vulnerable code block.
+
+    For functions in *manual_review_required* (AI analysis inconclusive or
+    request too large), we generate broad "needs manual review" rules so that
+    Semgrep at least flags those function definitions for a human to inspect.
 
     Semgrep's built-in rules already catch direct usage of dangerous APIs
     (e.g. subprocess.run(shell=True)), but they can't see through
@@ -86,6 +94,7 @@ def generate_custom_rules(llm_result: Dict[str, Any]) -> str:
     rules: List[Dict[str, Any]] = []
     results = llm_result.get("results", {})
 
+    # ── LLM-identified vulnerable wrappers ───────────────────────────────
     # Iterate every key the LLM returned — never hardcode ("python", "react").
     # The LLM may use "javascript", "node", etc. for the JS section.
     for lang_key, section in results.items():
@@ -97,6 +106,17 @@ def generate_custom_rules(llm_result: Dict[str, Any]) -> str:
 
         for wrapper in wrapper_functions:
             rule = _build_wrapper_rule(wrapper, semgrep_langs, lang_key)
+            if rule:
+                rules.append(rule)
+
+    # ── Manually-flagged functions (AI inconclusive / 413 too large) ──────
+    for entry in (manual_review_required or []):
+        lang_key   = entry.get("lang", "python")
+        func_names = entry.get("function_names", [])
+        semgrep_langs = _semgrep_langs_for_key(lang_key)
+
+        for func_name in func_names:
+            rule = _build_manual_review_rule(func_name, semgrep_langs, lang_key)
             if rule:
                 rules.append(rule)
 
@@ -258,3 +278,75 @@ def _semgrep_langs_for_key(lang_key: str) -> List[str]:
     if lang_key.lower() in _JS_LANG_KEYS:
         return ["javascript", "typescript"]
     return [lang_key]
+
+
+def _build_manual_review_rule(
+    func_name: str,
+    semgrep_langs: List[str],
+    lang_key: str,
+) -> Dict[str, Any] | None:
+    """
+    Build a broad Semgrep rule for a function that could not be AI-analysed
+    (request too large, repeated 429s, etc.).
+
+    The rule flags the function *definition* at WARNING severity and asks a
+    human to review it — Semgrep may independently catch dangerous patterns
+    inside the body even without LLM guidance.
+    """
+    func_name = (func_name or "").strip()
+    if not func_name:
+        return None
+
+    safe_name = "".join(c if c.isalnum() else "-" for c in func_name).strip("-").lower()
+    rule_id = f"fixora-manual-review-{safe_name}"
+
+    message = (
+        f"Function '{func_name}()' requires manual security review. "
+        "AI analysis was inconclusive (request too large or repeated API errors). "
+        "Inspect this function for unsanitised user input reaching dangerous sinks."
+    )
+    metadata: Dict[str, Any] = {
+        "category": "security",
+        "technology": list(semgrep_langs),
+        "source": "fixora-manual-review",
+        "confidence": "UNKNOWN",
+        "review_reason": "AI analysis inconclusive — manual inspection required",
+    }
+
+    if lang_key == "python":
+        return {
+            "id": rule_id,
+            "pattern": f"def {func_name}(...):\n  ...",
+            "message": message,
+            "severity": "WARNING",
+            "languages": ["python"],
+            "metadata": metadata,
+        }
+    else:
+        clean_name = func_name.replace("()", "").strip()
+        is_dotted  = "." in clean_name
+        patterns   = []
+        if not is_dotted:
+            patterns += [
+                {"pattern": f"function {clean_name}(...) {{ ... }}"},
+                {"pattern": f"const {clean_name} = (...) => {{ ... }}"},
+                {"pattern": f"let {clean_name} = (...) => {{ ... }}"},
+                {"pattern": f"var {clean_name} = (...) => {{ ... }}"},
+                {"pattern": f"this.{clean_name} = (...) => {{ ... }}"},
+                {"pattern": f"this.{clean_name} = function(...) {{ ... }}"},
+                {"pattern": f"{clean_name}: (...) => {{ ... }}"},
+                {"pattern": f"{clean_name}: function(...) {{ ... }}"},
+                {"pattern": f"{clean_name}(...) {{ ... }}"},
+            ]
+        patterns += [
+            {"pattern": f"{clean_name} = (...) => {{ ... }}"},
+            {"pattern": f"{clean_name} = function(...) {{ ... }}"},
+        ]
+        return {
+            "id": rule_id,
+            "pattern-either": patterns,
+            "message": message,
+            "severity": "WARNING",
+            "languages": ["javascript", "typescript"],
+            "metadata": metadata,
+        }

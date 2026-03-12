@@ -6,6 +6,8 @@ import uuid
 import jwt
 import logging
 import asyncio
+import base64
+import json
 from datetime import datetime
 from config.database import get_database
 from config.settings import get_settings
@@ -29,7 +31,7 @@ async def get_scan_status(
     db = Depends(get_database)
 ):
     """Get the status of a scan"""
-    scan = await db.scans.find_one({'scan_id': scan_id}, {'_id': 0})
+    scan = await db.scans.find_one({'id': scan_id}, {'_id': 0})
     if not scan:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Scan not found')
     
@@ -63,7 +65,7 @@ class ScanWebhookPayload(BaseModel):
 class WrapperHunterPayload(BaseModel):
     scan_id: str
     repository: str
-    wrapper_data: Dict[str, Any]
+    encoded_data: str  # Base64-encoded JSON to bypass Cloudflare WAF
 
 
 @router.post('/webhook/wrapper-results')
@@ -82,7 +84,19 @@ async def receive_wrapper_hunter_results(
     5. Cleans up the wrapper hunter workflow file
     """
     logger.info(f"Received wrapper hunter results for scan {payload.scan_id}")
-    
+
+    # Decode the Base64-encoded payload (sent this way to avoid Cloudflare WAF blocking
+    # requests containing raw exploit-like strings such as eval(), exec(), SELECT etc.)
+    try:
+        decoded_bytes = base64.b64decode(payload.encoded_data)
+        wrapper_data = json.loads(decoded_bytes)
+    except Exception as e:
+        logger.error(f"Failed to decode base64 payload: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid encoded_data: must be a base64-encoded JSON string"
+        )
+
     try:
         # Validate the token
         decoded = jwt.decode(
@@ -115,7 +129,7 @@ async def receive_wrapper_hunter_results(
     logger.info("=" * 80)
     logger.info("WRAPPER HUNTER RESULTS RECEIVED:")
     logger.info("=" * 80)
-    logger.info(str(payload.wrapper_data)[:2000])  # truncated log
+    logger.info(str(wrapper_data)[:2000])  # truncated log
     logger.info("=" * 80)
     
     # Send WebSocket update: wrapper hunter results received
@@ -133,7 +147,7 @@ async def receive_wrapper_hunter_results(
             "status": "running",
             "progress": 30,
             "phase": "llm_analysis",
-            "wrapper_data": payload.wrapper_data
+            "wrapper_data": wrapper_data
         }}
     )
 
@@ -144,7 +158,7 @@ async def receive_wrapper_hunter_results(
     background_tasks.add_task(
         _process_wrapper_results_in_background,
         payload.scan_id, payload.repository, repo_id, user_id,
-        payload.wrapper_data, scan, db
+        wrapper_data, scan, db
     )
 
     return {
@@ -183,12 +197,22 @@ async def _process_wrapper_results_in_background(
             "message": "AI analyzing wrapper functions for security sinks..."
         })
 
-        llm_result = await analyze_wrappers_with_llm(wrapper_data)
+        # Progress callback — forwards chunk progress to the WebSocket
+        async def _chunk_progress(msg: dict):
+            msg["scan_id"] = scan_id
+            await ws_manager.send_to_scan(scan_id, msg)
+
+        llm_result = await analyze_wrappers_with_llm(
+            wrapper_data, progress_callback=_chunk_progress
+        )
+
+        # Extract chunk metadata before stripping it from the LLM result
+        chunk_meta = llm_result.pop("_chunk_meta", None)
 
         logger.info("=" * 80)
         logger.info("LLM ANALYSIS RESULT (sink_modules.json):")
         logger.info("=" * 80)
-        logger.info(json_module.dumps(llm_result, indent=2))
+        logger.info(json_module.dumps(llm_result, indent=2)[:5000])
         logger.info("=" * 80)
 
         # Count findings for WebSocket message
@@ -205,9 +229,14 @@ async def _process_wrapper_results_in_background(
         # ── GENERATE CUSTOM SEMGREP RULES ─────────────────────────────────────
         custom_rules_yaml = ""
         rules_count = 0
-        if vuln_wrapper_count > 0:
-            logger.info(f"[BG] Generating custom Semgrep rules for {vuln_wrapper_count} vulnerable wrapper(s)")
-            custom_rules_yaml = generate_custom_rules(llm_result)
+        manual_review_list = chunk_meta.get("manual_review_required", []) if chunk_meta else []
+        if vuln_wrapper_count > 0 or manual_review_list:
+            logger.info(
+                f"[BG] Generating custom Semgrep rules for "
+                f"{vuln_wrapper_count} vulnerable wrapper(s) + "
+                f"{len(manual_review_list)} manual-review function(s)"
+            )
+            custom_rules_yaml = generate_custom_rules(llm_result, manual_review_list)
             rules_count = count_generated_rules(llm_result)
             logger.info(f"[BG] Generated {rules_count} custom Semgrep rules")
         else:
@@ -223,24 +252,37 @@ async def _process_wrapper_results_in_background(
             }}
         )
 
+        # Build chunk summary for WebSocket
+        failed_count = chunk_meta["failed"] if chunk_meta else 0
+        total_chunks = chunk_meta["total_chunks"] if chunk_meta else 0
+        manual_review_count = chunk_meta.get("manual_review", 0) if chunk_meta else 0
+        chunk_status_msg = ""
+        if failed_count:
+            chunk_status_msg = f" ({failed_count}/{total_chunks} chunks failed after retries)"
+        if manual_review_count:
+            chunk_status_msg += f" ({manual_review_count} chunk(s) flagged for manual review)"
+
         await ws_manager.send_to_scan(scan_id, {
             "type": "llm_analysis_complete",
             "scan_id": scan_id,
             "vulnerable_wrappers_count": vuln_wrapper_count,
             "sink_modules_count": sink_module_count,
             "custom_rules_count": count_generated_rules(llm_result),
+            "chunk_stats": chunk_meta,
+            "manual_review_count": manual_review_count,
             "message": (
                 f"AI analysis complete. Found {vuln_wrapper_count} vulnerable wrapper(s) "
                 f"across {sink_module_count} sink module(s). "
                 f"Generated {count_generated_rules(llm_result)} custom Semgrep rule(s). "
-                f"Starting Semgrep scan..."
+                f"Starting Semgrep scan...{chunk_status_msg}"
             )
         })
 
         # ── STORE FULL AI PIPELINE DEBUG DATA ─────────────────────────────────
         await _store_ai_debug(
             scan_id, repo_id, wrapper_data, llm_result,
-            custom_rules_yaml, vuln_wrapper_count, sink_module_count, rules_count, db
+            custom_rules_yaml, vuln_wrapper_count, sink_module_count, rules_count, db,
+            chunk_meta=chunk_meta
         )
 
         # ── TRIGGER SEMGREP ──────────────────────────────────────────────────
@@ -271,13 +313,16 @@ async def _store_ai_debug(
     vuln_wrapper_count: int,
     sink_module_count: int,
     rules_count: int,
-    db
+    db,
+    chunk_meta: Dict[str, Any] = None
 ):
     """
     Store the full AI pipeline debug data (Wrapper Hunter → LLM → Semgrep rules)
     into the ai_debug collection.  One document per scan, upserted by scan_id.
     """
     try:
+        import json as _json
+
         # Rebuild the exact prompt that was sent to Groq
         llm_prompt = None
         if wrapper_data:
@@ -285,6 +330,29 @@ async def _store_ai_debug(
                 llm_prompt = build_wrapper_analysis_prompt(wrapper_data)
             except Exception as e:
                 llm_prompt = f"(Could not rebuild prompt: {e})"
+
+        # Extract failed chunk details and manual review items for dedicated storage
+        failed_chunks = []
+        manual_review_required = []
+        chunk_stats = {}
+        if chunk_meta:
+            chunk_stats = {
+                "total_chunks":    chunk_meta.get("total_chunks", 0),
+                "succeeded":       chunk_meta.get("succeeded", 0),
+                "failed":          chunk_meta.get("failed", 0),
+                "manual_review":   chunk_meta.get("manual_review", 0),
+                "oversized_chunks": chunk_meta.get("oversized_chunks", 0),
+            }
+            manual_review_required = chunk_meta.get("manual_review_required", [])
+            for detail in chunk_meta.get("chunk_details", []):
+                if detail.get("status") == "failed":
+                    failed_chunks.append({
+                        "chunk_index": detail.get("chunk_index"),
+                        "lang": detail.get("lang"),
+                        "function_names": detail.get("function_names", []),
+                        "attempts": detail.get("attempts", 0),
+                        "error": detail.get("error", "Unknown"),
+                    })
 
         doc = {
             "id": str(uuid.uuid4()),
@@ -300,7 +368,40 @@ async def _store_ai_debug(
             "vuln_wrapper_count": vuln_wrapper_count,
             "sink_module_count": sink_module_count,
             "rules_count": rules_count,
+            # Chunk processing stats
+            "chunk_stats": chunk_stats,
+            "failed_chunks": failed_chunks,
+            # Functions too large for AI — user must inspect manually
+            "manual_review_required": manual_review_required,
         }
+
+        # MongoDB hard limit is 16 MB per document.  For large repos (e.g. Apache
+        # Spark) the raw wrapper hunter data alone can exceed this.  Progressively
+        # strip the heaviest fields until the document fits.
+        MONGO_LIMIT_BYTES = 12 * 1024 * 1024  # 12 MB — leave headroom
+
+        def _doc_size(d):
+            return len(_json.dumps(d, default=str).encode("utf-8"))
+
+        if _doc_size(doc) > MONGO_LIMIT_BYTES:
+            size_mb = _doc_size(doc) / (1024 * 1024)
+            logger.warning(
+                f"AI debug document for scan {scan_id} is {size_mb:.1f} MB — "
+                f"truncating wrapper_hunter_results to fit MongoDB 16 MB limit"
+            )
+            doc["wrapper_hunter_results"] = {
+                "_truncated": True,
+                "_original_size_mb": round(size_mb, 1),
+                "_reason": "Raw wrapper hunter data exceeded MongoDB document size limit",
+            }
+
+        if _doc_size(doc) > MONGO_LIMIT_BYTES:
+            size_mb = _doc_size(doc) / (1024 * 1024)
+            logger.warning(
+                f"AI debug document still {size_mb:.1f} MB after truncating wrapper data — "
+                f"also truncating llm_prompt"
+            )
+            doc["llm_prompt"] = f"(Truncated — document was {size_mb:.1f} MB, exceeding MongoDB limit)"
 
         # Upsert: one record per scan_id (replace if reprocessed)
         await db.ai_debug.replace_one(
@@ -308,7 +409,8 @@ async def _store_ai_debug(
             doc,
             upsert=True
         )
-        logger.info(f"Stored AI debug data for scan {scan_id} in ai_debug collection")
+        final_mb = _doc_size(doc) / (1024 * 1024)
+        logger.info(f"Stored AI debug data for scan {scan_id} in ai_debug collection ({final_mb:.1f} MB)")
 
     except Exception as e:
         logger.error(f"Error storing AI debug data for scan {scan_id}: {e}")
