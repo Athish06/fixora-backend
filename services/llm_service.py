@@ -386,7 +386,8 @@ async def analyze_wrappers_with_llm(
     }
 
     # ── ETA tracking ──────────────────────────────────────────────────────
-    phase_start = time.monotonic()
+    # NOTE: phase_start is set PER-LANGUAGE just before Phase 2 so that Phase 1
+    # wait time does not inflate the per-chunk average.
     processed_total = 0  # counts Phase 2 chunks processed (for ETA)
 
     # ── Process language-by-language ──────────────────────────────────────
@@ -407,6 +408,28 @@ async def analyze_wrappers_with_llm(
 
         # ── PHASE 2: analyse each function chunk with sink context ─────────
         logger.info(f"[{lang_key}] === Phase 2: {len(chunks)} function chunk(s) ===")
+        phase_start = time.monotonic()  # reset timer here — excludes Phase 1 wait
+
+        # Emit preliminary progress so frontend knows total chunk count immediately
+        if progress_callback:
+            try:
+                await progress_callback({
+                    "type":      "llm_chunk_progress",
+                    "lang":      lang_key,
+                    "chunk_idx": -1,
+                    "processed": processed_total,
+                    "total":     total_phase2_chunks,
+                    "failed":    0,
+                    "manual_review": 0,
+                    "estimated_seconds_remaining": None,
+                    "message": (
+                        f"AI analysis: phase 1 complete — "
+                        f"{len(sink_modules)} sink(s) identified. "
+                        f"Analysing {total_phase2_chunks} chunk(s)..."
+                    ),
+                })
+            except Exception:
+                pass
         for chunk_idx, chunk_info in enumerate(chunks):
             chunk     = chunk_info["funcs"]
             oversized = chunk_info["oversized"]
