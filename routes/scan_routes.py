@@ -17,7 +17,7 @@ from schemas.scan import ScanResult
 from services.activity_service import log_activity
 from services.websocket_manager import get_connection_manager
 from services.github_scan_service import GitHubScanService
-from services.llm_service import analyze_wrappers_with_llm, build_wrapper_analysis_prompt
+from services.llm_service import analyze_wrappers_with_llm
 from services.semgrep_rule_generator import generate_custom_rules, count_generated_rules
 
 router = APIRouter(prefix='/scan', tags=['Scans'])
@@ -323,13 +323,9 @@ async def _store_ai_debug(
     try:
         import json as _json
 
-        # Rebuild the exact prompt that was sent to Groq
-        llm_prompt = None
-        if wrapper_data:
-            try:
-                llm_prompt = build_wrapper_analysis_prompt(wrapper_data)
-            except Exception as e:
-                llm_prompt = f"(Could not rebuild prompt: {e})"
+        # Prompts are now built per-chunk in the 2-phase flow (build_module_sink_prompt /
+        # build_function_chunk_prompt) — no single combined prompt to store here.
+        llm_prompt = "(2-phase analysis: module-sink prompt + per-chunk function prompts)"
 
         # Extract failed chunk details and manual review items for dedicated storage
         failed_chunks = []
