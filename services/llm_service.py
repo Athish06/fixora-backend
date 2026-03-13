@@ -428,8 +428,8 @@ async def analyze_wrappers_with_llm(
                         f"Analysing {total_phase2_chunks} chunk(s)..."
                     ),
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to send Phase 1→2 progress: {e}")
         for chunk_idx, chunk_info in enumerate(chunks):
             chunk     = chunk_info["funcs"]
             oversized = chunk_info["oversized"]
@@ -542,8 +542,9 @@ async def analyze_wrappers_with_llm(
                                if manual_review_required else "")
                         ),
                     })
-                except Exception:
-                    pass  # WebSocket send failure is non-fatal — scan must continue
+                    logger.info(f"Sent chunk progress: {processed_total}/{total_phase2_chunks}")
+                except Exception as e:
+                    logger.warning(f"Failed to send chunk progress: {e}")
 
     # ── Summary ───────────────────────────────────────────────────────────
     failed_chunks = [m for m in all_chunk_meta if m["status"] == "failed"]
