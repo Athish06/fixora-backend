@@ -189,12 +189,12 @@ SOURCE_CODE_CHAR_LIMIT = 1500   # Max chars of source_code sent per function (~3
 # ~30 RPM and ~12K TPM for the selected model.
 GROQ_TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "12000"))
 GROQ_RPM_LIMIT = int(os.getenv("GROQ_RPM_LIMIT", "30"))
-TOKEN_BUFFER = float(os.getenv("GROQ_TOKEN_BUFFER", "0.80"))
+TOKEN_BUFFER = float(os.getenv("GROQ_TOKEN_BUFFER", "0.90"))
 EFFECTIVE_TPM = int(GROQ_TPM_LIMIT * TOKEN_BUFFER)  # default: 9600
 
 # Keep headroom under raw limits to reduce 429 risk during noisy periods.
-MAX_RPM = min(int(os.getenv("GROQ_MAX_RPM", "20")), GROQ_RPM_LIMIT)
-MIN_REQUEST_GAP_SECONDS = float(os.getenv("GROQ_MIN_REQUEST_GAP_SECONDS", "3"))
+MAX_RPM = min(int(os.getenv("GROQ_MAX_RPM", "25")), GROQ_RPM_LIMIT)
+MIN_REQUEST_GAP_SECONDS = float(os.getenv("GROQ_MIN_REQUEST_GAP_SECONDS", "2"))
 
 # 429 handling: wait at least this long, but also honor remaining window time.
 RATE_LIMIT_BACKOFF = int(os.getenv("GROQ_RATE_LIMIT_BACKOFF", "20"))
