@@ -328,7 +328,7 @@ jobs:
               return os.path.normpath(os.path.abspath(path))
 
           def _rel(repo_root, path):
-              rel = os.path.relpath(path, repo_root).replace("\\", "/")
+              rel = os.path.relpath(path, repo_root).replace("\\\\", "/")
               return "." if rel in ("", ".") else rel
 
           def _anchor_language(dirpath, filename):
@@ -699,7 +699,7 @@ jobs:
                               if module in target:
                                   for alias in node.names:
                                       imported_names[alias.asname or alias.name] = module
-                      rel = os.path.relpath(fp, display_root).replace("\\", "/")
+                      rel = os.path.relpath(fp, display_root).replace("\\\\", "/")
                       for node in ast.walk(tree):
                           if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                               # ── Pass 1: Track variables derived from imports ──

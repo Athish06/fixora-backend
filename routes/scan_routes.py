@@ -8,6 +8,7 @@ import logging
 import asyncio
 import base64
 import json
+import hashlib
 from datetime import datetime
 from config.database import get_database
 from config.settings import get_settings
@@ -614,13 +615,61 @@ async def receive_scan_results(
     
     # Process Semgrep results
     semgrep_results = payload.results.results
-    vulnerabilities = []
+    new_vulnerabilities = []
+    current_scan_vulnerabilities = []
+    now_iso = datetime.now().isoformat()
     
     logger.info(f"Processing {len(semgrep_results)} Semgrep results")
+
+    # Build lookup maps for existing vulnerabilities in this repository so
+    # rescans update existing findings instead of creating duplicates.
+    existing_docs = await db.vulnerabilities.find(
+        {"repository_id": repo_id},
+        {
+            "_id": 0,
+            "id": 1,
+            "fingerprint": 1,
+            "rule_id": 1,
+            "file_path": 1,
+            "line_number": 1,
+            "end_line": 1,
+            "description": 1,
+        },
+    ).sort("created_at", 1).to_list(50000)
+
+    existing_by_fingerprint = {}
+    existing_by_legacy = {}
+    duplicate_doc_ids = []
+    canonical_by_key = {}
+    for doc in existing_docs:
+        legacy_key = (
+            f"{doc.get('rule_id', '')}|{doc.get('file_path', '')}|"
+            f"{doc.get('line_number', 0)}|{doc.get('end_line', 0)}|"
+            f"{(doc.get('description') or '').strip()}"
+        )
+        canonical_key = doc.get("fingerprint") or f"legacy::{legacy_key}"
+        if canonical_key in canonical_by_key:
+            duplicate_doc_ids.append(doc["id"])
+            continue
+
+        canonical_by_key[canonical_key] = doc
+        fp = doc.get("fingerprint")
+        if fp:
+            existing_by_fingerprint[fp] = doc
+        existing_by_legacy[legacy_key] = doc
+
+    if duplicate_doc_ids:
+        await db.vulnerabilities.delete_many({"id": {"$in": duplicate_doc_ids}})
+        logger.info(
+            f"Removed {len(duplicate_doc_ids)} pre-existing duplicate vulnerability record(s) "
+            f"for repository {repo_id} before processing scan {payload.scan_id}"
+        )
+
+    # De-duplicate repeated Semgrep entries inside the same webhook payload.
+    seen_in_this_scan = set()
+    updated_existing_count = 0
     
     for result in semgrep_results:
-        vuln_id = str(uuid.uuid4())
-        
         # Extract severity from Semgrep metadata
         extra = result.get("extra", {})
         metadata = extra.get("metadata", {})
@@ -665,19 +714,79 @@ async def receive_scan_results(
         else:
             # Use the last part of the rule_id as type
             vuln_type = rule_id.split(".")[-1].replace("-", " ").title()
+
+        description = extra.get("message", "No description available")
+        file_path = result.get("path", "")
+        line_number = result.get("start", {}).get("line", 0)
+        end_line = result.get("end", {}).get("line", 0)
+
+        # Stable fingerprint to identify the same finding across multiple scans.
+        legacy_key = (
+            f"{rule_id}|{file_path}|{line_number}|{end_line}|{description.strip()}"
+        )
+        fingerprint = hashlib.sha256(legacy_key.encode("utf-8")).hexdigest()
+
+        if fingerprint in seen_in_this_scan:
+            continue
+        seen_in_this_scan.add(fingerprint)
+
+        existing = existing_by_fingerprint.get(fingerprint) or existing_by_legacy.get(legacy_key)
+
+        title = result.get("check_id", "Unknown vulnerability").split(".")[-1].replace("-", " ").title()
+        normalized_vuln = {
+            "severity": severity,
+            "type": vuln_type,
+            "title": title,
+        }
+
+        if existing:
+            await db.vulnerabilities.update_one(
+                {"id": existing["id"]},
+                {
+                    "$set": {
+                        "scan_id": payload.scan_id,
+                        "type": vuln_type,
+                        "title": title,
+                        "description": description,
+                        "severity": severity,
+                        "file_path": file_path,
+                        "line_number": line_number,
+                        "end_line": end_line,
+                        "code_snippet": extra.get("lines", ""),
+                        "rule_id": rule_id,
+                        "cwe": metadata.get("cwe", []),
+                        "owasp": metadata.get("owasp", []),
+                        "fix_regex": extra.get("fix_regex", None),
+                        "status": "open",
+                        "branch": payload.branch,
+                        "commit_sha": payload.commit_sha,
+                        "fingerprint": fingerprint,
+                        "last_seen_at": now_iso,
+                        "last_scan_id": payload.scan_id,
+                    },
+                    "$addToSet": {
+                        "scan_ids": payload.scan_id,
+                    },
+                },
+            )
+            updated_existing_count += 1
+            current_scan_vulnerabilities.append(normalized_vuln)
+            # Backfill the fingerprint map for legacy records that lacked it.
+            existing_by_fingerprint[fingerprint] = {"id": existing["id"], "fingerprint": fingerprint}
+            continue
         
         vulnerability = {
-            "id": vuln_id,
+            "id": str(uuid.uuid4()),
             "repository_id": repo_id,
             "scan_id": payload.scan_id,
             "user_id": user_id,
             "type": vuln_type,
-            "title": result.get("check_id", "Unknown vulnerability").split(".")[-1].replace("-", " ").title(),
-            "description": extra.get("message", "No description available"),
+            "title": title,
+            "description": description,
             "severity": severity,
-            "file_path": result.get("path", ""),
-            "line_number": result.get("start", {}).get("line", 0),
-            "end_line": result.get("end", {}).get("line", 0),
+            "file_path": file_path,
+            "line_number": line_number,
+            "end_line": end_line,
             "code_snippet": extra.get("lines", ""),
             "rule_id": rule_id,
             "cwe": metadata.get("cwe", []),
@@ -687,27 +796,37 @@ async def receive_scan_results(
             "ai_verified": False,
             "ai_confidence": None,
             "ai_reasoning": None,
-            "created_at": datetime.now().isoformat(),
+            "created_at": now_iso,
             "branch": payload.branch,
-            "commit_sha": payload.commit_sha
+            "commit_sha": payload.commit_sha,
+            "fingerprint": fingerprint,
+            "scan_ids": [payload.scan_id],
+            "first_seen_at": now_iso,
+            "last_seen_at": now_iso,
+            "last_scan_id": payload.scan_id,
         }
         
-        vulnerabilities.append(vulnerability)
+        new_vulnerabilities.append(vulnerability)
+        current_scan_vulnerabilities.append(normalized_vuln)
+        existing_by_fingerprint[fingerprint] = {"id": vulnerability["id"], "fingerprint": fingerprint}
+        existing_by_legacy[legacy_key] = {"id": vulnerability["id"], "fingerprint": fingerprint}
     
-    # Insert vulnerabilities
-    if vulnerabilities:
-        result = await db.vulnerabilities.insert_many(vulnerabilities)
-        logger.info(f"Inserted {len(result.inserted_ids)} vulnerabilities into database")
-    else:
+    # Insert only genuinely new vulnerabilities; existing ones were updated in-place.
+    if new_vulnerabilities:
+        result = await db.vulnerabilities.insert_many(new_vulnerabilities)
+        logger.info(f"Inserted {len(result.inserted_ids)} new vulnerabilities into database")
+    if updated_existing_count:
+        logger.info(f"Updated {updated_existing_count} existing vulnerabilities from previous scans")
+    if not new_vulnerabilities and not updated_existing_count:
         logger.info("No vulnerabilities found in scan results")
     
-    # Update scan record
-    vuln_count = len(vulnerabilities)
+    # Update scan record using unique findings seen in THIS scan.
+    vuln_count = len(current_scan_vulnerabilities)
     severity_counts = {
-        "critical": len([v for v in vulnerabilities if v["severity"] == "critical"]),
-        "high": len([v for v in vulnerabilities if v["severity"] == "high"]),
-        "medium": len([v for v in vulnerabilities if v["severity"] == "medium"]),
-        "low": len([v for v in vulnerabilities if v["severity"] == "low"])
+        "critical": len([v for v in current_scan_vulnerabilities if v["severity"] == "critical"]),
+        "high": len([v for v in current_scan_vulnerabilities if v["severity"] == "high"]),
+        "medium": len([v for v in current_scan_vulnerabilities if v["severity"] == "medium"]),
+        "low": len([v for v in current_scan_vulnerabilities if v["severity"] == "low"])
     }
     
     await db.scans.update_one(
