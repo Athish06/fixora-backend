@@ -279,16 +279,17 @@ jobs:
               return wrappers;
           }
 
-          const repoRoot = process.argv[2] || '.';
-          const manifestPkgs = JSON.parse(process.argv[3] || '[]');
+          const scanRoot = process.argv[2] || '.';
+          const displayRoot = process.argv[3] || scanRoot;
+          const manifestPkgs = JSON.parse(process.argv[4] || '[]');
           const allImports = new Set();
           const allWrappers = [];
-          walkDir(repoRoot, (fp) => {
+          walkDir(scanRoot, (fp) => {
               let src;
               try { src = fs.readFileSync(fp, 'utf8'); } catch(e) { return; }
               const ast = parseFile(fp, src);
               if (!ast || !ast.program) return;
-              const rel = path.relative(repoRoot, fp);
+              const rel = path.relative(displayRoot, fp);
               const { imports, alias } = collectImports(ast.program.body);
               imports.forEach(i => allImports.add(i));
               const wrappers = extractFile(ast, src, rel, alias);
@@ -316,30 +317,155 @@ jobs:
               ".github", ".vscode",
           }
 
-          # ─── LANGUAGE DETECTION ───────────────────────────────────────────────────────
-          def detect_language(repo_root):
-              has_py = (
-                  os.path.isfile(os.path.join(repo_root, "requirements.txt"))
-                  or os.path.isfile(os.path.join(repo_root, "setup.py"))
-                  or os.path.isfile(os.path.join(repo_root, "pyproject.toml"))
-                  or os.path.isfile(os.path.join(repo_root, "Pipfile"))
-                  or os.path.isfile(os.path.join(repo_root, "setup.cfg"))
-              )
-              has_js = os.path.isfile(os.path.join(repo_root, "package.json"))
-              if has_py and has_js:
-                  return "both"
-              if has_py:
-                  return "python"
-              if has_js:
+          # ─── TARGET ORCHESTRATOR (multi-language monorepo aware) ───────────────────
+          SOURCE_DIR_CANDIDATES = ("src", "lib", "app")
+          PY_ANCHOR_FILES = {
+              "requirements.txt", "pipfile", "pyproject.toml", "setup.py", "setup.cfg"
+          }
+          PARENT_SHIFT_DIRS = {"requirements", ".venv", "env"}
+
+          def _norm_abs(path):
+              return os.path.normpath(os.path.abspath(path))
+
+          def _rel(repo_root, path):
+              rel = os.path.relpath(path, repo_root).replace("\\", "/")
+              return "." if rel in ("", ".") else rel
+
+          def _anchor_language(dirpath, filename):
+              low = filename.lower()
+              if low == "package.json":
                   return "react"
+              if low in PY_ANCHOR_FILES:
+                  return "python"
+              # Nested requirements folder exception: requirements/base.txt, dev.txt...
+              if low.endswith(".txt") and os.path.basename(dirpath).lower() == "requirements":
+                  return "python"
+              return None
+
+          def discover_anchors(repo_root):
+              anchors = []
               for dirpath, dirnames, filenames in os.walk(repo_root):
                   dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
                   for fn in filenames:
-                      if fn.endswith(".py"):
-                          return "python"
-                      if fn.endswith((".js", ".jsx", ".ts", ".tsx")):
-                          return "react"
-              return "unknown"
+                      lang = _anchor_language(dirpath, fn)
+                      if not lang:
+                          continue
+                      anchors.append({
+                          "language": lang,
+                          "anchor_path": os.path.join(dirpath, fn),
+                      })
+              return anchors
+
+          def corrected_root_for_anchor(anchor_path):
+              parent = os.path.dirname(anchor_path)
+              if os.path.basename(parent).lower() in PARENT_SHIFT_DIRS:
+                  return os.path.dirname(parent)
+              return parent
+
+          def _lang_exts(language):
+              if language == "python":
+                  return (".py",)
+              return (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+
+          def _has_lang_file_immediate(root_path, language):
+              exts = _lang_exts(language)
+              try:
+                  entries = os.listdir(root_path)
+              except Exception:
+                  return False
+              for name in entries:
+                  fp = os.path.join(root_path, name)
+                  if os.path.isfile(fp) and name.lower().endswith(exts):
+                      return True
+              return False
+
+          def _repo_has_lang_source(repo_root, language):
+              exts = _lang_exts(language)
+              for dirpath, dirnames, filenames in os.walk(repo_root):
+                  dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+                  for fn in filenames:
+                      if fn.lower().endswith(exts):
+                          return True
+              return False
+
+          def _pick_scan_path(root_path):
+              # src-layout optimization: prefer src/lib/app over root scan
+              for name in SOURCE_DIR_CANDIDATES:
+                  p = os.path.join(root_path, name)
+                  if os.path.isdir(p):
+                      return p
+              return root_path
+
+          def build_scan_targets(repo_root):
+              found_anchors = discover_anchors(repo_root)
+
+              # De-duplicate by (language, corrected_root)
+              unique = {}
+              for a in found_anchors:
+                  root_abs = _norm_abs(corrected_root_for_anchor(a["anchor_path"]))
+                  key = (a["language"], root_abs)
+                  if key not in unique:
+                      unique[key] = {
+                          "language": a["language"],
+                          "root_abs": root_abs,
+                          "anchors": [],
+                          "inferred": False,
+                      }
+                  unique[key]["anchors"].append(a["anchor_path"])
+
+              # Fallback for repos/languages without manifest anchors:
+              # preserve previous behaviour by scanning source-file language at repo root.
+              anchored_languages = {a["language"] for a in found_anchors}
+              for lang in ("python", "react"):
+                  if lang in anchored_languages:
+                      continue
+                  if not _repo_has_lang_source(repo_root, lang):
+                      continue
+                  key = (lang, _norm_abs(repo_root))
+                  if key not in unique:
+                      unique[key] = {
+                          "language": lang,
+                          "root_abs": _norm_abs(repo_root),
+                          "anchors": [],
+                          "inferred": True,
+                      }
+
+              targets = []
+              phantom_roots_skipped = []
+              for item in unique.values():
+                  lang = item["language"]
+                  root_abs = item["root_abs"]
+
+                  # No Source, No Scan rule: if neither direct source file nor src/lib/app exists, skip.
+                  has_local_source = _has_lang_file_immediate(root_abs, lang)
+                  has_code_dir = any(
+                      os.path.isdir(os.path.join(root_abs, name))
+                      for name in SOURCE_DIR_CANDIDATES
+                  )
+                  if not has_local_source and not has_code_dir:
+                      phantom_roots_skipped.append({
+                          "language": lang,
+                          "root_path": _rel(repo_root, root_abs),
+                          "reason": "config_root_no_source",
+                      })
+                      continue
+
+                  scan_abs = _pick_scan_path(root_abs)
+                  targets.append({
+                      "language": lang,
+                      "root_abs": root_abs,
+                      "scan_abs": scan_abs,
+                      "root_path": _rel(repo_root, root_abs),
+                      "scan_path": _rel(repo_root, scan_abs),
+                      "anchor_files": (
+                          sorted({_rel(repo_root, p) for p in item["anchors"]})
+                          if item["anchors"]
+                          else ["<inferred-from-source-files>"]
+                      ),
+                  })
+
+              targets.sort(key=lambda t: (t["language"], t["root_path"], t["scan_path"]))
+              return targets, found_anchors, phantom_roots_skipped
 
           # ─── MANIFEST PARSERS ─────────────────────────────────────────────────────────
           def _parse_single_requirements_file(path):
@@ -488,11 +614,16 @@ jobs:
               return sorted(found)
 
           # ─── JS/REACT EXTRACTION (AST via Node.js) ───────────────────────────────
-          def run_js_extractor(repo_root, manifest_pkgs):
+          def run_js_extractor(scan_root, display_root, manifest_pkgs):
               import subprocess, sys
               try:
                   result = subprocess.run(
-                      ["node", "/tmp/js_extractor.js", repo_root, json.dumps(manifest_pkgs)],
+                      [
+                          "node", "/tmp/js_extractor.js",
+                          scan_root,
+                          display_root,
+                          json.dumps(manifest_pkgs),
+                      ],
                       capture_output=True, text=True, timeout=120
                   )
                   if result.returncode != 0:
@@ -534,7 +665,7 @@ jobs:
               "loads", "load",
           }
 
-          def extract_python_wrappers(repo_root, all_modules):
+          def extract_python_wrappers(scan_root, all_modules, display_root):
               # Find every function that:
               #   1. Calls any module from all_modules (existing), OR
               #   2. Calls a method on a variable derived from an imported module
@@ -543,7 +674,7 @@ jobs:
               wrappers = []
               target = set(all_modules)
               dangerous_builtins = {"eval", "exec", "__import__", "compile", "open", "globals", "locals"}
-              for dirpath, dirnames, filenames in os.walk(repo_root):
+              for dirpath, dirnames, filenames in os.walk(scan_root):
                   dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
                   for fn in filenames:
                       if not fn.endswith(".py"):
@@ -568,7 +699,7 @@ jobs:
                               if module in target:
                                   for alias in node.names:
                                       imported_names[alias.asname or alias.name] = module
-                      rel = os.path.relpath(fp, repo_root)
+                      rel = os.path.relpath(fp, display_root).replace("\\", "/")
                       for node in ast.walk(tree):
                           if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                               # ── Pass 1: Track variables derived from imports ──
@@ -659,41 +790,105 @@ jobs:
               return wrappers
 
           # ─── ORCHESTRATOR ─────────────────────────────────────────────────────────────
+          def _ensure_lang_section(results, lang):
+              if lang not in results:
+                  results[lang] = {
+                      "modules": {
+                          "from_manifest": [],
+                          "from_imports": [],
+                          "all": [],
+                      },
+                      "wrapper_functions": [],
+                  }
+
+          def _extend_unique(dst, src):
+              seen = set(dst)
+              for item in src:
+                  if item not in seen:
+                      dst.append(item)
+                      seen.add(item)
+
           def run_wrapper_hunter(repo_root="."):
-              lang = detect_language(repo_root)
+              repo_root = _norm_abs(repo_root)
+              targets, found_anchors, phantom_roots = build_scan_targets(repo_root)
+
               results = {}
-              if lang in ("python", "both"):
-                  # Collect from ALL manifest sources
-                  manifest_pkgs = sorted(set(
-                      parse_requirements_txt(repo_root)
-                      + parse_setup_py(repo_root)
-                      + parse_pyproject_toml(repo_root)
-                      + parse_pipfile(repo_root)
-                  ))
-                  import_mods = collect_python_imports(repo_root)
-                  all_modules = sorted(set(manifest_pkgs) | set(import_mods))
-                  results["python"] = {
-                      "modules": {
-                          "from_manifest": manifest_pkgs,
-                          "from_imports": import_mods,
-                          "all": all_modules,
-                      },
-                      "wrapper_functions": extract_python_wrappers(repo_root, all_modules),
+              scan_targets = []
+              wrapper_seen = {"python": set(), "react": set()}
+
+              for t in targets:
+                  lang = t["language"]
+                  root_abs = t["root_abs"]
+                  scan_abs = t["scan_abs"]
+
+                  if lang == "python":
+                      manifest_pkgs = sorted(set(
+                          parse_requirements_txt(root_abs)
+                          + parse_setup_py(root_abs)
+                          + parse_pyproject_toml(root_abs)
+                          + parse_pipfile(root_abs)
+                      ))
+                      import_mods = collect_python_imports(scan_abs)
+                      all_modules = sorted(set(manifest_pkgs) | set(import_mods))
+                      wrappers = extract_python_wrappers(scan_abs, all_modules, repo_root)
+                  else:
+                      manifest_pkgs = parse_package_json(root_abs)
+                      js_result = run_js_extractor(scan_abs, repo_root, manifest_pkgs)
+                      import_mods = js_result.get("from_imports", [])
+                      all_modules = sorted(set(manifest_pkgs) | set(import_mods))
+                      wrappers = js_result.get("wrappers", [])
+
+                  target_modules = {
+                      "from_manifest": manifest_pkgs,
+                      "from_imports": import_mods,
+                      "all": all_modules,
                   }
-              if lang in ("react", "both"):
-                  manifest_pkgs = parse_package_json(repo_root)
-                  js_result = run_js_extractor(repo_root, manifest_pkgs)
-                  import_mods = js_result.get("from_imports", [])
-                  all_modules = sorted(set(manifest_pkgs) | set(import_mods))
-                  results["react"] = {
-                      "modules": {
-                          "from_manifest": manifest_pkgs,
-                          "from_imports": import_mods,
-                          "all": all_modules,
-                      },
-                      "wrapper_functions": js_result.get("wrappers", []),
-                  }
-              return {"language": lang, "results": results}
+
+                  scan_targets.append({
+                      "language": lang,
+                      "root_path": t["root_path"],
+                      "scan_path": t["scan_path"],
+                      "anchor_files": t["anchor_files"],
+                      "modules": target_modules,
+                      "wrapper_count": len(wrappers),
+                  })
+
+                  _ensure_lang_section(results, lang)
+                  _extend_unique(results[lang]["modules"]["from_manifest"], manifest_pkgs)
+                  _extend_unique(results[lang]["modules"]["from_imports"], import_mods)
+                  _extend_unique(results[lang]["modules"]["all"], all_modules)
+
+                  # Deduplicate wrappers across overlapping targets by stable identity
+                  for w in wrappers:
+                      key = (
+                          w.get("function_name"),
+                          w.get("file"),
+                          w.get("line_start"),
+                          w.get("line_end"),
+                      )
+                      if key in wrapper_seen[lang]:
+                          continue
+                      wrapper_seen[lang].add(key)
+                      results[lang]["wrapper_functions"].append(w)
+
+              langs = sorted(results.keys())
+              if len(langs) == 2:
+                  language = "both"
+              elif len(langs) == 1:
+                  language = langs[0]
+              else:
+                  language = "unknown"
+
+              return {
+                  "language": language,
+                  "results": results,
+                  "scan_targets": scan_targets,
+                  "orchestrator": {
+                      "anchors_found": len(found_anchors),
+                      "targets_selected": len(scan_targets),
+                      "phantom_roots_skipped": phantom_roots,
+                  },
+              }
 
           if __name__ == "__main__":
               output = run_wrapper_hunter(".")

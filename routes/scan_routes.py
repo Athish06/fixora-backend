@@ -331,6 +331,22 @@ async def _store_ai_debug(
         failed_chunks = []
         manual_review_required = []
         chunk_stats = {}
+        wrapper_targets_summary = []
+        orchestrator_meta = {}
+
+        if isinstance(wrapper_data, dict):
+            orchestrator_meta = wrapper_data.get("orchestrator", {}) or {}
+            raw_targets = wrapper_data.get("scan_targets", []) or []
+            for t in raw_targets:
+                modules = (t.get("modules", {}) or {}).get("all", []) or []
+                wrapper_targets_summary.append({
+                    "language": t.get("language"),
+                    "root_path": t.get("root_path"),
+                    "scan_path": t.get("scan_path"),
+                    "wrapper_count": t.get("wrapper_count", 0),
+                    "module_count": len(modules),
+                })
+
         if chunk_meta:
             chunk_stats = {
                 "total_chunks":    chunk_meta.get("total_chunks", 0),
@@ -364,6 +380,8 @@ async def _store_ai_debug(
             "vuln_wrapper_count": vuln_wrapper_count,
             "sink_module_count": sink_module_count,
             "rules_count": rules_count,
+            "wrapper_targets_summary": wrapper_targets_summary,
+            "orchestrator": orchestrator_meta,
             # Chunk processing stats
             "chunk_stats": chunk_stats,
             "failed_chunks": failed_chunks,
