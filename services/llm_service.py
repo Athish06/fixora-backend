@@ -2,6 +2,7 @@
 # Receives wrapper_hunter_results.json, returns sink_modules.json
 import logging
 import json
+import os
 from typing import Dict, Any, Optional
 from config.settings import get_settings
 
@@ -180,23 +181,33 @@ def build_function_chunk_prompt(
 # LLM CALLER (RATE-LIMITED SEQUENTIAL CHUNKING)
 # ─────────────────────────────────────────────────────────────────────────────
 
-MAX_RETRIES = 2                  # Retry attempts per chunk
+MAX_RETRIES = 3                  # Retry attempts per chunk (helps transient 429s)
 SOURCE_CODE_CHAR_LIMIT = 1500   # Max chars of source_code sent per function (~375 tokens)
 
-# ── Rate limiting (Groq free tier) ───────────────────────────────────────────
-GROQ_TPM_LIMIT = 6000           # Tokens-per-minute hard ceiling (Groq free tier)
-TOKEN_BUFFER = 0.80              # 20% safety buffer — never aim for the exact ceiling
-EFFECTIVE_TPM = int(GROQ_TPM_LIMIT * TOKEN_BUFFER)  # 4800 effective tokens per minute
-MAX_RPM = 3                      # Max requests per minute (conservative)
-RATE_LIMIT_BACKOFF = 120         # Seconds to wait on 429 (before jitter)
-RATE_LIMIT_JITTER_MAX = 15       # Max random jitter seconds added to backoff
+# ── Rate limiting (Groq) ─────────────────────────────────────────────────────
+# These defaults match the dashboard limits shown in your screenshots:
+# ~30 RPM and ~12K TPM for the selected model.
+GROQ_TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "12000"))
+GROQ_RPM_LIMIT = int(os.getenv("GROQ_RPM_LIMIT", "30"))
+TOKEN_BUFFER = float(os.getenv("GROQ_TOKEN_BUFFER", "0.80"))
+EFFECTIVE_TPM = int(GROQ_TPM_LIMIT * TOKEN_BUFFER)  # default: 9600
+
+# Keep headroom under raw limits to reduce 429 risk during noisy periods.
+MAX_RPM = min(int(os.getenv("GROQ_MAX_RPM", "20")), GROQ_RPM_LIMIT)
+MIN_REQUEST_GAP_SECONDS = float(os.getenv("GROQ_MIN_REQUEST_GAP_SECONDS", "3"))
+
+# 429 handling: wait at least this long, but also honor remaining window time.
+RATE_LIMIT_BACKOFF = int(os.getenv("GROQ_RATE_LIMIT_BACKOFF", "20"))
+RATE_LIMIT_JITTER_MAX = int(os.getenv("GROQ_RATE_LIMIT_JITTER_MAX", "10"))
 
 # ── Dynamic chunking ──────────────────────────────────────────────────────────
 # Estimated token cost of prompt overhead per chunk:
 # system message + module list headers + formatting (~600 tokens)
 PROMPT_OVERHEAD_TOKENS = 600
-# Token budget available for function content inside a single Groq request
-FUNCTION_BUDGET_PER_CHUNK = EFFECTIVE_TPM - PROMPT_OVERHEAD_TOKENS  # 4200
+# Token budget available for function content inside a single Groq request.
+# Keep this tied directly to effective TPM to preserve the original greedy
+# chunking behavior.
+FUNCTION_BUDGET_PER_CHUNK = EFFECTIVE_TPM - PROMPT_OVERHEAD_TOKENS
 
 
 def _estimate_function_tokens(func: dict) -> int:
@@ -383,6 +394,7 @@ async def analyze_wrappers_with_llm(
         "minute_start": time.monotonic(),
         "requests_this_minute": 0,
         "tokens_this_minute": 0,
+        "last_request_ts": 0.0,
     }
 
     # ── ETA tracking ──────────────────────────────────────────────────────
@@ -587,24 +599,48 @@ async def _rate_limit_wait(state: dict, estimated_tokens: int):
     import time
     import asyncio
 
-    elapsed = time.monotonic() - state["minute_start"]
-    if elapsed >= 60:
-        # Window expired — reset
-        state["minute_start"] = time.monotonic()
-        state["requests_this_minute"] = 0
-        state["tokens_this_minute"] = 0
+    if estimated_tokens > EFFECTIVE_TPM:
+        # Oversized estimates can happen for huge single-function chunks.
+        # Let the call proceed and rely on HTTP 413 handling instead of deadlocking.
+        logger.warning(
+            f"Estimated request ({estimated_tokens} tokens) exceeds effective TPM "
+            f"({EFFECTIVE_TPM}). Sending anyway and relying on 413/manual-review fallback."
+        )
         return
 
-    needs_wait = (
-        state["requests_this_minute"] >= MAX_RPM
-        or state["tokens_this_minute"] + estimated_tokens > EFFECTIVE_TPM
-    )
-    if needs_wait:
+    while True:
+        now = time.monotonic()
+
+        # Smooth pacing: avoid bursty back-to-back sends.
+        last_ts = state.get("last_request_ts", 0.0)
+        if last_ts > 0:
+            delta = now - last_ts
+            if delta < MIN_REQUEST_GAP_SECONDS:
+                gap_wait = MIN_REQUEST_GAP_SECONDS - delta
+                logger.info(f"Pacing gap: waiting {gap_wait:.1f}s before next request")
+                await asyncio.sleep(gap_wait)
+                continue
+
+        elapsed = now - state["minute_start"]
+        if elapsed >= 60:
+            # Window expired — reset
+            state["minute_start"] = now
+            state["requests_this_minute"] = 0
+            state["tokens_this_minute"] = 0
+            return
+
+        needs_wait = (
+            state["requests_this_minute"] >= MAX_RPM
+            or state["tokens_this_minute"] + estimated_tokens > EFFECTIVE_TPM
+        )
+        if not needs_wait:
+            return
+
         wait_time = max(0, 60 - elapsed)
         logger.info(
-            f"Rate limit: {state['requests_this_minute']} RPM / "
-            f"{state['tokens_this_minute']} TPM used — waiting {wait_time:.1f}s "
-            f"for next window"
+            f"Rate gate: {state['requests_this_minute']} RPM / "
+            f"{state['tokens_this_minute']} TPM used, next est={estimated_tokens} — "
+            f"waiting {wait_time:.1f}s for next window"
         )
         await asyncio.sleep(wait_time)
         state["minute_start"] = time.monotonic()
@@ -614,8 +650,11 @@ async def _rate_limit_wait(state: dict, estimated_tokens: int):
 
 def _record_request(state: dict, estimated_tokens: int):
     """Update the rate-limiter counters after a successful send."""
+    import time
+
     state["requests_this_minute"] += 1
     state["tokens_this_minute"] += estimated_tokens
+    state["last_request_ts"] = time.monotonic()
 
 
 async def _handle_429_backoff(state: dict):
@@ -626,12 +665,19 @@ async def _handle_429_backoff(state: dict):
     import asyncio
     import random
 
-    wait = RATE_LIMIT_BACKOFF + random.randint(1, RATE_LIMIT_JITTER_MAX)
-    logger.warning(f"Rate limited (429). Global backoff: {wait}s (120 + jitter)")
+    elapsed = time.monotonic() - state["minute_start"]
+    window_wait = max(0, 60 - elapsed)
+    jitter = random.randint(1, RATE_LIMIT_JITTER_MAX) if RATE_LIMIT_JITTER_MAX > 0 else 0
+    wait = max(RATE_LIMIT_BACKOFF, int(window_wait)) + jitter
+    logger.warning(
+        f"Rate limited (429). Backoff: {wait}s "
+        f"(base={RATE_LIMIT_BACKOFF}s, window={int(window_wait)}s, jitter={jitter}s)"
+    )
     await asyncio.sleep(wait)
     state["minute_start"] = time.monotonic()
     state["requests_this_minute"] = 0
     state["tokens_this_minute"] = 0
+    state["last_request_ts"] = 0.0
 
 
 async def _call_groq_module_phase(
