@@ -1859,6 +1859,15 @@ class GitHubScanService:
             )
             effective_target_branch = dispatch_ref
 
+        # Enforce upload -> index wait -> dispatch order to avoid trigger races.
+        logger.info(f"Ensuring wrapper workflow is up to date before dispatch for {owner}/{repo}")
+        prepush_ok = await self.push_wrapper_hunter_workflow(owner, repo, dispatch_ref)
+        if not prepush_ok:
+            logger.error(f"Failed to push wrapper workflow before dispatch for {owner}/{repo}")
+            return False
+        logger.info("Waiting 5 seconds for GitHub to index wrapper workflow_dispatch trigger")
+        await asyncio.sleep(5)
+
         payload = {
             "ref": dispatch_ref,
             "inputs": {
@@ -1948,6 +1957,15 @@ class GitHubScanService:
                 f"'{dispatch_ref}' for {owner}/{repo}"
             )
             effective_target_branch = dispatch_ref
+
+        # Enforce upload -> index wait -> dispatch order to avoid trigger races.
+        logger.info(f"Ensuring semgrep workflow is up to date before dispatch for {owner}/{repo}")
+        prepush_ok = await self.push_workflow_file(owner, repo, dispatch_ref)
+        if not prepush_ok:
+            logger.error(f"Failed to push semgrep workflow before dispatch for {owner}/{repo}")
+            return False
+        logger.info("Waiting 5 seconds for GitHub to index semgrep workflow_dispatch trigger")
+        await asyncio.sleep(5)
 
         payload = {
             "ref": dispatch_ref,
