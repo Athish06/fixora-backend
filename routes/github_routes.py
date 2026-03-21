@@ -1204,7 +1204,9 @@ async def start_repository_scan(
             owner=owner,
             repo=repo_name,
             scan_id=scan_id,
-            target_branch=scan_request.branch
+            target_branch=scan_request.branch,
+            scan_mode=scan_request.scan_mode,
+            base_commit=scan_request.base_commit or "",
         )
         
         if triggered:

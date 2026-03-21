@@ -3,11 +3,25 @@
 import logging
 import json
 import os
+import re
 from typing import Dict, Any, Optional
 from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+CANONICAL_LLM_VULN_TYPES = {
+    "SQL Injection",
+    "Command Injection",
+    "Path Traversal",
+    "XSS",
+    "SSRF",
+    "Insecure Deserialization",
+    "IDOR / Broken Access Control",
+    "Cryptographic Failure",
+    "Hardcoded Secret",
+    "Business Logic Flaw",
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PROMPT BUILDERS — 2-phase LLM analysis
@@ -57,6 +71,10 @@ def build_module_sink_prompt(lang_key: str, modules: Dict[str, Any]) -> str:
         "  • Path traversal / arbitrary file read-write\n"
         "  • Insecure deserialization\n"
         "  • XXE / template injection / prototype pollution\n\n"
+        "ALSO include modules relevant to:\n"
+        "  • Cryptographic misuse (weak hashing, weak RNG, unsafe cipher modes)\n"
+        "  • Authentication/authorization and session boundaries (IDOR/BOLA risk)\n"
+        "  • Security misconfiguration surfaces (CORS/headers/cookie/JWT handling)\n\n"
         "Respond ONLY with valid JSON (no markdown, no extra text):\n"
         '{"sink_modules": ["mod1", "mod2", ...], "reason": "One sentence explanation"}\n\n'
         "If NO modules are sinks, respond:\n"
@@ -126,9 +144,11 @@ def build_function_chunk_prompt(
     for i, w in enumerate(wrappers, 1):
         calls        = [str(c) for c in (w.get("calls")        or []) if c is not None]
         modules_used = [str(m) for m in (w.get("modules_used") or []) if m is not None]
+        env          = str(w.get("environment") or "Unknown")
         func_parts.append(
             f"[{i}] {w.get('function_name', '?')} "
-            f"({w.get('file', '?')} L{w.get('line_start', '?')}-{w.get('line_end', '?')})\n"
+            f"({w.get('file', '?')} L{w.get('line_start', '?')}-{w.get('line_end', '?')}) "
+            f"- Runs in: {env}\n"
             f"    calls       : {', '.join(calls)}\n"
             f"    modules_used: {', '.join(modules_used)}\n"
             f"    source:\n```{code_fence}\n{w.get('source_code', '')}\n```\n\n"
@@ -143,9 +163,23 @@ def build_function_chunk_prompt(
         "  • If YES → include it in the output with vulnerability_type, severity, reason.\n"
         "  • If NO  → skip it entirely.\n\n"
         "SEVERITY GUIDELINES:\n"
-        "  HIGH   – Direct path from user input to sink, no sanitisation\n"
-        "  MEDIUM – Partial sanitisation or indirect taint path\n"
-        "  LOW    – Theoretical risk, unlikely to be exploitable as-is\n\n"
+        "  CRITICAL – Instant remote code execution, database dump, or auth bypass.\n"
+        "  HIGH     – Direct path from user input to sink, no sanitisation.\n"
+        "  MEDIUM   – Partial sanitisation or indirect taint path.\n"
+        "  LOW      – Theoretical risk, unlikely to be exploitable as-is.\n\n"
+        "TAXONOMY GUIDELINES:\n"
+        "  The 'vulnerability_type' MUST be exactly one of:\n"
+        "  ['SQL Injection', 'Command Injection', 'Path Traversal', 'XSS', 'SSRF', "
+        "'Insecure Deserialization', 'IDOR / Broken Access Control', "
+        "'Cryptographic Failure', 'Hardcoded Secret', 'Business Logic Flaw']\n\n"
+        "TAXONOMY & EXCLUSION RULES (STRICT):\n"
+        "  1. FRONTEND EXECUTION: If 'Runs in: BROWSER (Frontend)', do NOT report SQL Injection,\n"
+        "     Command Injection, or Path Traversal unless backend sink execution is directly visible\n"
+        "     in the provided function body (which is rare in browser code).\n"
+        "  2. PARAMETERIZED SDKs: Supabase/Prisma/TypeORM query builders are generally parameterized.\n"
+        "     Do NOT report SQL Injection unless there is explicit raw SQL construction or raw query API usage.\n"
+        "  3. FORMAT STRINGS: Do NOT report Unsafe Format String for JavaScript/TypeScript template literals\n"
+        "     or console logging patterns; that class is a C/C++ memory-corruption concept.\n\n"
         + sink_ctx
         + "RESPOND WITH ONLY VALID JSON. No markdown, no text outside the JSON.\n"
         "IMPORTANT: Do NOT include \"source_code\" in your output — I already have it.\n"
@@ -175,6 +209,178 @@ def build_function_chunk_prompt(
         f"=== {lang_label} WRAPPER FUNCTIONS ({len(wrappers)}) ===\n\n"
         + "".join(func_parts)
     )
+
+
+_FRONTEND_PATH_RE = re.compile(r"/(components|pages|views|hooks|ui|layouts)/", re.IGNORECASE)
+_FRONTEND_EXT_RE = re.compile(r"\.(tsx|jsx)$", re.IGNORECASE)
+_SEVERITY_BLOCKLIST_FRONTEND = (
+    "sql injection",
+    "nosql injection",
+    "command injection",
+    "os command injection",
+    "path traversal",
+    "directory traversal",
+)
+_FORMAT_STRING_MARKERS = (
+    "unsafe format string",
+    "format string",
+)
+_SAFE_ORM_SDKS = {
+    "supabase",
+    "@supabase/supabase-js",
+    "prisma",
+    "typeorm",
+}
+_RAW_SQL_MARKERS = (
+    "raw(",
+    ".raw(",
+    "queryraw",
+    "executeraw",
+    "$queryraw",
+    "$executeraw",
+    "select ",
+    "insert ",
+    "update ",
+    "delete ",
+)
+
+
+def _wrapper_key(item: dict) -> tuple:
+    return (
+        str(item.get("function_name") or ""),
+        str(item.get("file") or ""),
+        str(item.get("line_start") or ""),
+        str(item.get("line_end") or ""),
+    )
+
+
+def _normalize_llm_vuln_type(raw_type: str, reason: str, calls: list, modules: list) -> str:
+    txt = " ".join([
+        str(raw_type or ""),
+        str(reason or ""),
+        " ".join(str(c) for c in (calls or [])),
+        " ".join(str(m) for m in (modules or [])),
+    ]).lower()
+
+    if any(x in txt for x in ["sql", "nosql", "ldap", "xpath"]):
+        return "SQL Injection"
+    if any(x in txt for x in ["command", "exec", "spawn", "shell", "rce"]):
+        return "Command Injection"
+    if any(x in txt for x in ["path traversal", "directory traversal", "lfi", "path-traversal"]):
+        return "Path Traversal"
+    if "xss" in txt or "cross-site scripting" in txt:
+        return "XSS"
+    if "ssrf" in txt:
+        return "SSRF"
+    if any(x in txt for x in ["deserialize", "deserialization", "pickle", "yaml.load"]):
+        return "Insecure Deserialization"
+    if any(x in txt for x in ["idor", "bola", "access control", "authorization", "authz"]):
+        return "IDOR / Broken Access Control"
+    if any(x in txt for x in ["crypto", "md5", "sha1", "cipher", "weak random", "prng"]):
+        return "Cryptographic Failure"
+    if any(x in txt for x in ["secret", "hardcoded", "token", "password", "api key", "private key"]):
+        return "Hardcoded Secret"
+    if any(x in txt for x in ["business logic", "workflow", "abuse", "race condition"]):
+        return "Business Logic Flaw"
+    return "Business Logic Flaw"
+
+
+def _is_frontend_context(vuln: dict, source_wrapper: Optional[dict]) -> bool:
+    env_text = ""
+    file_path = str(vuln.get("file") or "")
+    if source_wrapper:
+        env_text = str(source_wrapper.get("environment") or "")
+        if not file_path:
+            file_path = str(source_wrapper.get("file") or "")
+    env_low = env_text.lower()
+    file_low = file_path.replace("\\", "/")
+    return (
+        "browser" in env_low
+        or bool(_FRONTEND_EXT_RE.search(file_low))
+        or bool(_FRONTEND_PATH_RE.search(file_low))
+    )
+
+
+def _find_source_wrapper(vuln: dict, source_index: Dict[tuple, dict]) -> Optional[dict]:
+    full_key = _wrapper_key(vuln)
+    if full_key in source_index:
+        return source_index[full_key]
+
+    fallback_key = (
+        str(vuln.get("function_name") or ""),
+        str(vuln.get("file") or ""),
+        "",
+        "",
+    )
+    return source_index.get(fallback_key)
+
+
+def _is_js_ts_file(vuln: dict, source_wrapper: Optional[dict]) -> bool:
+    file_path = str(vuln.get("file") or "")
+    if source_wrapper and not file_path:
+        file_path = str(source_wrapper.get("file") or "")
+    return file_path.lower().endswith((".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"))
+
+
+def _is_safe_orm_sqli_false_positive(vuln: dict, source_wrapper: Optional[dict]) -> bool:
+    vuln_type = str(vuln.get("vulnerability_type") or "").lower()
+    if "sql injection" not in vuln_type and "nosql injection" not in vuln_type:
+        return False
+
+    modules = set()
+    for mod in (vuln.get("modules_used") or []):
+        modules.add(str(mod).lower())
+    if source_wrapper:
+        for mod in (source_wrapper.get("modules_used") or []):
+            modules.add(str(mod).lower())
+
+    if not any(any(sdk in m for sdk in _SAFE_ORM_SDKS) for m in modules):
+        return False
+
+    haystack = " ".join([
+        str(vuln.get("reason") or ""),
+        " ".join(str(c) for c in (vuln.get("calls") or [])),
+        str(source_wrapper.get("source_code") or "") if source_wrapper else "",
+    ]).lower()
+
+    # Keep findings when explicit raw SQL/query patterns are visible.
+    if any(marker in haystack for marker in _RAW_SQL_MARKERS):
+        return False
+    return True
+
+
+def _prune_false_positive_wrappers(new_wrappers: list, source_index: Dict[tuple, dict]) -> tuple:
+    kept = []
+    dropped = []
+
+    for vuln in new_wrappers:
+        source_wrapper = _find_source_wrapper(vuln, source_index)
+        normalized_type = _normalize_llm_vuln_type(
+            str(vuln.get("vulnerability_type") or ""),
+            str(vuln.get("reason") or ""),
+            vuln.get("calls") or [],
+            vuln.get("modules_used") or [],
+        )
+        vuln["vulnerability_type"] = normalized_type
+        vuln_type = normalized_type.lower()
+
+        if _is_frontend_context(vuln, source_wrapper):
+            if any(marker in vuln_type for marker in _SEVERITY_BLOCKLIST_FRONTEND):
+                dropped.append(vuln)
+                continue
+
+        if _is_js_ts_file(vuln, source_wrapper):
+            if any(marker in vuln_type for marker in _FORMAT_STRING_MARKERS):
+                dropped.append(vuln)
+                continue
+
+        if _is_safe_orm_sqli_false_positive(vuln, source_wrapper):
+            dropped.append(vuln)
+            continue
+
+        kept.append(vuln)
+
+    return kept, dropped
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -524,10 +730,30 @@ async def analyze_wrappers_with_llm(
                     # Merge vulnerable wrapper functions
                     new_wrappers = ai_output.get("wrapper_functions", [])
                     if isinstance(new_wrappers, list):
-                        final_merged_result["results"][lang_key]["wrapper_functions"].extend(
-                            new_wrappers
+                        source_index = {}
+                        for src_w in chunk:
+                            source_index[_wrapper_key(src_w)] = src_w
+                            source_index[(
+                                str(src_w.get("function_name") or ""),
+                                str(src_w.get("file") or ""),
+                                "",
+                                "",
+                            )] = src_w
+
+                        kept_wrappers, dropped_wrappers = _prune_false_positive_wrappers(
+                            new_wrappers,
+                            source_index,
                         )
-                        total_vuln_wrappers += len(new_wrappers)
+                        if dropped_wrappers:
+                            logger.info(
+                                f"[{lang_key}] Pruned {len(dropped_wrappers)} likely false-positive "
+                                f"finding(s) from chunk {chunk_idx+1}/{len(chunks)}"
+                            )
+
+                        final_merged_result["results"][lang_key]["wrapper_functions"].extend(
+                            kept_wrappers
+                        )
+                        total_vuln_wrappers += len(kept_wrappers)
 
             # ── Progress + ETA callback ───────────────────────────────────
             if progress_callback:

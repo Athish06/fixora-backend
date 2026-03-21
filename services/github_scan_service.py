@@ -26,6 +26,14 @@ on:
     types: [fixora-wrapper-hunt]
   workflow_dispatch:
     inputs:
+            scan_mode:
+                description: 'Scan mode: full or diff'
+                required: true
+                default: 'full'
+                type: choice
+                options:
+                    - full
+                    - diff
       scan_id:
         description: 'Fixora scan ID for tracking'
         required: true
@@ -33,6 +41,10 @@ on:
         description: 'Branch to analyze'
         required: true
         default: 'main'
+            base_commit:
+                description: 'Base commit for diff scan (optional)'
+                required: false
+                default: ''
 
 jobs:
   wrapper-hunt:
@@ -65,6 +77,7 @@ jobs:
               '.github','.vscode','vendor','bower_components',
           ]);
           const JS_EXTS = new Set(['.js','.jsx','.ts','.tsx','.mjs','.cjs']);
+          const FRONTEND_IMPORTS = new Set(['react','vue','next','next/client','solid-js']);
 
           const DANGEROUS_GLOBALS = new Set([
               'eval','Function','setTimeout','setInterval','setImmediate',
@@ -77,6 +90,13 @@ jobs:
               'execSync','spawn','spawnSync','execFile','execFileSync','fork',
               'write','writeln','insertAdjacentHTML',
               'deserialize','unserialize',
+          ]);
+          const DATA_OPERATION_METHODS = new Set([
+              'query','execute','exec','aggregate','raw',
+              'find','findOne','findById','findOneAndUpdate','findOneAndDelete',
+              'deleteOne','deleteMany','updateOne','updateMany','insertOne','insertMany',
+              'replaceOne','bulkWrite','distinct','countDocuments',
+              'select','update','delete','upsert','save','create',
           ]);
 
           function walkDir(dir, cb) {
@@ -123,6 +143,17 @@ jobs:
                   return o && p ? o + '.' + p : (p || o);
               }
               return null;
+          }
+
+          function detectEnvironment(relPath, importsList) {
+              const normalizedPath = String(relPath || '').replace(/\\\\/g, '/').toLowerCase();
+              const isTsxJsx = /\.(tsx|jsx)$/i.test(normalizedPath);
+              const hasFrontendPath = /\/(components|pages|views|hooks|ui|layouts)\//i.test(normalizedPath);
+              const hasFrontendImport = (importsList || []).some((i) => FRONTEND_IMPORTS.has(String(i || '').toLowerCase()));
+              if (isTsxJsx || hasFrontendPath || hasFrontendImport) {
+                  return 'BROWSER (Frontend)';
+              }
+              return 'NODE.JS (Backend)';
           }
 
           function collectImports(body) {
@@ -214,7 +245,7 @@ jobs:
                           const method = cn.includes('.') ? cn.split('.').pop() : null;
                           if (DANGEROUS_GLOBALS.has(cn) || DANGEROUS_GLOBALS.has(root))
                               calls[cn] = 'builtins';
-                          else if (aliasMap[root])
+                          else if (aliasMap[root] && method && DANGEROUS_SINK_METHODS.has(method))
                               calls[cn] = aliasMap[root];
                           else if (method && DANGEROUS_SINK_METHODS.has(method))
                               calls[cn] = '<object>.' + method;
@@ -247,23 +278,52 @@ jobs:
               return calls;
           }
 
-          function extractFile(ast, src, relPath, aliasMap) {
+          function hasPotentialMissingAuthz(fnSrc, callsObj) {
+              const src = String(fnSrc || '').toLowerCase();
+              const hasAuthSignal = /\b(current_user|user_id|owner_id|req\.user|request\.user|ctx\.user|session\.user|authorize|authorization|authz|permission|isadmin|role)\b/i.test(src);
+              const callNames = Object.keys(callsObj || {});
+              const hasDataOperation = callNames.some((cn) => {
+                  const method = cn.includes('.') ? cn.split('.').pop() : cn;
+                  return DATA_OPERATION_METHODS.has(String(method || '').toLowerCase());
+              });
+              return hasDataOperation && !hasAuthSignal;
+          }
+
+          function extractFile(ast, src, relPath, aliasMap, importsList) {
               const wrappers = [];
+              const env = detectEnvironment(relPath, importsList);
               function visit(node, parent) {
                   if (!node || typeof node !== 'object') return;
                   if (isFn(node)) {
                       const name = fnName(node, parent);
                       const calls = findCalls(node, aliasMap);
-                      if (Object.keys(calls).length > 0) {
-                          const funcSrc = (node.start != null && node.end != null)
-                              ? src.substring(node.start, node.end) : '';
+                      const funcSrc = (node.start != null && node.end != null)
+                          ? src.substring(node.start, node.end) : '';
+                      const possibleIdor = hasPotentialMissingAuthz(funcSrc, calls);
+
+                      if (Object.keys(calls).length > 0 || possibleIdor) {
+                          const emittedCalls = Object.keys(calls);
+                          const emittedModules = [...new Set(Object.values(calls))];
+                          const heuristicFlags = [];
+                          if (possibleIdor) {
+                              if (!emittedCalls.includes('authz.missing_check')) {
+                                  emittedCalls.push('authz.missing_check');
+                              }
+                              if (!emittedModules.includes('<authz-risk>')) {
+                                  emittedModules.push('<authz-risk>');
+                              }
+                              heuristicFlags.push('possible_idor_missing_authz');
+                          }
+
                           const ls = node.loc ? node.loc.start.line : 1;
                           const le = node.loc ? node.loc.end.line : ls;
                           wrappers.push({
                               function_name: name, file: relPath,
+                              environment: env,
                               line_start: ls, line_end: le,
-                              calls: Object.keys(calls),
-                              modules_used: [...new Set(Object.values(calls))],
+                              calls: emittedCalls,
+                              modules_used: emittedModules,
+                              heuristic_flags: heuristicFlags,
                               source_code: funcSrc,
                           });
                       }
@@ -282,9 +342,11 @@ jobs:
           const scanRoot = process.argv[2] || '.';
           const displayRoot = process.argv[3] || scanRoot;
           const manifestPkgs = JSON.parse(process.argv[4] || '[]');
+          const targetFiles = JSON.parse(process.argv[5] || '[]');
           const allImports = new Set();
           const allWrappers = [];
-          walkDir(scanRoot, (fp) => {
+
+          function parseAndCollect(fp) {
               let src;
               try { src = fs.readFileSync(fp, 'utf8'); } catch(e) { return; }
               const ast = parseFile(fp, src);
@@ -292,9 +354,24 @@ jobs:
               const rel = path.relative(displayRoot, fp);
               const { imports, alias } = collectImports(ast.program.body);
               imports.forEach(i => allImports.add(i));
-              const wrappers = extractFile(ast, src, rel, alias);
+              const wrappers = extractFile(ast, src, rel, alias, imports);
               allWrappers.push(...wrappers);
-          });
+          }
+
+          if (Array.isArray(targetFiles) && targetFiles.length > 0) {
+              for (const relFp of targetFiles) {
+                  if (!relFp || typeof relFp !== 'string') continue;
+                  const fp = path.resolve(scanRoot, relFp);
+                  const ext = path.extname(fp).toLowerCase();
+                  if (!JS_EXTS.has(ext)) continue;
+                  if (!fs.existsSync(fp)) continue;
+                  parseAndCollect(fp);
+              }
+          } else {
+              walkDir(scanRoot, (fp) => {
+                  parseAndCollect(fp);
+              });
+          }
           process.stdout.write(JSON.stringify({
               from_imports: [...allImports].sort(),
               wrappers: allWrappers,
@@ -303,12 +380,20 @@ jobs:
 
       - name: Run Wrapper Hunter
         run: |
+                    SCAN_MODE="${{ github.event.client_payload.scan_mode || github.event.inputs.scan_mode || 'full' }}"
+                    BASE_COMMIT="${{ github.event.client_payload.base_commit || github.event.inputs.base_commit || '' }}"
+                    if [ "$SCAN_MODE" != "diff" ]; then
+                        BASE_COMMIT=""
+                    fi
+
           cat > /tmp/wrapper_hunter.py << 'HUNTER_SCRIPT'
           #!/usr/bin/env python3
           import ast
           import os
           import re
           import json
+          import subprocess
+          import sys
 
           IGNORE_DIRS = {
               "node_modules", "venv", ".venv", "env", ".env", ".git",
@@ -589,33 +674,40 @@ jobs:
               return sorted(set(pkgs))
 
           # ─── IMPORT COLLECTORS ────────────────────────────────────────────────────────
-          def collect_python_imports(repo_root):
-              # Walk all .py files; collect every top-level module name imported
-              found = set()
-              for dirpath, dirnames, filenames in os.walk(repo_root):
+          def _iter_target_python_files(scan_root, target_files=None):
+              if target_files is not None:
+                  for fp in target_files:
+                      if fp.endswith(".py") and os.path.isfile(fp):
+                          yield fp
+                  return
+
+              for dirpath, dirnames, filenames in os.walk(scan_root):
                   dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
                   for fn in filenames:
-                      if not fn.endswith(".py"):
-                          continue
-                      fp = os.path.join(dirpath, fn)
-                      try:
-                          with open(fp, "r", errors="ignore") as f:
-                              source = f.read()
-                          tree = ast.parse(source, filename=fp)
-                      except Exception:
-                          continue
-                      for node in ast.walk(tree):
-                          if isinstance(node, ast.Import):
-                              for alias in node.names:
-                                  found.add(alias.name.split(".")[0])
-                          elif isinstance(node, ast.ImportFrom):
-                              if node.module:
-                                  found.add(node.module.split(".")[0])
+                      if fn.endswith(".py"):
+                          yield os.path.join(dirpath, fn)
+
+          def collect_python_imports(scan_root, target_files=None):
+              # Collect every top-level imported module from Python files in scope.
+              found = set()
+              for fp in _iter_target_python_files(scan_root, target_files=target_files):
+                  try:
+                      with open(fp, "r", errors="ignore") as f:
+                          source = f.read()
+                      tree = ast.parse(source, filename=fp)
+                  except Exception:
+                      continue
+                  for node in ast.walk(tree):
+                      if isinstance(node, ast.Import):
+                          for alias in node.names:
+                              found.add(alias.name.split(".")[0])
+                      elif isinstance(node, ast.ImportFrom):
+                          if node.module:
+                              found.add(node.module.split(".")[0])
               return sorted(found)
 
           # ─── JS/REACT EXTRACTION (AST via Node.js) ───────────────────────────────
-          def run_js_extractor(scan_root, display_root, manifest_pkgs):
-              import subprocess, sys
+          def run_js_extractor(scan_root, display_root, manifest_pkgs, target_files=None):
               try:
                   result = subprocess.run(
                       [
@@ -623,6 +715,7 @@ jobs:
                           scan_root,
                           display_root,
                           json.dumps(manifest_pkgs),
+                          json.dumps(target_files or []),
                       ],
                       capture_output=True, text=True, timeout=120
                   )
@@ -665,7 +758,33 @@ jobs:
               "loads", "load",
           }
 
-          def extract_python_wrappers(scan_root, all_modules, display_root):
+          DATA_OPERATION_METHODS = {
+              "execute", "executemany", "executescript", "mogrify", "callproc",
+              "query", "find", "find_one", "findone", "get", "select", "filter",
+              "update", "update_one", "updateone", "update_many", "updatemany",
+              "delete", "delete_one", "deleteone", "delete_many", "deletemany",
+              "insert", "insert_one", "insertone", "insert_many", "insertmany",
+              "save", "create", "upsert", "merge", "bulk_write", "bulkwrite",
+          }
+
+          AUTHZ_SIGNAL_RE = re.compile(
+              r"\\b(current_user|user_id|owner_id|request\\.user|req\\.user|ctx\\.user|session\\.user|"
+              r"authorize|authorization|authz|permission|is_admin|isadmin|role)\\b",
+              re.IGNORECASE,
+          )
+
+          def _python_has_potential_missing_authz(func_src, calls_found):
+              src = (func_src or "").lower()
+              has_auth_signal = bool(AUTHZ_SIGNAL_RE.search(src))
+              has_data_operation = False
+              for call_str in calls_found.keys():
+                  method = call_str.rsplit(".", 1)[-1].lower()
+                  if method in DATA_OPERATION_METHODS:
+                      has_data_operation = True
+                      break
+              return has_data_operation and not has_auth_signal
+
+          def extract_python_wrappers(scan_root, all_modules, display_root, target_files=None):
               # Find every function that:
               #   1. Calls any module from all_modules (existing), OR
               #   2. Calls a method on a variable derived from an imported module
@@ -674,119 +793,126 @@ jobs:
               wrappers = []
               target = set(all_modules)
               dangerous_builtins = {"eval", "exec", "__import__", "compile", "open", "globals", "locals"}
-              for dirpath, dirnames, filenames in os.walk(scan_root):
-                  dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
-                  for fn in filenames:
-                      if not fn.endswith(".py"):
-                          continue
-                      fp = os.path.join(dirpath, fn)
-                      try:
-                          with open(fp, "r", errors="ignore") as f:
-                              source = f.read()
-                          tree = ast.parse(source, filename=fp)
-                      except Exception:
-                          continue
-                      # Per-file: alias -> root module name
-                      imported_names = {}
-                      for node in ast.walk(tree):
-                          if isinstance(node, ast.Import):
-                              for alias in node.names:
-                                  root = alias.name.split(".")[0]
-                                  if root in target:
-                                      imported_names[alias.asname or alias.name.split(".")[0]] = root
-                          elif isinstance(node, ast.ImportFrom):
-                              module = (node.module or "").split(".")[0]
-                              if module in target:
-                                  for alias in node.names:
-                                      imported_names[alias.asname or alias.name] = module
-                      rel = os.path.relpath(fp, display_root).replace("\\\\", "/")
-                      for node in ast.walk(tree):
-                          if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                              # ── Pass 1: Track variables derived from imports ──
-                              # Handles chains like:
-                              #   conn = sqlite3.connect(...)   → conn linked to sqlite3
-                              #   cursor = conn.cursor()        → cursor linked to sqlite3
-                              # Two iterations catch A→B→C chains.
-                              import_derived = {}
-                              for _pass in range(2):
-                                  for child in ast.walk(node):
-                                      # Simple assignments: x = something.method()
-                                      if isinstance(child, ast.Assign):
-                                          if isinstance(child.value, ast.Call):
-                                              cn = _get_call_name(child.value)
-                                              if cn:
-                                                  cr = cn.split(".")[0]
-                                                  linked = imported_names.get(cr) or import_derived.get(cr)
-                                                  if linked:
-                                                      for tgt in child.targets:
-                                                          if isinstance(tgt, ast.Name):
-                                                              import_derived[tgt.id] = linked
-                                          # x = something (non-call assignment from import alias)
-                                          elif isinstance(child.value, ast.Attribute):
-                                              cn = _get_call_name(ast.Call(func=child.value, args=[], keywords=[]))  # reuse helper
-                                              if cn:
-                                                  cr = cn.split(".")[0]
-                                                  linked = imported_names.get(cr) or import_derived.get(cr)
-                                                  if linked:
-                                                      for tgt in child.targets:
-                                                          if isinstance(tgt, ast.Name):
-                                                              import_derived[tgt.id] = linked
-                                          elif isinstance(child.value, ast.Name):
-                                              if child.value.id in imported_names:
-                                                  for tgt in child.targets:
-                                                      if isinstance(tgt, ast.Name):
-                                                          import_derived[tgt.id] = imported_names[child.value.id]
-                                              elif child.value.id in import_derived:
-                                                  for tgt in child.targets:
-                                                      if isinstance(tgt, ast.Name):
-                                                          import_derived[tgt.id] = import_derived[child.value.id]
-                                      # with-statement context managers:
-                                      #   with sqlite3.connect("db") as conn:
-                                      #   async with aiohttp.ClientSession() as session:
-                                      if isinstance(child, (ast.With, ast.AsyncWith)):
-                                          for item in child.items:
-                                              ctx = item.context_expr
-                                              if isinstance(ctx, ast.Call) and item.optional_vars:
-                                                  cn = _get_call_name(ctx)
-                                                  if cn:
-                                                      cr = cn.split(".")[0]
-                                                      linked = imported_names.get(cr) or import_derived.get(cr)
-                                                      if linked and isinstance(item.optional_vars, ast.Name):
-                                                          import_derived[item.optional_vars.id] = linked
+              for fp in _iter_target_python_files(scan_root, target_files=target_files):
+                  fn = os.path.basename(fp)
+                  if not fn.endswith(".py"):
+                      continue
+                  try:
+                      with open(fp, "r", errors="ignore") as f:
+                          source = f.read()
+                      tree = ast.parse(source, filename=fp)
+                  except Exception:
+                      continue
 
-                              # ── Pass 2: Collect calls ──────────────────────────
-                              calls_found = {}
-                              for child in ast.walk(node):
-                                  if isinstance(child, ast.Call):
-                                      call_str = _get_call_name(child)
-                                      if not call_str:
-                                          continue
-                                      root = call_str.split(".")[0]
-                                      # Direct import call (existing)
-                                      if root in imported_names:
-                                          calls_found[call_str] = imported_names[root]
-                                      # Dangerous builtins (existing)
-                                      elif root in dangerous_builtins:
-                                          calls_found[call_str] = "builtins"
-                                      # NEW: Variable derived from an import (cursor.execute, conn.commit)
-                                      elif root in import_derived:
-                                          calls_found[call_str] = import_derived[root]
-                                      # NEW: Known dangerous method on any object (fallback)
-                                      elif "." in call_str:
-                                          method = call_str.rsplit(".", 1)[-1]
-                                          if method in DANGEROUS_SINK_METHODS:
-                                              calls_found[call_str] = f"<object>.{method}"
-                              if calls_found:
-                                  func_src = ast.get_source_segment(source, node) or ""
-                                  wrappers.append({
-                                      "function_name": node.name,
-                                      "file": rel,
-                                      "line_start": node.lineno,
-                                      "line_end": node.end_lineno,
-                                      "calls": list(calls_found.keys()),
-                                      "modules_used": list(set(calls_found.values())),
-                                      "source_code": func_src,
-                                  })
+                  # Per-file: alias -> root module name
+                  imported_names = {}
+                  for node in ast.walk(tree):
+                      if isinstance(node, ast.Import):
+                          for alias in node.names:
+                              root = alias.name.split(".")[0]
+                              if root in target:
+                                  imported_names[alias.asname or alias.name.split(".")[0]] = root
+                      elif isinstance(node, ast.ImportFrom):
+                          module = (node.module or "").split(".")[0]
+                          if module in target:
+                              for alias in node.names:
+                                  imported_names[alias.asname or alias.name] = module
+
+                  rel = os.path.relpath(fp, display_root).replace("\\\\", "/")
+
+                  for node in ast.walk(tree):
+                      if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                          continue
+
+                      # ── Pass 1: Track variables derived from imports ──
+                      import_derived = {}
+                      for _pass in range(2):
+                          for child in ast.walk(node):
+                              if isinstance(child, ast.Assign):
+                                  if isinstance(child.value, ast.Call):
+                                      cn = _get_call_name(child.value)
+                                      if cn:
+                                          cr = cn.split(".")[0]
+                                          linked = imported_names.get(cr) or import_derived.get(cr)
+                                          if linked:
+                                              for tgt in child.targets:
+                                                  if isinstance(tgt, ast.Name):
+                                                      import_derived[tgt.id] = linked
+                                  elif isinstance(child.value, ast.Attribute):
+                                      cn = _get_call_name(ast.Call(func=child.value, args=[], keywords=[]))
+                                      if cn:
+                                          cr = cn.split(".")[0]
+                                          linked = imported_names.get(cr) or import_derived.get(cr)
+                                          if linked:
+                                              for tgt in child.targets:
+                                                  if isinstance(tgt, ast.Name):
+                                                      import_derived[tgt.id] = linked
+                                  elif isinstance(child.value, ast.Name):
+                                      if child.value.id in imported_names:
+                                          for tgt in child.targets:
+                                              if isinstance(tgt, ast.Name):
+                                                  import_derived[tgt.id] = imported_names[child.value.id]
+                                      elif child.value.id in import_derived:
+                                          for tgt in child.targets:
+                                              if isinstance(tgt, ast.Name):
+                                                  import_derived[tgt.id] = import_derived[child.value.id]
+
+                              if isinstance(child, (ast.With, ast.AsyncWith)):
+                                  for item in child.items:
+                                      ctx = item.context_expr
+                                      if isinstance(ctx, ast.Call) and item.optional_vars:
+                                          cn = _get_call_name(ctx)
+                                          if cn:
+                                              cr = cn.split(".")[0]
+                                              linked = imported_names.get(cr) or import_derived.get(cr)
+                                              if linked and isinstance(item.optional_vars, ast.Name):
+                                                  import_derived[item.optional_vars.id] = linked
+
+                      # ── Pass 2: Collect calls ──────────────────────────
+                      calls_found = {}
+                      for child in ast.walk(node):
+                          if isinstance(child, ast.Call):
+                              call_str = _get_call_name(child)
+                              if not call_str:
+                                  continue
+                              root = call_str.split(".")[0]
+                              if root in imported_names:
+                                  calls_found[call_str] = imported_names[root]
+                              elif root in dangerous_builtins:
+                                  calls_found[call_str] = "builtins"
+                              elif root in import_derived:
+                                  calls_found[call_str] = import_derived[root]
+                              elif "." in call_str:
+                                  method = call_str.rsplit(".", 1)[-1]
+                                  if method in DANGEROUS_SINK_METHODS:
+                                      calls_found[call_str] = f"<object>.{method}"
+
+                      func_src = ast.get_source_segment(source, node) or ""
+                      possible_idor = _python_has_potential_missing_authz(func_src, calls_found)
+
+                      if calls_found or possible_idor:
+                          emitted_calls = list(calls_found.keys())
+                          emitted_modules = list(set(calls_found.values()))
+                          heuristic_flags = []
+
+                          if possible_idor:
+                              if "authz.missing_check" not in emitted_calls:
+                                  emitted_calls.append("authz.missing_check")
+                              if "<authz-risk>" not in emitted_modules:
+                                  emitted_modules.append("<authz-risk>")
+                              heuristic_flags.append("possible_idor_missing_authz")
+
+                          wrappers.append({
+                              "function_name": node.name,
+                              "file": rel,
+                              "environment": "SERVER (Backend)",
+                              "line_start": node.lineno,
+                              "line_end": node.end_lineno,
+                              "calls": emitted_calls,
+                              "modules_used": emitted_modules,
+                              "heuristic_flags": heuristic_flags,
+                              "source_code": func_src,
+                          })
               return wrappers
 
           # ─── ORCHESTRATOR ─────────────────────────────────────────────────────────────
@@ -808,8 +934,68 @@ jobs:
                       dst.append(item)
                       seen.add(item)
 
-          def run_wrapper_hunter(repo_root="."):
+          def _safe_relpath(base_abs, path_abs):
+              try:
+                  if os.path.commonpath([base_abs, path_abs]) != base_abs:
+                      return None
+              except Exception:
+                  return None
+              return os.path.relpath(path_abs, base_abs).replace("\\", "/")
+
+          def _get_changed_files(repo_root, base_commit):
+              if not base_commit:
+                  return []
+              try:
+                  result = subprocess.run(
+                      ["git", "diff", "--name-only", base_commit, "HEAD"],
+                      cwd=repo_root,
+                      capture_output=True,
+                      text=True,
+                      timeout=60,
+                      check=False,
+                  )
+              except Exception as e:
+                  print(f"Diff mode disabled: git diff failed ({e})", file=sys.stderr)
+                  return []
+
+              if result.returncode != 0:
+                  print(
+                      f"Diff mode disabled: git diff exited {result.returncode}: {result.stderr[:300]}",
+                      file=sys.stderr,
+                  )
+                  return []
+
+              changed = []
+              for line in (result.stdout or "").splitlines():
+                  rel = line.strip()
+                  if not rel:
+                      continue
+                  abs_path = _norm_abs(os.path.join(repo_root, rel))
+                  if not os.path.isfile(abs_path):
+                      continue
+                  changed.append(abs_path)
+              return changed
+
+          def _target_changed_files(changed_files_abs, scan_abs, language):
+              if not changed_files_abs:
+                  return []
+              exts = _lang_exts(language)
+              selected = []
+              for fp in changed_files_abs:
+                  if not fp.lower().endswith(exts):
+                      continue
+                  try:
+                      if os.path.commonpath([scan_abs, fp]) != scan_abs:
+                          continue
+                  except Exception:
+                      continue
+                  selected.append(fp)
+              return selected
+
+          def run_wrapper_hunter(repo_root=".", base_commit=""):
               repo_root = _norm_abs(repo_root)
+              changed_files_abs = _get_changed_files(repo_root, base_commit)
+              diff_mode = bool(base_commit)
               targets, found_anchors, phantom_roots = build_scan_targets(repo_root)
 
               results = {}
@@ -820,6 +1006,19 @@ jobs:
                   lang = t["language"]
                   root_abs = t["root_abs"]
                   scan_abs = t["scan_abs"]
+                  changed_for_target = _target_changed_files(changed_files_abs, scan_abs, lang) if diff_mode else None
+
+                  if diff_mode and not changed_for_target:
+                      scan_targets.append({
+                          "language": lang,
+                          "root_path": t["root_path"],
+                          "scan_path": t["scan_path"],
+                          "anchor_files": t["anchor_files"],
+                          "modules": {"from_manifest": [], "from_imports": [], "all": []},
+                          "wrapper_count": 0,
+                          "skipped_reason": "no_changed_files_for_target",
+                      })
+                      continue
 
                   if lang == "python":
                       manifest_pkgs = sorted(set(
@@ -828,12 +1027,29 @@ jobs:
                           + parse_pyproject_toml(root_abs)
                           + parse_pipfile(root_abs)
                       ))
-                      import_mods = collect_python_imports(scan_abs)
+                      import_mods = collect_python_imports(scan_abs, target_files=changed_for_target)
                       all_modules = sorted(set(manifest_pkgs) | set(import_mods))
-                      wrappers = extract_python_wrappers(scan_abs, all_modules, repo_root)
+                      wrappers = extract_python_wrappers(
+                          scan_abs,
+                          all_modules,
+                          repo_root,
+                          target_files=changed_for_target,
+                      )
                   else:
                       manifest_pkgs = parse_package_json(root_abs)
-                      js_result = run_js_extractor(scan_abs, repo_root, manifest_pkgs)
+                      rel_changed = []
+                      if changed_for_target:
+                          for fp in changed_for_target:
+                              relp = _safe_relpath(scan_abs, fp)
+                              if relp:
+                                  rel_changed.append(relp)
+
+                      js_result = run_js_extractor(
+                          scan_abs,
+                          repo_root,
+                          manifest_pkgs,
+                          target_files=rel_changed,
+                      )
                       import_mods = js_result.get("from_imports", [])
                       all_modules = sorted(set(manifest_pkgs) | set(import_mods))
                       wrappers = js_result.get("wrappers", [])
@@ -884,6 +1100,9 @@ jobs:
                   "results": results,
                   "scan_targets": scan_targets,
                   "orchestrator": {
+                      "diff_mode": diff_mode,
+                      "base_commit": base_commit or "",
+                      "changed_files_considered": len(changed_files_abs) if diff_mode else 0,
                       "anchors_found": len(found_anchors),
                       "targets_selected": len(scan_targets),
                       "phantom_roots_skipped": phantom_roots,
@@ -891,12 +1110,13 @@ jobs:
               }
 
           if __name__ == "__main__":
-              output = run_wrapper_hunter(".")
+              base_commit_arg = sys.argv[1] if len(sys.argv) > 1 else ""
+              output = run_wrapper_hunter(".", base_commit=base_commit_arg)
               with open("wrapper-hunter-results.json", "w") as f:
                   json.dump(output, f, indent=2)
               print(json.dumps(output, indent=2))
           HUNTER_SCRIPT
-          python3 /tmp/wrapper_hunter.py
+          python3 /tmp/wrapper_hunter.py "$BASE_COMMIT"
 
       - name: Send Wrapper Hunter Results to Fixora
         run: |
@@ -1594,6 +1814,8 @@ class GitHubScanService:
         repo: str,
         scan_id: str,
         target_branch: str = "main",
+        scan_mode: str = "full",
+        base_commit: str = "",
         max_retries: int = 3
     ) -> bool:
         """Trigger the Wrapper Hunter workflow via repository_dispatch"""
@@ -1609,7 +1831,9 @@ class GitHubScanService:
                             "event_type": "fixora-wrapper-hunt",
                             "client_payload": {
                                 "scan_id": scan_id,
-                                "target_branch": target_branch
+                                "target_branch": target_branch,
+                                "scan_mode": scan_mode,
+                                "base_commit": base_commit or ""
                             }
                         }
                     )
