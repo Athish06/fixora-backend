@@ -22,6 +22,8 @@ CUSTOM_RULES_FILE_PATH = ".fixora-rules.yml"
 WRAPPER_HUNTER_TEMPLATE = '''name: Fixora Wrapper Hunter
 
 on:
+  repository_dispatch:
+    types: [fixora-wrapper-hunt]
   workflow_dispatch:
     inputs:
       scan_mode:
@@ -51,7 +53,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.target_branch }}
+          ref: ${{ github.event.client_payload.target_branch || github.event.inputs.target_branch }}
           fetch-depth: 0
 
       - name: Setup Python
@@ -378,8 +380,8 @@ jobs:
 
       - name: Run Wrapper Hunter
         run: |
-          SCAN_MODE="${{ github.event.inputs.scan_mode || 'full' }}"
-          BASE_COMMIT="${{ github.event.inputs.base_commit || '' }}"
+          SCAN_MODE="${{ github.event.client_payload.scan_mode || github.event.inputs.scan_mode || 'full' }}"
+          BASE_COMMIT="${{ github.event.client_payload.base_commit || github.event.inputs.base_commit || '' }}"
           if [ "$SCAN_MODE" != "diff" ]; then
             BASE_COMMIT=""
           fi
@@ -1118,7 +1120,7 @@ jobs:
 
       - name: Send Wrapper Hunter Results to Fixora
         run: |
-          SCAN_ID="${{ github.event.inputs.scan_id }}"
+          SCAN_ID="${{ github.event.client_payload.scan_id || github.event.inputs.scan_id }}"
           
           if [ -f wrapper-hunter-results.json ]; then
             echo "Sending wrapper hunter results to Fixora backend..."
@@ -1178,6 +1180,8 @@ jobs:
 WORKFLOW_TEMPLATE = '''name: Fixora Security Scan
 
 on:
+  repository_dispatch:
+    types: [fixora-scan]
   workflow_dispatch:
     inputs:
       scan_mode:
@@ -1207,7 +1211,7 @@ jobs:
       - name: Checkout target branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.target_branch }}
+          ref: ${{ github.event.client_payload.target_branch || github.event.inputs.target_branch }}
           fetch-depth: 0
 
       - name: Setup Python
@@ -1219,7 +1223,7 @@ jobs:
         run: pip install semgrep
 
       - name: Run Semgrep Scan (Full)
-        if: ${{ github.event.inputs.scan_mode == 'full' }}
+        if: ${{ (github.event.client_payload.scan_mode || github.event.inputs.scan_mode) == 'full' }}
         run: |
           EXTRA_CONFIG=""
           if [ -f .fixora-rules.yml ]; then
@@ -1230,14 +1234,14 @@ jobs:
           semgrep scan --config auto $EXTRA_CONFIG $FIXORA_EXCLUDE --json --output semgrep-results.json . || true
 
       - name: Run Semgrep Scan (Diff)
-        if: ${{ github.event.inputs.scan_mode == 'diff' && github.event.inputs.base_commit != '' }}
+        if: ${{ (github.event.client_payload.scan_mode || github.event.inputs.scan_mode) == 'diff' && (github.event.client_payload.base_commit || github.event.inputs.base_commit) != '' }}
         run: |
           EXTRA_CONFIG=""
           if [ -f .fixora-rules.yml ]; then
             echo "Found Fixora custom rules from AI analysis, including in scan..."
             EXTRA_CONFIG="--config .fixora-rules.yml"
           fi
-          BASE_COMMIT="${{ github.event.inputs.base_commit }}"
+          BASE_COMMIT="${{ github.event.client_payload.base_commit || github.event.inputs.base_commit }}"
           git diff --name-only $BASE_COMMIT HEAD > all_changed_files.txt
           # Exclude Fixora's own workflow files so Semgrep doesn't flag them
           grep -v -E 'fixora-scan\.yml|fixora-wrapper-hunter\.yml' all_changed_files.txt > changed_files.txt || true
@@ -1250,9 +1254,9 @@ jobs:
 
       - name: Send Results to Fixora
         run: |
-          SCAN_ID="${{ github.event.inputs.scan_id }}"
-          TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
-          SCAN_MODE="${{ github.event.inputs.scan_mode }}"
+          SCAN_ID="${{ github.event.client_payload.scan_id || github.event.inputs.scan_id }}"
+          TARGET_BRANCH="${{ github.event.client_payload.target_branch || github.event.inputs.target_branch }}"
+          SCAN_MODE="${{ github.event.client_payload.scan_mode || github.event.inputs.scan_mode }}"
           
           if [ -f semgrep-results.json ]; then
             echo "Sending results to Fixora backend: ${{ secrets.FIXORA_API_URL }}"
@@ -1340,21 +1344,13 @@ class GitHubScanService:
             
             return response.json()
 
-    async def _get_default_branch(self, owner: str, repo: str, token: Optional[str] = None) -> str:
+    async def _get_default_branch(self, owner: str, repo: str) -> str:
         """Fetch repository default branch (main/master/etc.) for safe workflow dispatch refs."""
-        headers = self.headers
-        if token:
-            headers = {
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            }
-
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(
                     f"{GITHUB_API_URL}/repos/{owner}/{repo}",
-                    headers=headers,
+                    headers=self.headers,
                 )
                 if response.status_code == 200:
                     default_branch = (response.json() or {}).get("default_branch")
@@ -1574,7 +1570,7 @@ class GitHubScanService:
             return False
     
     async def push_workflow_file(self, owner: str, repo: str, default_branch: str = "main") -> bool:
-        """Push the Semgrep workflow file to the default branch so workflow_dispatch can be triggered."""
+        """Push the Semgrep workflow file to the default branch (required for repository_dispatch)."""
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 # Check if file already exists on default branch
@@ -1846,10 +1842,9 @@ class GitHubScanService:
         base_commit: str = "",
         max_retries: int = 3
     ) -> bool:
-        """Trigger the Wrapper Hunter workflow via explicit workflow_dispatch."""
+        """Trigger the Wrapper Hunter workflow via repository_dispatch."""
         import asyncio
 
-        workflow_id = WRAPPER_WORKFLOW_FILE_PATH.split("/")[-1]
         dispatch_ref = await self._get_default_branch(owner, repo)
         effective_target_branch = (target_branch or "").strip() or dispatch_ref
         if effective_target_branch in {"main", "master"} and effective_target_branch != dispatch_ref:
@@ -1859,18 +1854,9 @@ class GitHubScanService:
             )
             effective_target_branch = dispatch_ref
 
-        # Enforce upload -> index wait -> dispatch order to avoid trigger races.
-        logger.info(f"Ensuring wrapper workflow is up to date before dispatch for {owner}/{repo}")
-        prepush_ok = await self.push_wrapper_hunter_workflow(owner, repo, dispatch_ref)
-        if not prepush_ok:
-            logger.error(f"Failed to push wrapper workflow before dispatch for {owner}/{repo}")
-            return False
-        logger.info("Waiting 5 seconds for GitHub to index wrapper workflow_dispatch trigger")
-        await asyncio.sleep(5)
-
         payload = {
-            "ref": dispatch_ref,
-            "inputs": {
+            "event_type": "fixora-wrapper-hunt",
+            "client_payload": {
                 "scan_id": scan_id,
                 "target_branch": effective_target_branch,
                 "scan_mode": scan_mode or "full",
@@ -1882,46 +1868,28 @@ class GitHubScanService:
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     response = await client.post(
-                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches",
+                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/dispatches",
                         headers=self.headers,
                         json=payload,
                     )
 
                     if response.status_code == 204:
                         logger.info(
-                            f"Triggered wrapper hunter via workflow_dispatch for {owner}/{repo} "
-                            f"(scan_id: {scan_id}, ref: {dispatch_ref}, target_branch: {effective_target_branch}, mode: {scan_mode})"
+                            f"Triggered wrapper hunter via repository_dispatch for {owner}/{repo} "
+                            f"(scan_id: {scan_id}, target_branch: {effective_target_branch}, mode: {scan_mode})"
                         )
                         return True
                     elif response.status_code == 404:
                         logger.warning(
-                            f"Wrapper workflow not indexed yet (attempt {attempt + 1}/{max_retries}): {response.text}"
+                            f"Wrapper repository dispatch failed (attempt {attempt + 1}/{max_retries}): {response.text}"
                         )
                         if attempt < max_retries - 1:
                             await asyncio.sleep(3)
                             continue
                         return False
-                    elif response.status_code == 422:
-                        body = response.text or ""
-                        if "workflow_dispatch" in body.lower() and attempt < max_retries - 1:
-                            logger.warning(
-                                f"Wrapper workflow dispatch not ready yet (attempt {attempt + 1}/{max_retries}): {body}"
-                            )
-                            refresh_ok = await self.push_wrapper_hunter_workflow(owner, repo, dispatch_ref)
-                            if not refresh_ok:
-                                logger.error(
-                                    f"Failed to refresh wrapper workflow before retry for {owner}/{repo}"
-                                )
-                                return False
-                            await asyncio.sleep(4)
-                            continue
-                        logger.error(
-                            f"Wrapper workflow dispatch validation failed (422): {body}"
-                        )
-                        return False
                     else:
                         logger.error(
-                            f"Failed to trigger wrapper hunter dispatch: {response.status_code} - {response.text}"
+                            f"Failed to trigger wrapper hunter repository dispatch: {response.status_code} - {response.text}"
                         )
                         return False
                         
@@ -1945,10 +1913,9 @@ class GitHubScanService:
         base_commit: str = "",
         max_retries: int = 3
     ) -> bool:
-        """Trigger the Fixora Semgrep workflow via explicit workflow_dispatch."""
+        """Trigger the Fixora Semgrep workflow via repository_dispatch."""
         import asyncio
 
-        workflow_id = WORKFLOW_FILE_PATH.split("/")[-1]
         dispatch_ref = await self._get_default_branch(owner, repo)
         effective_target_branch = (target_branch or "").strip() or dispatch_ref
         if effective_target_branch in {"main", "master"} and effective_target_branch != dispatch_ref:
@@ -1958,18 +1925,9 @@ class GitHubScanService:
             )
             effective_target_branch = dispatch_ref
 
-        # Enforce upload -> index wait -> dispatch order to avoid trigger races.
-        logger.info(f"Ensuring semgrep workflow is up to date before dispatch for {owner}/{repo}")
-        prepush_ok = await self.push_workflow_file(owner, repo, dispatch_ref)
-        if not prepush_ok:
-            logger.error(f"Failed to push semgrep workflow before dispatch for {owner}/{repo}")
-            return False
-        logger.info("Waiting 5 seconds for GitHub to index semgrep workflow_dispatch trigger")
-        await asyncio.sleep(5)
-
         payload = {
-            "ref": dispatch_ref,
-            "inputs": {
+            "event_type": "fixora-scan",
+            "client_payload": {
                 "scan_mode": scan_mode,
                 "target_branch": effective_target_branch,
                 "base_commit": base_commit or "",
@@ -1981,44 +1939,28 @@ class GitHubScanService:
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     response = await client.post(
-                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches",
+                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/dispatches",
                         headers=self.headers,
                         json=payload,
                     )
 
                     if response.status_code == 204:
                         logger.info(
-                            f"Triggered semgrep workflow via workflow_dispatch for {owner}/{repo} "
-                            f"(scan_id: {scan_id}, ref: {dispatch_ref}, target_branch: {effective_target_branch}, mode: {scan_mode})"
+                            f"Triggered semgrep workflow via repository_dispatch for {owner}/{repo} "
+                            f"(scan_id: {scan_id}, target_branch: {effective_target_branch}, mode: {scan_mode})"
                         )
                         return True
                     elif response.status_code == 404:
                         logger.warning(
-                            f"Semgrep workflow not indexed yet (attempt {attempt + 1}/{max_retries}): {response.text}"
+                            f"Semgrep repository dispatch failed (attempt {attempt + 1}/{max_retries}): {response.text}"
                         )
                         if attempt < max_retries - 1:
                             await asyncio.sleep(3)
                             continue
                         return False
-                    elif response.status_code == 422:
-                        body = response.text or ""
-                        if "workflow_dispatch" in body.lower() and attempt < max_retries - 1:
-                            logger.warning(
-                                f"Semgrep workflow dispatch not ready yet (attempt {attempt + 1}/{max_retries}): {body}"
-                            )
-                            refresh_ok = await self.push_workflow_file(owner, repo, dispatch_ref)
-                            if not refresh_ok:
-                                logger.error(
-                                    f"Failed to refresh semgrep workflow before retry for {owner}/{repo}"
-                                )
-                                return False
-                            await asyncio.sleep(4)
-                            continue
-                        logger.error(f"Semgrep workflow dispatch validation failed (422): {body}")
-                        return False
                     else:
                         logger.error(
-                            f"Failed to trigger semgrep workflow dispatch: {response.status_code} - {response.text}"
+                            f"Failed to trigger semgrep repository dispatch: {response.status_code} - {response.text}"
                         )
                         return False
                         
@@ -2102,7 +2044,7 @@ class GitHubScanService:
                 owner, repo, "FIXORA_API_URL", api_url
             )
             
-            # Step 3: Push workflow file to the default branch so dispatch can target it
+            # Step 3: Push workflow file to the default branch (required for repository_dispatch)
             result["steps"]["workflow_file"] = await self.push_workflow_file(owner, repo, default_branch)
             
             if not result["steps"]["workflow_file"]:
