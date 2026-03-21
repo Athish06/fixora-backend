@@ -1474,7 +1474,7 @@ class GitHubScanService:
                 
                 # Create or update the file on DEFAULT branch
                 payload = {
-                    "message": "chore: Add Fixora security scanning workflow [skip ci]",
+                    "message": "chore: Add Fixora security scanning workflow",
                     "content": content,
                     "branch": default_branch
                 }
@@ -1525,7 +1525,7 @@ class GitHubScanService:
                     f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{WORKFLOW_FILE_PATH}",
                     headers=self.headers,
                     json={
-                        "message": "chore: Remove Fixora scanning workflow (scan completed) [skip ci]",
+                        "message": "chore: Remove Fixora scanning workflow (scan completed)",
                         "sha": sha,
                         "branch": default_branch
                     }
@@ -1560,7 +1560,7 @@ class GitHubScanService:
                 content = base64.b64encode(WRAPPER_HUNTER_TEMPLATE.encode()).decode()
                 
                 payload = {
-                    "message": "chore: Add Fixora wrapper hunter workflow [skip ci]",
+                    "message": "chore: Add Fixora wrapper hunter workflow",
                     "content": content,
                     "branch": default_branch
                 }
@@ -1608,7 +1608,7 @@ class GitHubScanService:
                     f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{WRAPPER_WORKFLOW_FILE_PATH}",
                     headers=self.headers,
                     json={
-                        "message": "chore: Remove Fixora wrapper hunter workflow (completed) [skip ci]",
+                        "message": "chore: Remove Fixora wrapper hunter workflow (completed)",
                         "sha": sha,
                         "branch": default_branch
                     }
@@ -1652,7 +1652,7 @@ class GitHubScanService:
                 content = base64.b64encode(rules_yaml.encode()).decode()
                 
                 payload = {
-                    "message": "chore: Add Fixora AI-generated Semgrep rules for scan [skip ci]",
+                    "message": "chore: Add Fixora AI-generated Semgrep rules for scan",
                     "content": content,
                     "branch": default_branch
                 }
@@ -1700,7 +1700,7 @@ class GitHubScanService:
                     f"{GITHUB_API_URL}/repos/{owner}/{repo}/contents/{CUSTOM_RULES_FILE_PATH}",
                     headers=self.headers,
                     json={
-                        "message": "chore: Remove Fixora AI-generated rules (scan completed) [skip ci]",
+                        "message": "chore: Remove Fixora AI-generated rules (scan completed)",
                         "sha": sha,
                         "branch": default_branch
                     }
@@ -1723,22 +1723,31 @@ class GitHubScanService:
         repo: str,
         scan_id: str,
         target_branch: str = "main",
+        base_commit: str = "",
         max_retries: int = 3
     ) -> bool:
-        """Trigger the Wrapper Hunter workflow via repository_dispatch"""
+        """Trigger the Wrapper Hunter workflow via workflow_dispatch."""
         import asyncio
+
+        try:
+            repo_info = await self.get_repository_info(owner, repo)
+            default_branch = repo_info.get("default_branch", "main")
+        except Exception as e:
+            logger.error(f"Failed to resolve default branch for {owner}/{repo}: {e}")
+            return False
         
         for attempt in range(max_retries):
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     response = await client.post(
-                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/dispatches",
+                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows/fixora-wrapper-hunter.yml/dispatches",
                         headers=self.headers,
                         json={
-                            "event_type": "fixora-wrapper-hunt",
-                            "client_payload": {
+                            "ref": default_branch,
+                            "inputs": {
                                 "scan_id": scan_id,
-                                "target_branch": target_branch
+                                "target_branch": target_branch,
+                                "base_commit": base_commit or ""
                             }
                         }
                     )
@@ -1746,10 +1755,12 @@ class GitHubScanService:
                     if response.status_code == 204:
                         logger.info(f"Triggered wrapper hunter for {owner}/{repo} (scan_id: {scan_id})")
                         return True
-                    elif response.status_code == 404:
-                        logger.warning(f"Wrapper hunter dispatch failed (attempt {attempt + 1}/{max_retries}): {response.text}")
+                    elif response.status_code in [404, 422]:
+                        logger.warning(
+                            f"Wrapper hunter dispatch not ready (attempt {attempt + 1}/{max_retries}): {response.text}"
+                        )
                         if attempt < max_retries - 1:
-                            await asyncio.sleep(3)
+                            await asyncio.sleep(5)
                             continue
                     else:
                         logger.error(f"Failed to trigger wrapper hunter: {response.status_code} - {response.text}")
@@ -1758,11 +1769,10 @@ class GitHubScanService:
             except Exception as e:
                 logger.error(f"Error triggering wrapper hunter (attempt {attempt + 1}): {e}")
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(5)
                     continue
                 return False
-        
-        logger.error(f"Failed to trigger wrapper hunter after {max_retries} attempts")
+
         return False
     
     async def trigger_workflow(
@@ -1775,19 +1785,25 @@ class GitHubScanService:
         base_commit: str = "",
         max_retries: int = 3
     ) -> bool:
-        """Trigger the Fixora scan workflow via repository_dispatch"""
+        """Trigger the Fixora scan workflow via workflow_dispatch."""
         import asyncio
+
+        try:
+            repo_info = await self.get_repository_info(owner, repo)
+            default_branch = repo_info.get("default_branch", "main")
+        except Exception as e:
+            logger.error(f"Failed to resolve default branch for {owner}/{repo}: {e}")
+            return False
         
         for attempt in range(max_retries):
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
-                    # Use repository_dispatch which works from any branch
                     response = await client.post(
-                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/dispatches",
+                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows/fixora-scan.yml/dispatches",
                         headers=self.headers,
                         json={
-                            "event_type": "fixora-scan",
-                            "client_payload": {
+                            "ref": default_branch,
+                            "inputs": {
                                 "scan_mode": scan_mode,
                                 "target_branch": target_branch,
                                 "base_commit": base_commit or "",
@@ -1799,11 +1815,12 @@ class GitHubScanService:
                     if response.status_code == 204:
                         logger.info(f"Triggered scan workflow for {owner}/{repo} (scan_id: {scan_id})")
                         return True
-                    elif response.status_code == 404:
-                        # Repository not found or no access
-                        logger.warning(f"Repository dispatch failed (attempt {attempt + 1}/{max_retries}): {response.text}")
+                    elif response.status_code in [404, 422]:
+                        logger.warning(
+                            f"Scan workflow dispatch not ready (attempt {attempt + 1}/{max_retries}): {response.text}"
+                        )
                         if attempt < max_retries - 1:
-                            await asyncio.sleep(3)  # Wait 3 seconds before retry
+                            await asyncio.sleep(5)
                             continue
                     else:
                         logger.error(f"Failed to trigger workflow: {response.status_code} - {response.text}")
@@ -1812,11 +1829,10 @@ class GitHubScanService:
             except Exception as e:
                 logger.error(f"Error triggering workflow (attempt {attempt + 1}): {e}")
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(5)
                     continue
                 return False
-        
-        logger.error(f"Failed to trigger workflow after {max_retries} attempts")
+
         return False
     
     async def get_commits(
