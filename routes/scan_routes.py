@@ -991,17 +991,7 @@ async def receive_scan_results(
                 except Exception as e:
                     logger.error(f"Error deleting Semgrep workflow: {e}")
 
-                # 2. Delete Wrapper Hunter workflow (.github/workflows/fixora-wrapper-hunter.yml)
-                try:
-                    ok = await service.delete_wrapper_hunter_workflow(owner, repo_name, default_branch)
-                    if ok:
-                        logger.info(f"✅ Deleted Wrapper Hunter workflow from {payload.repository}")
-                    else:
-                        logger.warning(f"⚠️  Wrapper Hunter workflow not deleted from {payload.repository}")
-                except Exception as e:
-                    logger.error(f"Error deleting Wrapper Hunter workflow: {e}")
-
-                # 3. Delete AI-generated custom rules (.fixora-rules.yml)
+                # 2. Delete AI-generated custom rules (.fixora-rules.yml)
                 try:
                     ok = await service.delete_custom_rules_file(owner, repo_name, default_branch)
                     if ok:
