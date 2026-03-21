@@ -1,4 +1,4 @@
-﻿# GitHub Scanning Service - Implements the "Infection" mechanism
+# GitHub Scanning Service - Implements the "Infection" mechanism
 # Pushes workflows, injects secrets, and triggers scans via GitHub Actions
 
 import httpx
@@ -33,10 +33,10 @@ on:
         description: 'Branch to analyze'
         required: true
         default: 'main'
-            base_commit:
-                description: 'Base commit for diff scan'
-                required: false
-                default: ''
+      base_commit:
+        description: 'Base commit for diff scan'
+        required: false
+        default: ''
 
 jobs:
   wrapper-hunt:
