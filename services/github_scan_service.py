@@ -378,11 +378,11 @@ jobs:
 
       - name: Run Wrapper Hunter
         run: |
-                    SCAN_MODE="${{ github.event.inputs.scan_mode || 'full' }}"
-                    BASE_COMMIT="${{ github.event.inputs.base_commit || '' }}"
-                    if [ "$SCAN_MODE" != "diff" ]; then
-                        BASE_COMMIT=""
-                    fi
+          SCAN_MODE="${{ github.event.inputs.scan_mode || 'full' }}"
+          BASE_COMMIT="${{ github.event.inputs.base_commit || '' }}"
+          if [ "$SCAN_MODE" != "diff" ]; then
+            BASE_COMMIT=""
+          fi
 
           cat > /tmp/wrapper_hunter.py << 'HUNTER_SCRIPT'
           #!/usr/bin/env python3
@@ -741,7 +741,7 @@ jobs:
                   return ".".join(reversed(parts))
               return None
 
-          # Known dangerous method names ï¿½ indicate security-relevant operations
+          # Known dangerous method names indicate security-relevant operations
           # even when called on LOCAL objects (e.g. cursor.execute, proc.communicate).
           # These catch cases where the AST can't trace variable origin back to a module.
           DANGEROUS_SINK_METHODS = {
@@ -1118,7 +1118,7 @@ jobs:
 
       - name: Send Wrapper Hunter Results to Fixora
         run: |
-                    SCAN_ID="${{ github.event.inputs.scan_id }}"
+          SCAN_ID="${{ github.event.inputs.scan_id }}"
           
           if [ -f wrapper-hunter-results.json ]; then
             echo "Sending wrapper hunter results to Fixora backend..."
@@ -1150,19 +1150,19 @@ jobs:
               echo "HTTP status: $HTTP_STATUS"
               cat /tmp/wh-response.txt || true
               if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
-                echo "? Wrapper hunter results sent successfully (HTTP $HTTP_STATUS)"
+                echo "Wrapper hunter results sent successfully (HTTP $HTTP_STATUS)"
                 exit 0
               else
                 RETRY_COUNT=$((RETRY_COUNT + 1))
-                echo "??  Attempt $RETRY_COUNT failed (HTTP $HTTP_STATUS). Retrying in 10s..."
+                echo "Attempt $RETRY_COUNT failed (HTTP $HTTP_STATUS). Retrying in 10s..."
                 sleep 10
               fi
             done
             
-            echo "? Failed to send wrapper hunter results after $MAX_RETRIES attempts"
+            echo "Failed to send wrapper hunter results after $MAX_RETRIES attempts"
             exit 1
           else
-            echo "??  No wrapper hunter results file found"
+            echo "No wrapper hunter results file found"
           fi
 
       - name: Upload Wrapper Hunter Artifacts
@@ -1219,7 +1219,7 @@ jobs:
         run: pip install semgrep
 
       - name: Run Semgrep Scan (Full)
-                if: ${{ github.event.inputs.scan_mode == 'full' }}
+        if: ${{ github.event.inputs.scan_mode == 'full' }}
         run: |
           EXTRA_CONFIG=""
           if [ -f .fixora-rules.yml ]; then
@@ -1230,7 +1230,7 @@ jobs:
           semgrep scan --config auto $EXTRA_CONFIG $FIXORA_EXCLUDE --json --output semgrep-results.json . || true
 
       - name: Run Semgrep Scan (Diff)
-                if: ${{ github.event.inputs.scan_mode == 'diff' && github.event.inputs.base_commit != '' }}
+        if: ${{ github.event.inputs.scan_mode == 'diff' && github.event.inputs.base_commit != '' }}
         run: |
           EXTRA_CONFIG=""
           if [ -f .fixora-rules.yml ]; then
@@ -1250,9 +1250,9 @@ jobs:
 
       - name: Send Results to Fixora
         run: |
-                    SCAN_ID="${{ github.event.inputs.scan_id }}"
-                    TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
-                    SCAN_MODE="${{ github.event.inputs.scan_mode }}"
+          SCAN_ID="${{ github.event.inputs.scan_id }}"
+          TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
+          SCAN_MODE="${{ github.event.inputs.scan_mode }}"
           
           if [ -f semgrep-results.json ]; then
             echo "Sending results to Fixora backend: ${{ secrets.FIXORA_API_URL }}"
@@ -1283,22 +1283,22 @@ jobs:
                 --max-time 30 \
                 --retry 2 \
                 --retry-delay 5; then
-                echo "? Results sent successfully"
+                                echo "Results sent successfully"
                 exit 0
               else
                 RETRY_COUNT=$((RETRY_COUNT + 1))
-                echo "??  Attempt $RETRY_COUNT failed. Retrying..."
+                                echo "Attempt $RETRY_COUNT failed. Retrying..."
                 sleep 5
               fi
             done
             
-            echo "? Failed to send results after $MAX_RETRIES attempts"
+                        echo "Failed to send results after $MAX_RETRIES attempts"
             echo "This usually means your Fixora backend is not publicly accessible."
             echo "For local development, use ngrok or similar to expose your backend."
             echo "Backend URL configured: ${{ secrets.FIXORA_API_URL }}"
             exit 1
           else
-            echo "??  No results file found"
+                        echo "No results file found"
           fi
 
       - name: Upload Scan Artifacts
@@ -1339,6 +1339,38 @@ class GitHubScanService:
                 raise Exception(f"Failed to get repository info: {response.text}")
             
             return response.json()
+
+    async def _get_default_branch(self, owner: str, repo: str, token: Optional[str] = None) -> str:
+        """Fetch repository default branch (main/master/etc.) for safe workflow dispatch refs."""
+        headers = self.headers
+        if token:
+            headers = {
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(
+                    f"{GITHUB_API_URL}/repos/{owner}/{repo}",
+                    headers=headers,
+                )
+                if response.status_code == 200:
+                    default_branch = (response.json() or {}).get("default_branch")
+                    if default_branch:
+                        return default_branch
+                logger.warning(
+                    f"Failed to resolve default branch for {owner}/{repo} "
+                    f"(status={response.status_code}); falling back to 'main'"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Error resolving default branch for {owner}/{repo}: {e}; "
+                "falling back to 'main'"
+            )
+
+        return "main"
     
     async def get_branches(self, owner: str, repo: str) -> List[Dict[str, Any]]:
         """Get all branches in a repository"""
@@ -1721,7 +1753,7 @@ class GitHubScanService:
         """
         if not rules_yaml or not rules_yaml.strip():
             logger.info("No custom rules to push (empty YAML)")
-            return True  # Not an error ï¿½ just nothing to push
+            return True  # Not an error; just nothing to push
         
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1818,11 +1850,20 @@ class GitHubScanService:
         import asyncio
 
         workflow_id = WRAPPER_WORKFLOW_FILE_PATH.split("/")[-1]
+        dispatch_ref = await self._get_default_branch(owner, repo)
+        effective_target_branch = (target_branch or "").strip() or dispatch_ref
+        if effective_target_branch in {"main", "master"} and effective_target_branch != dispatch_ref:
+            logger.info(
+                f"Normalizing wrapper target branch from '{effective_target_branch}' to default branch "
+                f"'{dispatch_ref}' for {owner}/{repo}"
+            )
+            effective_target_branch = dispatch_ref
+
         payload = {
-            "ref": target_branch,
+            "ref": dispatch_ref,
             "inputs": {
                 "scan_id": scan_id,
-                "target_branch": target_branch,
+                "target_branch": effective_target_branch,
                 "scan_mode": scan_mode or "full",
                 "base_commit": base_commit or "",
             },
@@ -1840,7 +1881,7 @@ class GitHubScanService:
                     if response.status_code == 204:
                         logger.info(
                             f"Triggered wrapper hunter via workflow_dispatch for {owner}/{repo} "
-                            f"(scan_id: {scan_id}, branch: {target_branch}, mode: {scan_mode})"
+                            f"(scan_id: {scan_id}, ref: {dispatch_ref}, target_branch: {effective_target_branch}, mode: {scan_mode})"
                         )
                         return True
                     elif response.status_code == 404:
@@ -1886,11 +1927,20 @@ class GitHubScanService:
         import asyncio
 
         workflow_id = WORKFLOW_FILE_PATH.split("/")[-1]
+        dispatch_ref = await self._get_default_branch(owner, repo)
+        effective_target_branch = (target_branch or "").strip() or dispatch_ref
+        if effective_target_branch in {"main", "master"} and effective_target_branch != dispatch_ref:
+            logger.info(
+                f"Normalizing semgrep target branch from '{effective_target_branch}' to default branch "
+                f"'{dispatch_ref}' for {owner}/{repo}"
+            )
+            effective_target_branch = dispatch_ref
+
         payload = {
-            "ref": target_branch,
+            "ref": dispatch_ref,
             "inputs": {
                 "scan_mode": scan_mode,
-                "target_branch": target_branch,
+                "target_branch": effective_target_branch,
                 "base_commit": base_commit or "",
                 "scan_id": scan_id,
             },
@@ -1908,7 +1958,7 @@ class GitHubScanService:
                     if response.status_code == 204:
                         logger.info(
                             f"Triggered semgrep workflow via workflow_dispatch for {owner}/{repo} "
-                            f"(scan_id: {scan_id}, branch: {target_branch}, mode: {scan_mode})"
+                            f"(scan_id: {scan_id}, ref: {dispatch_ref}, target_branch: {effective_target_branch}, mode: {scan_mode})"
                         )
                         return True
                     elif response.status_code == 404:
@@ -1981,7 +2031,7 @@ class GitHubScanService:
         Complete setup process for a repository:
         1. Get repo info
         2. Inject secrets
-        3. Push workflow file to main branch
+        3. Push workflow file to repository default branch
         """
         result = {
             "success": False,
@@ -1996,8 +2046,7 @@ class GitHubScanService:
         
         try:
             # Get repository info
-            repo_info = await self.get_repository_info(owner, repo)
-            default_branch = repo_info.get("default_branch", "main")
+            default_branch = await self._get_default_branch(owner, repo)
             
             # Step 1: Inject API token secret
             result["steps"]["api_token_secret"] = await self.inject_repository_secret(
