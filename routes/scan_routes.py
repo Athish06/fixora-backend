@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import hashlib
+import re
 from datetime import datetime
 from config.database import get_database
 from config.settings import get_settings
@@ -24,6 +25,68 @@ from services.semgrep_rule_generator import generate_custom_rules, count_generat
 router = APIRouter(prefix='/scan', tags=['Scans'])
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+UNIFIED_VULN_CATEGORIES = [
+    "Injection (SQL/NoSQL/LDAP/Command/Path Traversal)",
+    "Broken Access Control (IDOR/BOLA)",
+    "Cross-Site Scripting (XSS)",
+    "Server-Side Request Forgery (SSRF)",
+    "Insecure Deserialization",
+    "Hardcoded Secrets / Credentials",
+    "Cryptographic Failures",
+    "Security Misconfiguration (CORS, Headers)",
+    "Insecure Design / Architecture",
+    "Business Logic Flaws",
+]
+
+_PLACEHOLDER_TEXT_RE = re.compile(
+    r"requires\s+logn|requires\s+login|unknown\s+vulnerability|security\s+issue",
+    flags=re.IGNORECASE,
+)
+
+
+def _normalize_unified_type_and_category(
+    rule_id: str,
+    metadata: Dict[str, Any],
+    description: str,
+):
+    hay = " ".join([
+        str(rule_id or ""),
+        str(metadata.get("category") or ""),
+        str(metadata.get("vulnerability_type") or ""),
+        str(description or ""),
+    ]).lower()
+
+    if any(k in hay for k in ["sqli", "sql injection", "nosql", "ldap", "xpath", "command-injection", "command injection", "path-traversal", "path traversal"]):
+        if "command" in hay:
+            return "Command Injection", "Injection (SQL/NoSQL/LDAP/Command/Path Traversal)"
+        if "path" in hay and "travers" in hay:
+            return "Path Traversal", "Injection (SQL/NoSQL/LDAP/Command/Path Traversal)"
+        return "SQL Injection", "Injection (SQL/NoSQL/LDAP/Command/Path Traversal)"
+    if "xss" in hay or "cross-site scripting" in hay or "cross site scripting" in hay:
+        return "XSS", "Cross-Site Scripting (XSS)"
+    if "ssrf" in hay or "server-side request forgery" in hay:
+        return "SSRF", "Server-Side Request Forgery (SSRF)"
+    if "deserialize" in hay:
+        return "Insecure Deserialization", "Insecure Deserialization"
+    if "idor" in hay or "bola" in hay or "broken access" in hay:
+        return "IDOR / Broken Access Control", "Broken Access Control (IDOR/BOLA)"
+    if "secret" in hay or "credential" in hay or "hardcoded" in hay:
+        return "Hardcoded Secret", "Hardcoded Secrets / Credentials"
+    if "crypto" in hay or "weak hash" in hay or "weak cipher" in hay or "encryption" in hay:
+        return "Cryptographic Failure", "Cryptographic Failures"
+    if "cors" in hay or "header" in hay or "misconfig" in hay or "csrf" in hay:
+        return "Security Misconfiguration", "Security Misconfiguration (CORS, Headers)"
+    if "business" in hay or "logic" in hay or "workflow" in hay:
+        return "Business Logic Flaw", "Business Logic Flaws"
+    return "Security Misconfiguration", "Insecure Design / Architecture"
+
+
+def _clean_placeholder_text(value: str, fallback: str) -> str:
+    text = str(value or "").strip()
+    if not text or _PLACEHOLDER_TEXT_RE.search(text):
+        return fallback
+    return text
 
 @router.get('/{scan_id}', response_model=ScanResult)
 async def get_scan_status(
@@ -687,35 +750,18 @@ async def receive_scan_results(
         }
         severity = severity_map.get(severity, "medium")
         
-        # Extract vulnerability type from rule_id or metadata
+        # Extract vulnerability type/category in unified taxonomy
         rule_id = result.get("check_id", "")
-        vuln_type = metadata.get("category", "security")
-        
-        # Try to extract a more specific type from rule_id
-        # e.g., "javascript.express.security.audit.xss" -> "XSS"
-        if "xss" in rule_id.lower():
-            vuln_type = "XSS"
-        elif "sql-injection" in rule_id.lower() or "sqli" in rule_id.lower():
-            vuln_type = "SQL Injection"
-        elif "command-injection" in rule_id.lower():
-            vuln_type = "Command Injection"
-        elif "path-traversal" in rule_id.lower():
-            vuln_type = "Path Traversal"
-        elif "ssrf" in rule_id.lower():
-            vuln_type = "SSRF"
-        elif "hardcoded" in rule_id.lower() or "secret" in rule_id.lower():
-            vuln_type = "Hardcoded Secret"
-        elif "csrf" in rule_id.lower():
-            vuln_type = "CSRF"
-        elif "open-redirect" in rule_id.lower():
-            vuln_type = "Open Redirect"
-        elif "insecure" in rule_id.lower():
-            vuln_type = "Insecure Configuration"
-        else:
-            # Use the last part of the rule_id as type
-            vuln_type = rule_id.split(".")[-1].replace("-", " ").title()
-
         description = extra.get("message", "No description available")
+        vuln_type, category = _normalize_unified_type_and_category(
+            rule_id=rule_id,
+            metadata=metadata,
+            description=description,
+        )
+        description = _clean_placeholder_text(
+            description,
+            f"Potential {vuln_type} detected. Review data flow and controls.",
+        )
         file_path = result.get("path", "")
         line_number = result.get("start", {}).get("line", 0)
         end_line = result.get("end", {}).get("line", 0)
@@ -732,10 +778,12 @@ async def receive_scan_results(
 
         existing = existing_by_fingerprint.get(fingerprint) or existing_by_legacy.get(legacy_key)
 
-        title = result.get("check_id", "Unknown vulnerability").split(".")[-1].replace("-", " ").title()
+        raw_title = result.get("check_id", "Unknown vulnerability").split(".")[-1].replace("-", " ").title()
+        title = _clean_placeholder_text(raw_title, vuln_type)
         normalized_vuln = {
             "severity": severity,
             "type": vuln_type,
+            "category": category,
             "title": title,
         }
 
@@ -746,6 +794,7 @@ async def receive_scan_results(
                     "$set": {
                         "scan_id": payload.scan_id,
                         "type": vuln_type,
+                        "category": category,
                         "title": title,
                         "description": description,
                         "severity": severity,
@@ -781,6 +830,7 @@ async def receive_scan_results(
             "scan_id": payload.scan_id,
             "user_id": user_id,
             "type": vuln_type,
+            "category": category,
             "title": title,
             "description": description,
             "severity": severity,

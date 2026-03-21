@@ -9,6 +9,26 @@ from config.settings import get_settings
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+ALLOWED_VULNERABILITY_TYPES = {
+    "SQL Injection",
+    "Command Injection",
+    "Path Traversal",
+    "XSS",
+    "SSRF",
+    "Insecure Deserialization",
+    "IDOR / Broken Access Control",
+    "Cryptographic Failure",
+    "Hardcoded Secret",
+    "Business Logic Flaw",
+    "Security Misconfiguration",
+}
+
+FRONTEND_IMPOSSIBLE_TYPES = {
+    "SQL Injection",
+    "Command Injection",
+    "Path Traversal",
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PROMPT BUILDERS — 2-phase LLM analysis
 # ─────────────────────────────────────────────────────────────────────────────
@@ -102,54 +122,38 @@ def build_function_chunk_prompt(
           "analysis_summary": "X vulnerable wrappers found."
         }
     """
-    lang_label  = "PYTHON PROJECT" if lang_key == "python" else "REACT / NODE.JS PROJECT"
     code_fence  = "python" if lang_key == "python" else "javascript"
-    lang_display = "Python" if lang_key == "python" else "JavaScript/React/Node.js"
-
-    # ── Sink context block ────────────────────────────────────────────────
-    if sink_modules:
-        sink_ctx = (
-            "=== KNOWN DANGEROUS SINK MODULES (identified in phase 1) ===\n"
-            f"Sinks: {', '.join(sink_modules)}\n"
-            f"Reason: {sink_reason or 'These modules expose dangerous APIs.'}\n\n"
-            "Focus especially on functions that pass user-supplied data to these sinks "
-            "WITHOUT proper sanitisation or parameterisation.\n\n"
-        )
-    else:
-        sink_ctx = (
-            "NOTE: No dangerous sink modules were pre-identified for this project. "
-            "Inspect each function on its own merits for any security vulnerability.\n\n"
-        )
 
     # ── Function list ─────────────────────────────────────────────────────
     func_parts = []
     for i, w in enumerate(wrappers, 1):
         calls        = [str(c) for c in (w.get("calls")        or []) if c is not None]
         modules_used = [str(m) for m in (w.get("modules_used") or []) if m is not None]
+        env = w.get("environment", "BACKEND")
+        auth = "YES" if w.get("has_auth_check", True) else "NO (Potential IDOR)"
         func_parts.append(
-            f"[{i}] {w.get('function_name', '?')} "
-            f"({w.get('file', '?')} L{w.get('line_start', '?')}-{w.get('line_end', '?')})\n"
+            f"[{i}] {w.get('function_name', '?')} ({w.get('file', '?')})\n"
+            f"    Environment : {env}\n"
+            f"    Auth Checks : {auth}\n"
             f"    calls       : {', '.join(calls)}\n"
             f"    modules_used: {', '.join(modules_used)}\n"
             f"    source:\n```{code_fence}\n{w.get('source_code', '')}\n```\n\n"
         )
 
     return (
-        "You are an expert application-security engineer performing static analysis.\n\n"
-        f"=== TASK ===\n"
-        f"Analyse the {lang_display} wrapper functions below.  "
-        "For each function, determine:\n"
-        "  • Does it pass user-controlled data to a dangerous sink WITHOUT sanitisation?\n"
-        "  • If YES → include it in the output with vulnerability_type, severity, reason.\n"
-        "  • If NO  → skip it entirely.\n\n"
-        "SEVERITY GUIDELINES:\n"
-        "  HIGH   – Direct path from user input to sink, no sanitisation\n"
-        "  MEDIUM – Partial sanitisation or indirect taint path\n"
-        "  LOW    – Theoretical risk, unlikely to be exploitable as-is\n\n"
-        + sink_ctx
-        + "RESPOND WITH ONLY VALID JSON. No markdown, no text outside the JSON.\n"
-        "IMPORTANT: Do NOT include \"source_code\" in your output — I already have it.\n"
-        "Keep output compact so the full JSON fits within token limits.\n\n"
+        "You are an expert application-security engineer. Analyze these wrappers.\n\n"
+        "TAXONOMY GUIDELINES (STRICT ENUMERATION):\n"
+        "The 'vulnerability_type' MUST be exactly one of the following:\n"
+        "['SQL Injection', 'Command Injection', 'Path Traversal', 'XSS', 'SSRF', 'Insecure Deserialization', 'IDOR / Broken Access Control', 'Cryptographic Failure', 'Hardcoded Secret', 'Business Logic Flaw', 'Security Misconfiguration']\n\n"
+        "EXCLUSION RULES (CRITICAL):\n"
+        "1. FRONTEND RULE: If 'Environment' is 'BROWSER (Frontend)', it is MATHEMATICALLY IMPOSSIBLE for it to have SQL Injection, Command Injection, or Path Traversal. Ignore generic fetch() or console.log() calls here.\n"
+        "2. ORM RULE: Assume Supabase, Prisma, and TypeORM queries are perfectly parameterized by default. Do NOT flag them for SQLi.\n"
+        "3. IDOR CHECK: If the function updates/fetches database records but 'Auth Checks' is 'NO', you MUST flag it as 'IDOR / Broken Access Control'.\n\n"
+        "SINK CONTEXT:\n"
+        f"Known sink modules: {', '.join(sink_modules) if sink_modules else 'none'}\n"
+        f"Sink reason: {sink_reason or 'No pre-identified sink context.'}\n\n"
+        "RESPOND WITH ONLY VALID JSON. No markdown, no text outside the JSON.\n"
+        "IMPORTANT: Do NOT include \"source_code\" in your output.\n"
         "Use this EXACT structure:\n\n"
         "{\n"
         '  "language": "<same as input>",\n'
@@ -172,9 +176,79 @@ def build_function_chunk_prompt(
         "}\n\n"
         f"If NO vulnerabilities are found return:\n"
         f'{{"language":"<lang>","results":{{"{lang_key}":{{"wrapper_functions":[]}}}},"analysis_summary":"No vulnerable wrappers found."}}\n\n'
-        f"=== {lang_label} WRAPPER FUNCTIONS ({len(wrappers)}) ===\n\n"
+        f"=== WRAPPER FUNCTIONS ({len(wrappers)}) ===\n\n"
         + "".join(func_parts)
     )
+
+
+def _normalize_vulnerability_type(value: Any) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    aliases = {
+        "sqli": "SQL Injection",
+        "sql injection": "SQL Injection",
+        "command injection": "Command Injection",
+        "path traversal": "Path Traversal",
+        "xss": "XSS",
+        "cross site scripting": "XSS",
+        "cross-site scripting": "XSS",
+        "ssrf": "SSRF",
+        "insecure deserialization": "Insecure Deserialization",
+        "idor": "IDOR / Broken Access Control",
+        "bola": "IDOR / Broken Access Control",
+        "idor / broken access control": "IDOR / Broken Access Control",
+        "broken access control": "IDOR / Broken Access Control",
+        "cryptographic failure": "Cryptographic Failure",
+        "hardcoded secret": "Hardcoded Secret",
+        "hardcoded secrets": "Hardcoded Secret",
+        "business logic flaw": "Business Logic Flaw",
+        "security misconfiguration": "Security Misconfiguration",
+    }
+
+    key = raw.lower()
+    normalized = aliases.get(key)
+    if normalized in ALLOWED_VULNERABILITY_TYPES:
+        return normalized
+    if raw in ALLOWED_VULNERABILITY_TYPES:
+        return raw
+    return None
+
+
+def _sanitize_llm_wrappers(chunk_wrappers: list, ai_wrappers: list) -> list:
+    """Enforce strict taxonomy and frontend exclusion rules on AI output."""
+    if not isinstance(ai_wrappers, list):
+        return []
+
+    context_by_key = {}
+    for w in chunk_wrappers:
+        fn = str(w.get("function_name") or "").strip()
+        fp = str(w.get("file") or "").strip()
+        context_by_key[(fn, fp)] = w
+
+    cleaned = []
+    for row in ai_wrappers:
+        if not isinstance(row, dict):
+            continue
+
+        vuln_type = _normalize_vulnerability_type(row.get("vulnerability_type"))
+        if not vuln_type:
+            continue
+
+        fn = str(row.get("function_name") or "").strip()
+        fp = str(row.get("file") or "").strip()
+        ctx = context_by_key.get((fn, fp), {})
+        env = str(ctx.get("environment") or "BACKEND")
+
+        if env == "BROWSER (Frontend)" and vuln_type in FRONTEND_IMPOSSIBLE_TYPES:
+            continue
+
+        item = dict(row)
+        item["vulnerability_type"] = vuln_type
+        cleaned.append(item)
+
+    return cleaned
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -524,6 +598,7 @@ async def analyze_wrappers_with_llm(
                     # Merge vulnerable wrapper functions
                     new_wrappers = ai_output.get("wrapper_functions", [])
                     if isinstance(new_wrappers, list):
+                        new_wrappers = _sanitize_llm_wrappers(chunk, new_wrappers)
                         final_merged_result["results"][lang_key]["wrapper_functions"].extend(
                             new_wrappers
                         )
