@@ -749,7 +749,7 @@ jobs:
                           if module in target:
                               for alias in node.names:
                                   imported_names[alias.asname or alias.name] = module
-                  rel = os.path.relpath(fp, display_root).replace("\\", "/")
+                  rel = os.path.relpath(fp, display_root).replace("\\\\", "/")
                   for node in ast.walk(tree):
                       if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                           # ── Pass 1: Track variables derived from imports ──
@@ -905,7 +905,7 @@ jobs:
                       return None
               except Exception:
                   return None
-              return os.path.relpath(path_abs, base_abs).replace("\\", "/")
+              return os.path.relpath(path_abs, base_abs).replace("\\\\", "/")
 
           def run_wrapper_hunter(repo_root="."):
               repo_root = _norm_abs(repo_root)
