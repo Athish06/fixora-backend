@@ -1818,13 +1818,48 @@ class GitHubScanService:
         base_commit: str = "",
         max_retries: int = 3
     ) -> bool:
-        """Trigger the Wrapper Hunter workflow via repository_dispatch"""
+        """Trigger the Wrapper Hunter workflow.
+
+        Strategy:
+        1) Try workflow_dispatch directly against the workflow file (most deterministic).
+        2) Fallback to repository_dispatch for compatibility.
+        """
         import asyncio
         
         for attempt in range(max_retries):
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
-                    response = await client.post(
+                    wrapper_workflow_id = WRAPPER_WORKFLOW_FILE_PATH.split("/")[-1]
+                    # Preferred path: explicit workflow_dispatch
+                    dispatch_response = await client.post(
+                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows/{wrapper_workflow_id}/dispatches",
+                        headers=self.headers,
+                        json={
+                            "ref": target_branch,
+                            "inputs": {
+                                "scan_id": scan_id,
+                                "target_branch": target_branch,
+                                "scan_mode": scan_mode or "full",
+                                "base_commit": base_commit or "",
+                            },
+                        }
+                    )
+
+                    if dispatch_response.status_code == 204:
+                        logger.info(
+                            f"Triggered wrapper hunter via workflow_dispatch for {owner}/{repo} "
+                            f"(scan_id: {scan_id}, branch: {target_branch}, mode: {scan_mode})"
+                        )
+                        return True
+                    else:
+                        logger.warning(
+                            "Wrapper workflow_dispatch failed "
+                            f"(attempt {attempt + 1}/{max_retries}): "
+                            f"{dispatch_response.status_code} - {dispatch_response.text}"
+                        )
+
+                    # Fallback: repository_dispatch
+                    fallback_response = await client.post(
                         f"{GITHUB_API_URL}/repos/{owner}/{repo}/dispatches",
                         headers=self.headers,
                         json={
@@ -1832,23 +1867,28 @@ class GitHubScanService:
                             "client_payload": {
                                 "scan_id": scan_id,
                                 "target_branch": target_branch,
-                                "scan_mode": scan_mode,
-                                "base_commit": base_commit or ""
-                            }
-                        }
+                                "scan_mode": scan_mode or "full",
+                                "base_commit": base_commit or "",
+                            },
+                        },
                     )
-                    
-                    if response.status_code == 204:
-                        logger.info(f"Triggered wrapper hunter for {owner}/{repo} (scan_id: {scan_id})")
+
+                    if fallback_response.status_code == 204:
+                        logger.info(
+                            f"Triggered wrapper hunter via repository_dispatch for {owner}/{repo} "
+                            f"(scan_id: {scan_id}, branch: {target_branch}, mode: {scan_mode})"
+                        )
                         return True
-                    elif response.status_code == 404:
-                        logger.warning(f"Wrapper hunter dispatch failed (attempt {attempt + 1}/{max_retries}): {response.text}")
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(3)
-                            continue
-                    else:
-                        logger.error(f"Failed to trigger wrapper hunter: {response.status_code} - {response.text}")
-                        return False
+
+                    logger.warning(
+                        "Wrapper repository_dispatch failed "
+                        f"(attempt {attempt + 1}/{max_retries}): "
+                        f"{fallback_response.status_code} - {fallback_response.text}"
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(3)
+                        continue
+                    return False
                         
             except Exception as e:
                 logger.error(f"Error triggering wrapper hunter (attempt {attempt + 1}): {e}")
@@ -1870,14 +1910,48 @@ class GitHubScanService:
         base_commit: str = "",
         max_retries: int = 3
     ) -> bool:
-        """Trigger the Fixora scan workflow via repository_dispatch"""
+        """Trigger the Fixora Semgrep workflow.
+
+        Strategy:
+        1) Try workflow_dispatch directly against the workflow file (most deterministic).
+        2) Fallback to repository_dispatch for compatibility.
+        """
         import asyncio
         
         for attempt in range(max_retries):
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
-                    # Use repository_dispatch which works from any branch
-                    response = await client.post(
+                    semgrep_workflow_id = WORKFLOW_FILE_PATH.split("/")[-1]
+                    # Preferred path: explicit workflow_dispatch
+                    dispatch_response = await client.post(
+                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows/{semgrep_workflow_id}/dispatches",
+                        headers=self.headers,
+                        json={
+                            "ref": target_branch,
+                            "inputs": {
+                                "scan_mode": scan_mode,
+                                "target_branch": target_branch,
+                                "base_commit": base_commit or "",
+                                "scan_id": scan_id,
+                            },
+                        }
+                    )
+
+                    if dispatch_response.status_code == 204:
+                        logger.info(
+                            f"Triggered semgrep workflow via workflow_dispatch for {owner}/{repo} "
+                            f"(scan_id: {scan_id}, branch: {target_branch}, mode: {scan_mode})"
+                        )
+                        return True
+                    else:
+                        logger.warning(
+                            "Semgrep workflow_dispatch failed "
+                            f"(attempt {attempt + 1}/{max_retries}): "
+                            f"{dispatch_response.status_code} - {dispatch_response.text}"
+                        )
+
+                    # Fallback path: repository_dispatch
+                    fallback_response = await client.post(
                         f"{GITHUB_API_URL}/repos/{owner}/{repo}/dispatches",
                         headers=self.headers,
                         json={
@@ -1886,23 +1960,27 @@ class GitHubScanService:
                                 "scan_mode": scan_mode,
                                 "target_branch": target_branch,
                                 "base_commit": base_commit or "",
-                                "scan_id": scan_id
-                            }
-                        }
+                                "scan_id": scan_id,
+                            },
+                        },
                     )
-                    
-                    if response.status_code == 204:
-                        logger.info(f"Triggered scan workflow for {owner}/{repo} (scan_id: {scan_id})")
+
+                    if fallback_response.status_code == 204:
+                        logger.info(
+                            f"Triggered semgrep workflow via repository_dispatch for {owner}/{repo} "
+                            f"(scan_id: {scan_id}, branch: {target_branch}, mode: {scan_mode})"
+                        )
                         return True
-                    elif response.status_code == 404:
-                        # Repository not found or no access
-                        logger.warning(f"Repository dispatch failed (attempt {attempt + 1}/{max_retries}): {response.text}")
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(3)  # Wait 3 seconds before retry
-                            continue
-                    else:
-                        logger.error(f"Failed to trigger workflow: {response.status_code} - {response.text}")
-                        return False
+
+                    logger.warning(
+                        "Semgrep repository_dispatch failed "
+                        f"(attempt {attempt + 1}/{max_retries}): "
+                        f"{fallback_response.status_code} - {fallback_response.text}"
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(3)
+                        continue
+                    return False
                         
             except Exception as e:
                 logger.error(f"Error triggering workflow (attempt {attempt + 1}): {e}")
