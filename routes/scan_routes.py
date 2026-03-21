@@ -39,47 +39,49 @@ UNIFIED_VULN_CATEGORIES = [
     "Business Logic Flaws",
 ]
 
+VULN_TYPE_TO_CATEGORY = {
+    "SQL Injection": "Injection (SQL/NoSQL/LDAP/Command/Path Traversal)",
+    "Command Injection": "Injection (SQL/NoSQL/LDAP/Command/Path Traversal)",
+    "Path Traversal": "Injection (SQL/NoSQL/LDAP/Command/Path Traversal)",
+    "XSS": "Cross-Site Scripting (XSS)",
+    "SSRF": "Server-Side Request Forgery (SSRF)",
+    "Insecure Deserialization": "Insecure Deserialization",
+    "Hardcoded Secret": "Hardcoded Secrets / Credentials",
+    "Cryptographic Failure": "Cryptographic Failures",
+    "IDOR / Broken Access Control": "Broken Access Control (IDOR/BOLA)",
+    "Security Misconfiguration": "Security Misconfiguration (CORS, Headers)",
+    "Business Logic Flaw": "Business Logic Flaws",
+}
+
 _PLACEHOLDER_TEXT_RE = re.compile(
     r"requires\s+logn|requires\s+login|unknown\s+vulnerability|security\s+issue",
     flags=re.IGNORECASE,
 )
 
 
-def _normalize_unified_type_and_category(
-    rule_id: str,
-    metadata: Dict[str, Any],
-    description: str,
-):
-    hay = " ".join([
-        str(rule_id or ""),
-        str(metadata.get("category") or ""),
-        str(metadata.get("vulnerability_type") or ""),
-        str(description or ""),
-    ]).lower()
-
-    if any(k in hay for k in ["sqli", "sql injection", "nosql", "ldap", "xpath", "command-injection", "command injection", "path-traversal", "path traversal"]):
-        if "command" in hay:
-            return "Command Injection", "Injection (SQL/NoSQL/LDAP/Command/Path Traversal)"
-        if "path" in hay and "travers" in hay:
-            return "Path Traversal", "Injection (SQL/NoSQL/LDAP/Command/Path Traversal)"
-        return "SQL Injection", "Injection (SQL/NoSQL/LDAP/Command/Path Traversal)"
-    if "xss" in hay or "cross-site scripting" in hay or "cross site scripting" in hay:
-        return "XSS", "Cross-Site Scripting (XSS)"
-    if "ssrf" in hay or "server-side request forgery" in hay:
-        return "SSRF", "Server-Side Request Forgery (SSRF)"
-    if "deserialize" in hay:
-        return "Insecure Deserialization", "Insecure Deserialization"
-    if "idor" in hay or "bola" in hay or "broken access" in hay:
-        return "IDOR / Broken Access Control", "Broken Access Control (IDOR/BOLA)"
-    if "secret" in hay or "credential" in hay or "hardcoded" in hay:
-        return "Hardcoded Secret", "Hardcoded Secrets / Credentials"
-    if "crypto" in hay or "weak hash" in hay or "weak cipher" in hay or "encryption" in hay:
-        return "Cryptographic Failure", "Cryptographic Failures"
-    if "cors" in hay or "header" in hay or "misconfig" in hay or "csrf" in hay:
-        return "Security Misconfiguration", "Security Misconfiguration (CORS, Headers)"
-    if "business" in hay or "logic" in hay or "workflow" in hay:
-        return "Business Logic Flaw", "Business Logic Flaws"
-    return "Security Misconfiguration", "Insecure Design / Architecture"
+def _normalize_rule_id_to_vuln_type(rule_id: str) -> str:
+    """Strict taxonomy normalizer driven by Semgrep check_id."""
+    if any(x in rule_id for x in ["sql", "sqli", "nosql"]):
+        return "SQL Injection"
+    if any(x in rule_id for x in ["command", "exec", "rce", "spawn"]):
+        return "Command Injection"
+    if any(x in rule_id for x in ["path-traversal", "lfi", "directory-traversal"]):
+        return "Path Traversal"
+    if "xss" in rule_id or "cross-site-scripting" in rule_id:
+        return "XSS"
+    if "ssrf" in rule_id:
+        return "SSRF"
+    if any(x in rule_id for x in ["deserialization", "pickle", "yaml.load"]):
+        return "Insecure Deserialization"
+    if any(x in rule_id for x in ["secret", "hardcoded", "password", "token", "key"]):
+        return "Hardcoded Secret"
+    if any(x in rule_id for x in ["crypto", "hash", "md5", "sha1", "cipher", "random", "jwt"]):
+        return "Cryptographic Failure"
+    if any(x in rule_id for x in ["idor", "bola", "authz", "access-control", "permission"]):
+        return "IDOR / Broken Access Control"
+    if any(x in rule_id for x in ["cors", "cookie", "config", "header"]):
+        return "Security Misconfiguration"
+    return "Business Logic Flaw"
 
 
 def _clean_placeholder_text(value: str, fallback: str) -> str:
@@ -750,14 +752,15 @@ async def receive_scan_results(
         }
         severity = severity_map.get(severity, "medium")
         
-        # Extract vulnerability type/category in unified taxonomy
-        rule_id = result.get("check_id", "")
-        description = extra.get("message", "No description available")
-        vuln_type, category = _normalize_unified_type_and_category(
-            rule_id=rule_id,
-            metadata=metadata,
-            description=description,
-        )
+        # Strict taxonomy normalization from Semgrep check_id
+        rule_id = result.get("check_id", "").lower()
+        metadata = extra.get("metadata", {})
+
+        vuln_type = _normalize_rule_id_to_vuln_type(rule_id)
+        category = VULN_TYPE_TO_CATEGORY.get(vuln_type, "Business Logic Flaws")
+
+        # Clean weird placeholders from Semgrep description text
+        description = extra.get("message", "No description available").replace("requires login", "").strip()
         description = _clean_placeholder_text(
             description,
             f"Potential {vuln_type} detected. Review data flow and controls.",
