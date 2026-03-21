@@ -1893,8 +1893,21 @@ class GitHubScanService:
                             continue
                         return False
                     elif response.status_code == 422:
+                        body = response.text or ""
+                        if "workflow_dispatch" in body.lower() and attempt < max_retries - 1:
+                            logger.warning(
+                                f"Wrapper workflow dispatch not ready yet (attempt {attempt + 1}/{max_retries}): {body}"
+                            )
+                            refresh_ok = await self.push_wrapper_hunter_workflow(owner, repo, dispatch_ref)
+                            if not refresh_ok:
+                                logger.error(
+                                    f"Failed to refresh wrapper workflow before retry for {owner}/{repo}"
+                                )
+                                return False
+                            await asyncio.sleep(4)
+                            continue
                         logger.error(
-                            f"Wrapper workflow dispatch validation failed (422): {response.text}"
+                            f"Wrapper workflow dispatch validation failed (422): {body}"
                         )
                         return False
                     else:
@@ -1970,7 +1983,20 @@ class GitHubScanService:
                             continue
                         return False
                     elif response.status_code == 422:
-                        logger.error(f"Semgrep workflow dispatch validation failed (422): {response.text}")
+                        body = response.text or ""
+                        if "workflow_dispatch" in body.lower() and attempt < max_retries - 1:
+                            logger.warning(
+                                f"Semgrep workflow dispatch not ready yet (attempt {attempt + 1}/{max_retries}): {body}"
+                            )
+                            refresh_ok = await self.push_workflow_file(owner, repo, dispatch_ref)
+                            if not refresh_ok:
+                                logger.error(
+                                    f"Failed to refresh semgrep workflow before retry for {owner}/{repo}"
+                                )
+                                return False
+                            await asyncio.sleep(4)
+                            continue
+                        logger.error(f"Semgrep workflow dispatch validation failed (422): {body}")
                         return False
                     else:
                         logger.error(
