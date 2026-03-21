@@ -25,113 +25,6 @@ router = APIRouter(prefix='/scan', tags=['Scans'])
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# ── Unified vulnerability taxonomy (strict) ─────────────────────────────────
-UNIFIED_TAXONOMY_CATEGORIES = {
-    "Injection (SQL/NoSQL/LDAP/Command/Path Traversal)",
-    "Broken Access Control (IDOR/BOLA)",
-    "Cross-Site Scripting (XSS)",
-    "Server-Side Request Forgery (SSRF)",
-    "Insecure Deserialization",
-    "Hardcoded Secrets / Credentials",
-    "Cryptographic Failures",
-    "Security Misconfiguration (CORS, Headers)",
-    "Insecure Design / Architecture",
-    "Business Logic Flaws",
-}
-
-CANONICAL_VULN_TYPES = {
-    "SQL Injection",
-    "Command Injection",
-    "Path Traversal",
-    "XSS",
-    "SSRF",
-    "Insecure Deserialization",
-    "IDOR / Broken Access Control",
-    "Cryptographic Failure",
-    "Hardcoded Secret",
-    "Business Logic Flaw",
-    "Security Misconfiguration",
-    "Insecure Design / Architecture",
-}
-
-
-def _normalize_vulnerability_taxonomy(rule_id: str, metadata: Dict[str, Any], description: str) -> Dict[str, str]:
-    """Force Semgrep findings into Fixora's unified taxonomy.
-
-    Returns:
-        {
-            "type": canonical fixed label,
-            "category": unified category bucket,
-        }
-    """
-    rid = (rule_id or "").lower()
-    md_cat = str(metadata.get("category", "") or "").lower()
-    md_sub = str(metadata.get("sub_category", "") or "").lower()
-    msg = (description or "").lower()
-    blob = " ".join([rid, md_cat, md_sub, msg])
-
-    if any(x in blob for x in ["sql", "sqli", "nosql", "ldap", "xpath"]):
-        return {
-            "type": "SQL Injection",
-            "category": "Injection (SQL/NoSQL/LDAP/Command/Path Traversal)",
-        }
-    if any(x in blob for x in ["command", "exec", "spawn", "rce", "shell"]):
-        return {
-            "type": "Command Injection",
-            "category": "Injection (SQL/NoSQL/LDAP/Command/Path Traversal)",
-        }
-    if any(x in blob for x in ["path-traversal", "directory-traversal", "lfi", "path traversal"]):
-        return {
-            "type": "Path Traversal",
-            "category": "Injection (SQL/NoSQL/LDAP/Command/Path Traversal)",
-        }
-    if "xss" in blob or "cross-site-scripting" in blob:
-        return {
-            "type": "XSS",
-            "category": "Cross-Site Scripting (XSS)",
-        }
-    if "ssrf" in blob:
-        return {
-            "type": "SSRF",
-            "category": "Server-Side Request Forgery (SSRF)",
-        }
-    if any(x in blob for x in ["deserialization", "pickle", "yaml.load", "unsafe-load"]):
-        return {
-            "type": "Insecure Deserialization",
-            "category": "Insecure Deserialization",
-        }
-    if any(x in blob for x in ["secret", "hardcoded", "password", "token", "apikey", "api-key", "private key"]):
-        return {
-            "type": "Hardcoded Secret",
-            "category": "Hardcoded Secrets / Credentials",
-        }
-    if any(x in blob for x in ["crypto", "hash", "md5", "sha1", "cipher", "random", "weak-prng", "bcrypt"]):
-        return {
-            "type": "Cryptographic Failure",
-            "category": "Cryptographic Failures",
-        }
-    if any(x in blob for x in ["idor", "bola", "access-control", "access control", "authz", "authorization bypass"]):
-        return {
-            "type": "IDOR / Broken Access Control",
-            "category": "Broken Access Control (IDOR/BOLA)",
-        }
-    if any(x in blob for x in ["cors", "header", "hsts", "tls", "cookie", "jwt", "csrf", "misconfig", "configuration"]):
-        return {
-            "type": "Security Misconfiguration",
-            "category": "Security Misconfiguration (CORS, Headers)",
-        }
-    if any(x in blob for x in ["logic", "workflow", "race condition", "double spend", "abuse"]):
-        return {
-            "type": "Business Logic Flaw",
-            "category": "Business Logic Flaws",
-        }
-
-    # Conservative fallback for unknown/odd rule IDs.
-    return {
-        "type": "Insecure Design / Architecture",
-        "category": "Insecure Design / Architecture",
-    }
-
 @router.get('/{scan_id}', response_model=ScanResult)
 async def get_scan_status(
     scan_id: str,
@@ -794,12 +687,35 @@ async def receive_scan_results(
         }
         severity = severity_map.get(severity, "medium")
         
-        # Normalize into fixed taxonomy (no invented vulnerability labels).
+        # Extract vulnerability type from rule_id or metadata
         rule_id = result.get("check_id", "")
+        vuln_type = metadata.get("category", "security")
+        
+        # Try to extract a more specific type from rule_id
+        # e.g., "javascript.express.security.audit.xss" -> "XSS"
+        if "xss" in rule_id.lower():
+            vuln_type = "XSS"
+        elif "sql-injection" in rule_id.lower() or "sqli" in rule_id.lower():
+            vuln_type = "SQL Injection"
+        elif "command-injection" in rule_id.lower():
+            vuln_type = "Command Injection"
+        elif "path-traversal" in rule_id.lower():
+            vuln_type = "Path Traversal"
+        elif "ssrf" in rule_id.lower():
+            vuln_type = "SSRF"
+        elif "hardcoded" in rule_id.lower() or "secret" in rule_id.lower():
+            vuln_type = "Hardcoded Secret"
+        elif "csrf" in rule_id.lower():
+            vuln_type = "CSRF"
+        elif "open-redirect" in rule_id.lower():
+            vuln_type = "Open Redirect"
+        elif "insecure" in rule_id.lower():
+            vuln_type = "Insecure Configuration"
+        else:
+            # Use the last part of the rule_id as type
+            vuln_type = rule_id.split(".")[-1].replace("-", " ").title()
+
         description = extra.get("message", "No description available")
-        taxonomy = _normalize_vulnerability_taxonomy(rule_id, metadata, description)
-        vuln_type = taxonomy["type"]
-        vuln_category = taxonomy["category"]
         file_path = result.get("path", "")
         line_number = result.get("start", {}).get("line", 0)
         end_line = result.get("end", {}).get("line", 0)
@@ -820,7 +736,6 @@ async def receive_scan_results(
         normalized_vuln = {
             "severity": severity,
             "type": vuln_type,
-            "category": vuln_category,
             "title": title,
         }
 
@@ -831,7 +746,6 @@ async def receive_scan_results(
                     "$set": {
                         "scan_id": payload.scan_id,
                         "type": vuln_type,
-                        "category": vuln_category,
                         "title": title,
                         "description": description,
                         "severity": severity,
@@ -867,7 +781,6 @@ async def receive_scan_results(
             "scan_id": payload.scan_id,
             "user_id": user_id,
             "type": vuln_type,
-            "category": vuln_category,
             "title": title,
             "description": description,
             "severity": severity,
