@@ -28,7 +28,7 @@ on:
     inputs:
       scan_mode:
         description: 'Scan mode: full or diff'
-        required: true
+        required: false
         default: 'full'
         type: choice
         options:
@@ -36,10 +36,11 @@ on:
           - diff
       scan_id:
         description: 'Fixora scan ID for tracking'
-        required: true
+        required: false
+        default: ''
       target_branch:
         description: 'Branch to analyze'
-        required: true
+        required: false
         default: 'main'
       base_commit:
         description: 'Base commit for diff scan (optional)'
@@ -1184,25 +1185,26 @@ on:
     types: [fixora-scan]
   workflow_dispatch:
     inputs:
-      scan_mode:
-        description: 'Scan mode: full or diff'
-        required: true
-        default: 'full'
-        type: choice
-        options:
-          - full
-          - diff
-      target_branch:
-        description: 'Branch to scan'
-        required: true
-        default: 'main'
-      base_commit:
-        description: 'Base commit for diff scan (optional)'
-        required: false
-        default: ''
-      scan_id:
-        description: 'Fixora scan ID for tracking'
-        required: true
+            scan_mode:
+                description: 'Scan mode: full or diff'
+                required: false
+                default: 'full'
+                type: choice
+                options:
+                    - full
+                    - diff
+            target_branch:
+                description: 'Branch to scan'
+                required: false
+                default: 'main'
+            base_commit:
+                description: 'Base commit for diff scan (optional)'
+                required: false
+                default: ''
+            scan_id:
+                description: 'Fixora scan ID for tracking'
+                required: false
+                default: ''
 
 jobs:
   security-scan:
