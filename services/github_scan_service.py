@@ -33,6 +33,10 @@ on:
         description: 'Branch to analyze'
         required: true
         default: 'main'
+            base_commit:
+                description: 'Base commit for diff scan'
+                required: false
+                default: ''
 
 jobs:
   wrapper-hunt:
@@ -65,6 +69,7 @@ jobs:
               '.github','.vscode','vendor','bower_components',
           ]);
           const JS_EXTS = new Set(['.js','.jsx','.ts','.tsx','.mjs','.cjs']);
+          const FRONTEND_IMPORTS = new Set(['react','vue','next','solid-js']);
 
           const DANGEROUS_GLOBALS = new Set([
               'eval','Function','setTimeout','setInterval','setImmediate',
@@ -175,6 +180,15 @@ jobs:
               return { imports: [...imports].sort(), alias };
           }
 
+          function detectEnvironment(relPath, importsList) {
+              const norm = String(relPath || '').replace(/\\/g, '/').toLowerCase();
+              const isTsxJsx = /\.(tsx|jsx)$/i.test(norm);
+              const hasFrontendPath = /\/(components|pages|views|hooks|ui|layouts)\//i.test(norm);
+              const hasFrontendImport = (importsList || []).some((i) => FRONTEND_IMPORTS.has(String(i || '').toLowerCase()));
+              if (isTsxJsx || hasFrontendPath || hasFrontendImport) return 'BROWSER (Frontend)';
+              return 'NODE.JS (Backend)';
+          }
+
           function isFn(n) {
               return n && (
                   n.type==='FunctionDeclaration'||n.type==='FunctionExpression'||
@@ -247,7 +261,7 @@ jobs:
               return calls;
           }
 
-          function extractFile(ast, src, relPath, aliasMap) {
+          function extractFile(ast, src, relPath, aliasMap, importsList) {
               const wrappers = [];
               function visit(node, parent) {
                   if (!node || typeof node !== 'object') return;
@@ -257,10 +271,19 @@ jobs:
                       if (Object.keys(calls).length > 0) {
                           const funcSrc = (node.start != null && node.end != null)
                               ? src.substring(node.start, node.end) : '';
+                          const funcSrcStr = funcSrc.toLowerCase();
+                          const hasAuthCheck =
+                              funcSrcStr.includes('req.user') ||
+                              funcSrcStr.includes('session') ||
+                              funcSrcStr.includes('jwt') ||
+                              funcSrcStr.includes('current_user') ||
+                              funcSrcStr.includes('user_id');
                           const ls = node.loc ? node.loc.start.line : 1;
                           const le = node.loc ? node.loc.end.line : ls;
                           wrappers.push({
                               function_name: name, file: relPath,
+                              environment: detectEnvironment(relPath, importsList),
+                              has_auth_check: hasAuthCheck,
                               line_start: ls, line_end: le,
                               calls: Object.keys(calls),
                               modules_used: [...new Set(Object.values(calls))],
@@ -282,9 +305,11 @@ jobs:
           const scanRoot = process.argv[2] || '.';
           const displayRoot = process.argv[3] || scanRoot;
           const manifestPkgs = JSON.parse(process.argv[4] || '[]');
+          const targetFiles = JSON.parse(process.argv[5] || '[]');
           const allImports = new Set();
           const allWrappers = [];
-          walkDir(scanRoot, (fp) => {
+
+          function parseAndCollect(fp) {
               let src;
               try { src = fs.readFileSync(fp, 'utf8'); } catch(e) { return; }
               const ast = parseFile(fp, src);
@@ -292,9 +317,24 @@ jobs:
               const rel = path.relative(displayRoot, fp);
               const { imports, alias } = collectImports(ast.program.body);
               imports.forEach(i => allImports.add(i));
-              const wrappers = extractFile(ast, src, rel, alias);
+              const wrappers = extractFile(ast, src, rel, alias, imports);
               allWrappers.push(...wrappers);
-          });
+          }
+
+          if (Array.isArray(targetFiles) && targetFiles.length > 0) {
+              for (const relFp of targetFiles) {
+                  if (!relFp || typeof relFp !== 'string') continue;
+                  const fp = path.resolve(scanRoot, relFp);
+                  const ext = path.extname(fp).toLowerCase();
+                  if (!JS_EXTS.has(ext)) continue;
+                  if (!fs.existsSync(fp)) continue;
+                  parseAndCollect(fp);
+              }
+          } else {
+              walkDir(scanRoot, (fp) => {
+                  parseAndCollect(fp);
+              });
+          }
           process.stdout.write(JSON.stringify({
               from_imports: [...allImports].sort(),
               wrappers: allWrappers,
@@ -303,6 +343,15 @@ jobs:
 
       - name: Run Wrapper Hunter
         run: |
+                    BASE_COMMIT="${{ github.event.client_payload.base_commit || github.event.inputs.base_commit }}"
+                    if [ -n "$BASE_COMMIT" ]; then
+                        echo "Running in DIFF mode from $BASE_COMMIT"
+                        git diff --name-only $BASE_COMMIT HEAD > /tmp/changed_files.txt || true
+                    else
+                        echo "Running in FULL SCAN mode"
+                        : > /tmp/changed_files.txt
+                    fi
+
           cat > /tmp/wrapper_hunter.py << 'HUNTER_SCRIPT'
           #!/usr/bin/env python3
           import ast
@@ -589,32 +638,43 @@ jobs:
               return sorted(set(pkgs))
 
           # ─── IMPORT COLLECTORS ────────────────────────────────────────────────────────
-          def collect_python_imports(repo_root):
-              # Walk all .py files; collect every top-level module name imported
-              found = set()
-              for dirpath, dirnames, filenames in os.walk(repo_root):
+          def detect_environment(filepath):
+              return "BACKEND (Python)"
+
+          def _iter_target_python_files(scan_root, target_files=None):
+              if target_files is not None:
+                  for fp in target_files:
+                      if fp.endswith(".py") and os.path.isfile(fp):
+                          yield fp
+                  return
+
+              for dirpath, dirnames, filenames in os.walk(scan_root):
                   dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
                   for fn in filenames:
-                      if not fn.endswith(".py"):
-                          continue
-                      fp = os.path.join(dirpath, fn)
-                      try:
-                          with open(fp, "r", errors="ignore") as f:
-                              source = f.read()
-                          tree = ast.parse(source, filename=fp)
-                      except Exception:
-                          continue
-                      for node in ast.walk(tree):
-                          if isinstance(node, ast.Import):
-                              for alias in node.names:
-                                  found.add(alias.name.split(".")[0])
-                          elif isinstance(node, ast.ImportFrom):
-                              if node.module:
-                                  found.add(node.module.split(".")[0])
+                      if fn.endswith(".py"):
+                          yield os.path.join(dirpath, fn)
+
+          def collect_python_imports(scan_root, target_files=None):
+              # Walk .py files in scope; collect every top-level module name imported
+              found = set()
+              for fp in _iter_target_python_files(scan_root, target_files=target_files):
+                  try:
+                      with open(fp, "r", errors="ignore") as f:
+                          source = f.read()
+                      tree = ast.parse(source, filename=fp)
+                  except Exception:
+                      continue
+                  for node in ast.walk(tree):
+                      if isinstance(node, ast.Import):
+                          for alias in node.names:
+                              found.add(alias.name.split(".")[0])
+                      elif isinstance(node, ast.ImportFrom):
+                          if node.module:
+                              found.add(node.module.split(".")[0])
               return sorted(found)
 
           # ─── JS/REACT EXTRACTION (AST via Node.js) ───────────────────────────────
-          def run_js_extractor(scan_root, display_root, manifest_pkgs):
+          def run_js_extractor(scan_root, display_root, manifest_pkgs, target_files=None):
               import subprocess, sys
               try:
                   result = subprocess.run(
@@ -623,6 +683,7 @@ jobs:
                           scan_root,
                           display_root,
                           json.dumps(manifest_pkgs),
+                          json.dumps(target_files or []),
                       ],
                       capture_output=True, text=True, timeout=120
                   )
@@ -665,7 +726,7 @@ jobs:
               "loads", "load",
           }
 
-          def extract_python_wrappers(scan_root, all_modules, display_root):
+          def extract_python_wrappers(scan_root, all_modules, display_root, target_files=None):
               # Find every function that:
               #   1. Calls any module from all_modules (existing), OR
               #   2. Calls a method on a variable derived from an imported module
@@ -674,119 +735,127 @@ jobs:
               wrappers = []
               target = set(all_modules)
               dangerous_builtins = {"eval", "exec", "__import__", "compile", "open", "globals", "locals"}
-              for dirpath, dirnames, filenames in os.walk(scan_root):
-                  dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
-                  for fn in filenames:
-                      if not fn.endswith(".py"):
-                          continue
-                      fp = os.path.join(dirpath, fn)
-                      try:
-                          with open(fp, "r", errors="ignore") as f:
-                              source = f.read()
-                          tree = ast.parse(source, filename=fp)
-                      except Exception:
-                          continue
-                      # Per-file: alias -> root module name
-                      imported_names = {}
-                      for node in ast.walk(tree):
-                          if isinstance(node, ast.Import):
+              for fp in _iter_target_python_files(scan_root, target_files=target_files):
+                  fn = os.path.basename(fp)
+                  if not fn.endswith(".py"):
+                      continue
+                  try:
+                      with open(fp, "r", errors="ignore") as f:
+                          source = f.read()
+                      tree = ast.parse(source, filename=fp)
+                  except Exception:
+                      continue
+                  # Per-file: alias -> root module name
+                  imported_names = {}
+                  for node in ast.walk(tree):
+                      if isinstance(node, ast.Import):
+                          for alias in node.names:
+                              root = alias.name.split(".")[0]
+                              if root in target:
+                                  imported_names[alias.asname or alias.name.split(".")[0]] = root
+                      elif isinstance(node, ast.ImportFrom):
+                          module = (node.module or "").split(".")[0]
+                          if module in target:
                               for alias in node.names:
-                                  root = alias.name.split(".")[0]
-                                  if root in target:
-                                      imported_names[alias.asname or alias.name.split(".")[0]] = root
-                          elif isinstance(node, ast.ImportFrom):
-                              module = (node.module or "").split(".")[0]
-                              if module in target:
-                                  for alias in node.names:
-                                      imported_names[alias.asname or alias.name] = module
-                      rel = os.path.relpath(fp, display_root).replace("\\\\", "/")
-                      for node in ast.walk(tree):
-                          if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                              # ── Pass 1: Track variables derived from imports ──
-                              # Handles chains like:
-                              #   conn = sqlite3.connect(...)   → conn linked to sqlite3
-                              #   cursor = conn.cursor()        → cursor linked to sqlite3
-                              # Two iterations catch A→B→C chains.
-                              import_derived = {}
-                              for _pass in range(2):
-                                  for child in ast.walk(node):
-                                      # Simple assignments: x = something.method()
-                                      if isinstance(child, ast.Assign):
-                                          if isinstance(child.value, ast.Call):
-                                              cn = _get_call_name(child.value)
-                                              if cn:
-                                                  cr = cn.split(".")[0]
-                                                  linked = imported_names.get(cr) or import_derived.get(cr)
-                                                  if linked:
-                                                      for tgt in child.targets:
-                                                          if isinstance(tgt, ast.Name):
-                                                              import_derived[tgt.id] = linked
-                                          # x = something (non-call assignment from import alias)
-                                          elif isinstance(child.value, ast.Attribute):
-                                              cn = _get_call_name(ast.Call(func=child.value, args=[], keywords=[]))  # reuse helper
-                                              if cn:
-                                                  cr = cn.split(".")[0]
-                                                  linked = imported_names.get(cr) or import_derived.get(cr)
-                                                  if linked:
-                                                      for tgt in child.targets:
-                                                          if isinstance(tgt, ast.Name):
-                                                              import_derived[tgt.id] = linked
-                                          elif isinstance(child.value, ast.Name):
-                                              if child.value.id in imported_names:
-                                                  for tgt in child.targets:
-                                                      if isinstance(tgt, ast.Name):
-                                                          import_derived[tgt.id] = imported_names[child.value.id]
-                                              elif child.value.id in import_derived:
-                                                  for tgt in child.targets:
-                                                      if isinstance(tgt, ast.Name):
-                                                          import_derived[tgt.id] = import_derived[child.value.id]
-                                      # with-statement context managers:
-                                      #   with sqlite3.connect("db") as conn:
-                                      #   async with aiohttp.ClientSession() as session:
-                                      if isinstance(child, (ast.With, ast.AsyncWith)):
-                                          for item in child.items:
-                                              ctx = item.context_expr
-                                              if isinstance(ctx, ast.Call) and item.optional_vars:
-                                                  cn = _get_call_name(ctx)
-                                                  if cn:
-                                                      cr = cn.split(".")[0]
-                                                      linked = imported_names.get(cr) or import_derived.get(cr)
-                                                      if linked and isinstance(item.optional_vars, ast.Name):
-                                                          import_derived[item.optional_vars.id] = linked
-
-                              # ── Pass 2: Collect calls ──────────────────────────
-                              calls_found = {}
+                                  imported_names[alias.asname or alias.name] = module
+                  rel = os.path.relpath(fp, display_root).replace("\\", "/")
+                  for node in ast.walk(tree):
+                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                          # ── Pass 1: Track variables derived from imports ──
+                          # Handles chains like:
+                          #   conn = sqlite3.connect(...)   → conn linked to sqlite3
+                          #   cursor = conn.cursor()        → cursor linked to sqlite3
+                          # Two iterations catch A→B→C chains.
+                          import_derived = {}
+                          for _pass in range(2):
                               for child in ast.walk(node):
-                                  if isinstance(child, ast.Call):
-                                      call_str = _get_call_name(child)
-                                      if not call_str:
-                                          continue
-                                      root = call_str.split(".")[0]
-                                      # Direct import call (existing)
-                                      if root in imported_names:
-                                          calls_found[call_str] = imported_names[root]
-                                      # Dangerous builtins (existing)
-                                      elif root in dangerous_builtins:
-                                          calls_found[call_str] = "builtins"
-                                      # NEW: Variable derived from an import (cursor.execute, conn.commit)
-                                      elif root in import_derived:
-                                          calls_found[call_str] = import_derived[root]
-                                      # NEW: Known dangerous method on any object (fallback)
-                                      elif "." in call_str:
-                                          method = call_str.rsplit(".", 1)[-1]
-                                          if method in DANGEROUS_SINK_METHODS:
-                                              calls_found[call_str] = f"<object>.{method}"
-                              if calls_found:
-                                  func_src = ast.get_source_segment(source, node) or ""
-                                  wrappers.append({
-                                      "function_name": node.name,
-                                      "file": rel,
-                                      "line_start": node.lineno,
-                                      "line_end": node.end_lineno,
-                                      "calls": list(calls_found.keys()),
-                                      "modules_used": list(set(calls_found.values())),
-                                      "source_code": func_src,
-                                  })
+                                  # Simple assignments: x = something.method()
+                                  if isinstance(child, ast.Assign):
+                                      if isinstance(child.value, ast.Call):
+                                          cn = _get_call_name(child.value)
+                                          if cn:
+                                              cr = cn.split(".")[0]
+                                              linked = imported_names.get(cr) or import_derived.get(cr)
+                                              if linked:
+                                                  for tgt in child.targets:
+                                                      if isinstance(tgt, ast.Name):
+                                                          import_derived[tgt.id] = linked
+                                      # x = something (non-call assignment from import alias)
+                                      elif isinstance(child.value, ast.Attribute):
+                                          cn = _get_call_name(ast.Call(func=child.value, args=[], keywords=[]))  # reuse helper
+                                          if cn:
+                                              cr = cn.split(".")[0]
+                                              linked = imported_names.get(cr) or import_derived.get(cr)
+                                              if linked:
+                                                  for tgt in child.targets:
+                                                      if isinstance(tgt, ast.Name):
+                                                          import_derived[tgt.id] = linked
+                                      elif isinstance(child.value, ast.Name):
+                                          if child.value.id in imported_names:
+                                              for tgt in child.targets:
+                                                  if isinstance(tgt, ast.Name):
+                                                      import_derived[tgt.id] = imported_names[child.value.id]
+                                          elif child.value.id in import_derived:
+                                              for tgt in child.targets:
+                                                  if isinstance(tgt, ast.Name):
+                                                      import_derived[tgt.id] = import_derived[child.value.id]
+                                  # with-statement context managers:
+                                  #   with sqlite3.connect("db") as conn:
+                                  #   async with aiohttp.ClientSession() as session:
+                                  if isinstance(child, (ast.With, ast.AsyncWith)):
+                                      for item in child.items:
+                                          ctx = item.context_expr
+                                          if isinstance(ctx, ast.Call) and item.optional_vars:
+                                              cn = _get_call_name(ctx)
+                                              if cn:
+                                                  cr = cn.split(".")[0]
+                                                  linked = imported_names.get(cr) or import_derived.get(cr)
+                                                  if linked and isinstance(item.optional_vars, ast.Name):
+                                                      import_derived[item.optional_vars.id] = linked
+
+                          # ── Pass 2: Collect calls ──────────────────────────
+                          calls_found = {}
+                          for child in ast.walk(node):
+                              if isinstance(child, ast.Call):
+                                  call_str = _get_call_name(child)
+                                  if not call_str:
+                                      continue
+                                  root = call_str.split(".")[0]
+                                  # Direct import call (existing)
+                                  if root in imported_names:
+                                      calls_found[call_str] = imported_names[root]
+                                  # Dangerous builtins (existing)
+                                  elif root in dangerous_builtins:
+                                      calls_found[call_str] = "builtins"
+                                  # NEW: Variable derived from an import (cursor.execute, conn.commit)
+                                  elif root in import_derived:
+                                      calls_found[call_str] = import_derived[root]
+                                  # NEW: Known dangerous method on any object (fallback)
+                                  elif "." in call_str:
+                                      method = call_str.rsplit(".", 1)[-1]
+                                      if method in DANGEROUS_SINK_METHODS:
+                                          calls_found[call_str] = f"<object>.{method}"
+                          if calls_found:
+                              func_src = ast.get_source_segment(source, node) or ""
+                              src_low = func_src.lower()
+                              has_auth_check = (
+                                  "req.user" in src_low or
+                                  "session" in src_low or
+                                  "jwt" in src_low or
+                                  "current_user" in src_low or
+                                  "user_id" in src_low
+                              )
+                              wrappers.append({
+                                  "function_name": node.name,
+                                  "file": rel,
+                                  "environment": detect_environment(rel),
+                                  "has_auth_check": has_auth_check,
+                                  "line_start": node.lineno,
+                                  "line_end": node.end_lineno,
+                                  "calls": list(calls_found.keys()),
+                                  "modules_used": list(set(calls_found.values())),
+                                  "source_code": func_src,
+                              })
               return wrappers
 
           # ─── ORCHESTRATOR ─────────────────────────────────────────────────────────────
@@ -808,8 +877,48 @@ jobs:
                       dst.append(item)
                       seen.add(item)
 
+          def _read_changed_files(repo_root):
+              changed_path = "/tmp/changed_files.txt"
+              if not os.path.isfile(changed_path):
+                  return []
+              changed = []
+              with open(changed_path, "r", errors="ignore") as f:
+                  for line in f:
+                      rel = line.strip()
+                      if not rel:
+                          continue
+                      abs_path = _norm_abs(os.path.join(repo_root, rel))
+                      if os.path.isfile(abs_path):
+                          changed.append(abs_path)
+              return changed
+
+          def _target_changed_files(changed_files_abs, scan_abs, language):
+              if not changed_files_abs:
+                  return []
+              exts = _lang_exts(language)
+              selected = []
+              for fp in changed_files_abs:
+                  if not fp.lower().endswith(exts):
+                      continue
+                  try:
+                      if os.path.commonpath([scan_abs, fp]) != scan_abs:
+                          continue
+                  except Exception:
+                      continue
+                  selected.append(fp)
+              return selected
+
+          def _safe_relpath(base_abs, path_abs):
+              try:
+                  if os.path.commonpath([base_abs, path_abs]) != base_abs:
+                      return None
+              except Exception:
+                  return None
+              return os.path.relpath(path_abs, base_abs).replace("\\", "/")
+
           def run_wrapper_hunter(repo_root="."):
               repo_root = _norm_abs(repo_root)
+              changed_files_abs = _read_changed_files(repo_root)
               targets, found_anchors, phantom_roots = build_scan_targets(repo_root)
 
               results = {}
@@ -820,6 +929,7 @@ jobs:
                   lang = t["language"]
                   root_abs = t["root_abs"]
                   scan_abs = t["scan_abs"]
+                  changed_for_target = _target_changed_files(changed_files_abs, scan_abs, lang)
 
                   if lang == "python":
                       manifest_pkgs = sorted(set(
@@ -828,12 +938,31 @@ jobs:
                           + parse_pyproject_toml(root_abs)
                           + parse_pipfile(root_abs)
                       ))
-                      import_mods = collect_python_imports(scan_abs)
+                      import_mods = collect_python_imports(
+                          scan_abs,
+                          target_files=(changed_for_target if changed_files_abs else None),
+                      )
                       all_modules = sorted(set(manifest_pkgs) | set(import_mods))
-                      wrappers = extract_python_wrappers(scan_abs, all_modules, repo_root)
+                      wrappers = extract_python_wrappers(
+                          scan_abs,
+                          all_modules,
+                          repo_root,
+                          target_files=(changed_for_target if changed_files_abs else None),
+                      )
                   else:
                       manifest_pkgs = parse_package_json(root_abs)
-                      js_result = run_js_extractor(scan_abs, repo_root, manifest_pkgs)
+                      rel_changed = []
+                      if changed_files_abs:
+                          for fp in changed_for_target:
+                              relp = _safe_relpath(scan_abs, fp)
+                              if relp:
+                                  rel_changed.append(relp)
+                      js_result = run_js_extractor(
+                          scan_abs,
+                          repo_root,
+                          manifest_pkgs,
+                          target_files=(rel_changed if changed_files_abs else None),
+                      )
                       import_mods = js_result.get("from_imports", [])
                       all_modules = sorted(set(manifest_pkgs) | set(import_mods))
                       wrappers = js_result.get("wrappers", [])
