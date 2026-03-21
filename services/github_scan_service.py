@@ -341,17 +341,8 @@ jobs:
           }));
           JS_EXTRACTOR_SCRIPT
 
-      - name: Run Wrapper Hunter
+      - name: Prepare Wrapper Hunter Script
         run: |
-          BASE_COMMIT="${{ github.event.client_payload.base_commit || github.event.inputs.base_commit }}"
-          if [ -n "$BASE_COMMIT" ]; then
-              echo "Running in DIFF mode from $BASE_COMMIT"
-              git diff --name-only $BASE_COMMIT HEAD > /tmp/changed_files.txt || true
-          else
-              echo "Running in FULL SCAN mode"
-              : > /tmp/changed_files.txt
-          fi
-
           cat > /tmp/wrapper_hunter.py << 'HUNTER_SCRIPT'
           #!/usr/bin/env python3
           import ast
@@ -1025,6 +1016,18 @@ jobs:
                   json.dump(output, f, indent=2)
               print(json.dumps(output, indent=2))
           HUNTER_SCRIPT
+
+      - name: Run Wrapper Hunter
+        env:
+          BASE_COMMIT: ${{ github.event.client_payload.base_commit || github.event.inputs.base_commit }}
+        run: |
+          if [ -n "$BASE_COMMIT" ]; then
+              echo "Running in DIFF mode from $BASE_COMMIT"
+              git diff --name-only "$BASE_COMMIT" HEAD > /tmp/changed_files.txt || true
+          else
+              echo "Running in FULL SCAN mode"
+              : > /tmp/changed_files.txt
+          fi
           python3 /tmp/wrapper_hunter.py
 
       - name: Send Wrapper Hunter Results to Fixora
