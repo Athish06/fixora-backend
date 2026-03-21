@@ -1,4 +1,4 @@
-﻿# GitHub Scanning Service - Implements the "Infection" mechanism
+# GitHub Scanning Service - Implements the "Infection" mechanism
 # Pushes workflows, injects secrets, and triggers scans via GitHub Actions
 
 import httpx
@@ -26,14 +26,14 @@ on:
     types: [fixora-wrapper-hunt]
   workflow_dispatch:
     inputs:
-            scan_mode:
-                description: 'Scan mode: full or diff'
-                required: true
-                default: 'full'
-                type: choice
-                options:
-                    - full
-                    - diff
+      scan_mode:
+        description: 'Scan mode: full or diff'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - diff
       scan_id:
         description: 'Fixora scan ID for tracking'
         required: true
@@ -41,10 +41,10 @@ on:
         description: 'Branch to analyze'
         required: true
         default: 'main'
-            base_commit:
-                description: 'Base commit for diff scan (optional)'
-                required: false
-                default: ''
+      base_commit:
+        description: 'Base commit for diff scan (optional)'
+        required: false
+        default: ''
 
 jobs:
   wrapper-hunt:
@@ -402,7 +402,7 @@ jobs:
               ".github", ".vscode",
           }
 
-          # ─── TARGET ORCHESTRATOR (multi-language monorepo aware) ───────────────────
+          # --- TARGET ORCHESTRATOR (multi-language monorepo aware) -------------------
           SOURCE_DIR_CANDIDATES = ("src", "lib", "app")
           PY_ANCHOR_FILES = {
               "requirements.txt", "pipfile", "pyproject.toml", "setup.py", "setup.cfg"
@@ -552,7 +552,7 @@ jobs:
               targets.sort(key=lambda t: (t["language"], t["root_path"], t["scan_path"]))
               return targets, found_anchors, phantom_roots_skipped
 
-          # ─── MANIFEST PARSERS ─────────────────────────────────────────────────────────
+          # --- MANIFEST PARSERS ---------------------------------------------------------
           def _parse_single_requirements_file(path):
               # Parse a single requirements file -> clean package names
               pkgs = []
@@ -673,7 +673,7 @@ jobs:
                   pass
               return sorted(set(pkgs))
 
-          # ─── IMPORT COLLECTORS ────────────────────────────────────────────────────────
+          # --- IMPORT COLLECTORS --------------------------------------------------------
           def _iter_target_python_files(scan_root, target_files=None):
               if target_files is not None:
                   for fp in target_files:
@@ -706,7 +706,7 @@ jobs:
                               found.add(node.module.split(".")[0])
               return sorted(found)
 
-          # ─── JS/REACT EXTRACTION (AST via Node.js) ───────────────────────────────
+          # --- JS/REACT EXTRACTION (AST via Node.js) -------------------------------
           def run_js_extractor(scan_root, display_root, manifest_pkgs, target_files=None):
               try:
                   result = subprocess.run(
@@ -727,7 +727,7 @@ jobs:
                   print(f"JS extractor failed: {e}", file=sys.stderr)
                   return {"from_imports": [], "wrappers": []}
 
-          # ─── PYTHON WRAPPER EXTRACTION (AST) ─────────────────────────────────────────
+          # --- PYTHON WRAPPER EXTRACTION (AST) -----------------------------------------
           def _get_call_name(call_node):
               func = call_node.func
               if isinstance(func, ast.Name):
@@ -743,7 +743,7 @@ jobs:
                   return ".".join(reversed(parts))
               return None
 
-          # Known dangerous method names — indicate security-relevant operations
+          # Known dangerous method names � indicate security-relevant operations
           # even when called on LOCAL objects (e.g. cursor.execute, proc.communicate).
           # These catch cases where the AST can't trace variable origin back to a module.
           DANGEROUS_SINK_METHODS = {
@@ -824,7 +824,7 @@ jobs:
                       if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                           continue
 
-                      # ── Pass 1: Track variables derived from imports ──
+                      # -- Pass 1: Track variables derived from imports --
                       import_derived = {}
                       for _pass in range(2):
                           for child in ast.walk(node):
@@ -868,7 +868,7 @@ jobs:
                                               if linked and isinstance(item.optional_vars, ast.Name):
                                                   import_derived[item.optional_vars.id] = linked
 
-                      # ── Pass 2: Collect calls ──────────────────────────
+                      # -- Pass 2: Collect calls --------------------------
                       calls_found = {}
                       for child in ast.walk(node):
                           if isinstance(child, ast.Call):
@@ -915,7 +915,7 @@ jobs:
                           })
               return wrappers
 
-          # ─── ORCHESTRATOR ─────────────────────────────────────────────────────────────
+          # --- ORCHESTRATOR -------------------------------------------------------------
           def _ensure_lang_section(results, lang):
               if lang not in results:
                   results[lang] = {
@@ -1152,19 +1152,19 @@ jobs:
               echo "HTTP status: $HTTP_STATUS"
               cat /tmp/wh-response.txt || true
               if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
-                echo "✅ Wrapper hunter results sent successfully (HTTP $HTTP_STATUS)"
+                echo "? Wrapper hunter results sent successfully (HTTP $HTTP_STATUS)"
                 exit 0
               else
                 RETRY_COUNT=$((RETRY_COUNT + 1))
-                echo "⚠️  Attempt $RETRY_COUNT failed (HTTP $HTTP_STATUS). Retrying in 10s..."
+                echo "??  Attempt $RETRY_COUNT failed (HTTP $HTTP_STATUS). Retrying in 10s..."
                 sleep 10
               fi
             done
             
-            echo "❌ Failed to send wrapper hunter results after $MAX_RETRIES attempts"
+            echo "? Failed to send wrapper hunter results after $MAX_RETRIES attempts"
             exit 1
           else
-            echo "⚠️  No wrapper hunter results file found"
+            echo "??  No wrapper hunter results file found"
           fi
 
       - name: Upload Wrapper Hunter Artifacts
@@ -1287,22 +1287,22 @@ jobs:
                 --max-time 30 \
                 --retry 2 \
                 --retry-delay 5; then
-                echo "✅ Results sent successfully"
+                echo "? Results sent successfully"
                 exit 0
               else
                 RETRY_COUNT=$((RETRY_COUNT + 1))
-                echo "⚠️  Attempt $RETRY_COUNT failed. Retrying..."
+                echo "??  Attempt $RETRY_COUNT failed. Retrying..."
                 sleep 5
               fi
             done
             
-            echo "❌ Failed to send results after $MAX_RETRIES attempts"
+            echo "? Failed to send results after $MAX_RETRIES attempts"
             echo "This usually means your Fixora backend is not publicly accessible."
             echo "For local development, use ngrok or similar to expose your backend."
             echo "Backend URL configured: ${{ secrets.FIXORA_API_URL }}"
             exit 1
           else
-            echo "⚠️  No results file found"
+            echo "??  No results file found"
           fi
 
       - name: Upload Scan Artifacts
@@ -1330,7 +1330,7 @@ class GitHubScanService:
         }
         if self.is_installation_token:
             logger.info("GitHubScanService initialized with installation token")
-    
+
     async def get_repository_info(self, owner: str, repo: str) -> Dict[str, Any]:
         """Get repository information including default branch"""
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1725,7 +1725,7 @@ class GitHubScanService:
         """
         if not rules_yaml or not rules_yaml.strip():
             logger.info("No custom rules to push (empty YAML)")
-            return True  # Not an error — just nothing to push
+            return True  # Not an error � just nothing to push
         
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1818,48 +1818,13 @@ class GitHubScanService:
         base_commit: str = "",
         max_retries: int = 3
     ) -> bool:
-        """Trigger the Wrapper Hunter workflow.
-
-        Strategy:
-        1) Try workflow_dispatch directly against the workflow file (most deterministic).
-        2) Fallback to repository_dispatch for compatibility.
-        """
+        """Trigger the Wrapper Hunter workflow via repository_dispatch."""
         import asyncio
         
         for attempt in range(max_retries):
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
-                    wrapper_workflow_id = WRAPPER_WORKFLOW_FILE_PATH.split("/")[-1]
-                    # Preferred path: explicit workflow_dispatch
-                    dispatch_response = await client.post(
-                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows/{wrapper_workflow_id}/dispatches",
-                        headers=self.headers,
-                        json={
-                            "ref": target_branch,
-                            "inputs": {
-                                "scan_id": scan_id,
-                                "target_branch": target_branch,
-                                "scan_mode": scan_mode or "full",
-                                "base_commit": base_commit or "",
-                            },
-                        }
-                    )
-
-                    if dispatch_response.status_code == 204:
-                        logger.info(
-                            f"Triggered wrapper hunter via workflow_dispatch for {owner}/{repo} "
-                            f"(scan_id: {scan_id}, branch: {target_branch}, mode: {scan_mode})"
-                        )
-                        return True
-                    else:
-                        logger.warning(
-                            "Wrapper workflow_dispatch failed "
-                            f"(attempt {attempt + 1}/{max_retries}): "
-                            f"{dispatch_response.status_code} - {dispatch_response.text}"
-                        )
-
-                    # Fallback: repository_dispatch
-                    fallback_response = await client.post(
+                    response = await client.post(
                         f"{GITHUB_API_URL}/repos/{owner}/{repo}/dispatches",
                         headers=self.headers,
                         json={
@@ -1873,18 +1838,22 @@ class GitHubScanService:
                         },
                     )
 
-                    if fallback_response.status_code == 204:
+                    if response.status_code == 204:
                         logger.info(
                             f"Triggered wrapper hunter via repository_dispatch for {owner}/{repo} "
                             f"(scan_id: {scan_id}, branch: {target_branch}, mode: {scan_mode})"
                         )
                         return True
+                    elif response.status_code == 404:
+                        logger.warning(
+                            f"Wrapper hunter dispatch failed (attempt {attempt + 1}/{max_retries}): {response.text}"
+                        )
+                    else:
+                        logger.error(
+                            f"Failed to trigger wrapper hunter: {response.status_code} - {response.text}"
+                        )
+                        return False
 
-                    logger.warning(
-                        "Wrapper repository_dispatch failed "
-                        f"(attempt {attempt + 1}/{max_retries}): "
-                        f"{fallback_response.status_code} - {fallback_response.text}"
-                    )
                     if attempt < max_retries - 1:
                         await asyncio.sleep(3)
                         continue
@@ -1910,48 +1879,13 @@ class GitHubScanService:
         base_commit: str = "",
         max_retries: int = 3
     ) -> bool:
-        """Trigger the Fixora Semgrep workflow.
-
-        Strategy:
-        1) Try workflow_dispatch directly against the workflow file (most deterministic).
-        2) Fallback to repository_dispatch for compatibility.
-        """
+        """Trigger the Fixora Semgrep workflow via repository_dispatch."""
         import asyncio
         
         for attempt in range(max_retries):
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
-                    semgrep_workflow_id = WORKFLOW_FILE_PATH.split("/")[-1]
-                    # Preferred path: explicit workflow_dispatch
-                    dispatch_response = await client.post(
-                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows/{semgrep_workflow_id}/dispatches",
-                        headers=self.headers,
-                        json={
-                            "ref": target_branch,
-                            "inputs": {
-                                "scan_mode": scan_mode,
-                                "target_branch": target_branch,
-                                "base_commit": base_commit or "",
-                                "scan_id": scan_id,
-                            },
-                        }
-                    )
-
-                    if dispatch_response.status_code == 204:
-                        logger.info(
-                            f"Triggered semgrep workflow via workflow_dispatch for {owner}/{repo} "
-                            f"(scan_id: {scan_id}, branch: {target_branch}, mode: {scan_mode})"
-                        )
-                        return True
-                    else:
-                        logger.warning(
-                            "Semgrep workflow_dispatch failed "
-                            f"(attempt {attempt + 1}/{max_retries}): "
-                            f"{dispatch_response.status_code} - {dispatch_response.text}"
-                        )
-
-                    # Fallback path: repository_dispatch
-                    fallback_response = await client.post(
+                    response = await client.post(
                         f"{GITHUB_API_URL}/repos/{owner}/{repo}/dispatches",
                         headers=self.headers,
                         json={
@@ -1965,18 +1899,17 @@ class GitHubScanService:
                         },
                     )
 
-                    if fallback_response.status_code == 204:
-                        logger.info(
-                            f"Triggered semgrep workflow via repository_dispatch for {owner}/{repo} "
-                            f"(scan_id: {scan_id}, branch: {target_branch}, mode: {scan_mode})"
-                        )
+                    if response.status_code == 204:
+                        logger.info(f"Triggered scan workflow for {owner}/{repo} (scan_id: {scan_id})")
                         return True
+                    elif response.status_code == 404:
+                        logger.warning(
+                            f"Repository dispatch failed (attempt {attempt + 1}/{max_retries}): {response.text}"
+                        )
+                    else:
+                        logger.error(f"Failed to trigger workflow: {response.status_code} - {response.text}")
+                        return False
 
-                    logger.warning(
-                        "Semgrep repository_dispatch failed "
-                        f"(attempt {attempt + 1}/{max_retries}): "
-                        f"{fallback_response.status_code} - {fallback_response.text}"
-                    )
                     if attempt < max_retries - 1:
                         await asyncio.sleep(3)
                         continue
