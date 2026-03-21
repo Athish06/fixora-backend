@@ -1831,6 +1831,78 @@ class GitHubScanService:
         except Exception as e:
             logger.error(f"Error deleting custom rules file: {e}")
             return False
+
+    async def _ensure_workflow_ready(
+        self,
+        owner: str,
+        repo: str,
+        workflow_id: str,
+        max_retries: int = 8,
+        delay_seconds: int = 3,
+    ) -> bool:
+        """Wait until the workflow is indexed and active; enable it if disabled."""
+        import asyncio
+
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.get(
+                        f"{GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows/{workflow_id}",
+                        headers=self.headers,
+                    )
+
+                    if response.status_code == 200:
+                        data = response.json() or {}
+                        state = str(data.get("state") or "").lower()
+                        if state == "active":
+                            return True
+
+                        if state in {"disabled_manually", "disabled_inactivity"}:
+                            enable_response = await client.put(
+                                f"{GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows/{workflow_id}/enable",
+                                headers=self.headers,
+                            )
+                            if enable_response.status_code in (200, 204):
+                                logger.info(
+                                    f"Enabled workflow {workflow_id} for {owner}/{repo}; waiting for activation"
+                                )
+                                await asyncio.sleep(delay_seconds)
+                                continue
+
+                            logger.warning(
+                                f"Failed to enable workflow {workflow_id} for {owner}/{repo}: "
+                                f"{enable_response.status_code} - {enable_response.text}"
+                            )
+
+                        logger.info(
+                            f"Workflow {workflow_id} for {owner}/{repo} state='{state}' "
+                            f"(attempt {attempt + 1}/{max_retries}); waiting"
+                        )
+                        await asyncio.sleep(delay_seconds)
+                        continue
+
+                    if response.status_code == 404:
+                        logger.info(
+                            f"Workflow {workflow_id} not indexed yet for {owner}/{repo} "
+                            f"(attempt {attempt + 1}/{max_retries}); waiting"
+                        )
+                        await asyncio.sleep(delay_seconds)
+                        continue
+
+                    logger.warning(
+                        f"Unexpected workflow readiness response for {owner}/{repo}/{workflow_id}: "
+                        f"{response.status_code} - {response.text}"
+                    )
+                    await asyncio.sleep(delay_seconds)
+
+            except Exception as e:
+                logger.warning(
+                    f"Error checking workflow readiness for {owner}/{repo}/{workflow_id} "
+                    f"(attempt {attempt + 1}/{max_retries}): {e}"
+                )
+                await asyncio.sleep(delay_seconds)
+
+        return False
     
     async def trigger_wrapper_hunter(
         self,
@@ -1844,6 +1916,11 @@ class GitHubScanService:
     ) -> bool:
         """Trigger the Wrapper Hunter workflow via repository_dispatch."""
         import asyncio
+
+        workflow_id = WRAPPER_WORKFLOW_FILE_PATH.split("/")[-1]
+        if not await self._ensure_workflow_ready(owner, repo, workflow_id):
+            logger.error(f"Wrapper workflow {workflow_id} is not ready in {owner}/{repo}")
+            return False
 
         dispatch_ref = await self._get_default_branch(owner, repo)
         effective_target_branch = (target_branch or "").strip() or dispatch_ref
@@ -1915,6 +1992,11 @@ class GitHubScanService:
     ) -> bool:
         """Trigger the Fixora Semgrep workflow via repository_dispatch."""
         import asyncio
+
+        workflow_id = WORKFLOW_FILE_PATH.split("/")[-1]
+        if not await self._ensure_workflow_ready(owner, repo, workflow_id):
+            logger.error(f"Semgrep workflow {workflow_id} is not ready in {owner}/{repo}")
+            return False
 
         dispatch_ref = await self._get_default_branch(owner, repo)
         effective_target_branch = (target_branch or "").strip() or dispatch_ref
