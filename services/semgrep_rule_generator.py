@@ -176,9 +176,33 @@ def _build_wrapper_rule(
     owasp = VULN_TYPE_TO_OWASP.get(vuln_type, [])
 
     wraps_text = ", ".join(calls) if calls else "dangerous sink calls"
+
+    # Dynamic impact mapping used in rich markdown output.
+    impact_map = {
+        "SQL Injection": "Can leak the entire database, bypass authentication, or destroy critical records.",
+        "Command Injection": "Allows an attacker to execute arbitrary OS commands, leading to full server compromise.",
+        "Path Traversal": "Can leak sensitive server files (e.g., /etc/passwd, .env) and application source code.",
+        "XSS": "Can steal user session cookies, hijack accounts, or deface the application.",
+        "IDOR / Broken Access Control": "Allows attackers to view, edit, or delete private data belonging to other users.",
+        "SSRF": "Can force the server to scan internal networks and bypass firewalls.",
+        "Insecure Deserialization": "Can lead to Remote Code Execution (RCE) via malicious payload injection.",
+    }
+    impact_text = impact_map.get(vuln_type, "Can allow attackers to bypass intended application logic.")
+    lang_ext = "python" if lang_key == "python" else "javascript"
+
     message = (
-        f"Vulnerable function '{func_name}()' wraps {wraps_text}. "
-        f"Vulnerability: {vuln_type}. {reason}"
+        f"### [ALERT] {vuln_type} in `{func_name}()`\n\n"
+        f"**Mechanism:**\n"
+        f"This function takes untrusted input and passes it directly into `{wraps_text}` without adequate validation or sanitization.\n\n"
+        f"**Example Exploit:**\n"
+        f"```{lang_ext}\n"
+        f"// An attacker passes a malicious payload into the wrapper:\n"
+        f"{func_name}(malicious_payload)\n"
+        f"```\n\n"
+        f"**Data at Risk (Impact):**\n"
+        f"{impact_text}\n\n"
+        f"**AI Analysis:**\n"
+        f"{reason}"
     )
 
     metadata: Dict[str, Any] = {
