@@ -71,7 +71,7 @@ def _normalize_rule_id_to_vuln_type(rule_id: str) -> str:
         return "XSS"
     if "ssrf" in rule_id:
         return "SSRF"
-    if any(x in rule_id for x in ["deserialization", "pickle", "yaml.load"]):
+    if any(x in rule_id for x in ["deserialization", "pickle", "yaml.load", "xxe", "xml-external-entity", "resolve_entities"]):
         return "Insecure Deserialization"
     if any(x in rule_id for x in ["secret", "hardcoded", "password", "token", "key"]):
         return "Hardcoded Secret"
@@ -765,6 +765,7 @@ async def receive_scan_results(
             description,
             f"Potential {vuln_type} detected. Review data flow and controls.",
         )
+        reason = description
         file_path = result.get("path", "")
         line_number = result.get("start", {}).get("line", 0)
         end_line = result.get("end", {}).get("line", 0)
@@ -787,6 +788,7 @@ async def receive_scan_results(
             "severity": severity,
             "type": vuln_type,
             "category": category,
+            "reason": reason,
             "title": title,
         }
 
@@ -800,6 +802,7 @@ async def receive_scan_results(
                         "category": category,
                         "title": title,
                         "description": description,
+                        "reason": reason,
                         "severity": severity,
                         "file_path": file_path,
                         "line_number": line_number,
@@ -836,6 +839,7 @@ async def receive_scan_results(
             "category": category,
             "title": title,
             "description": description,
+            "reason": reason,
             "severity": severity,
             "file_path": file_path,
             "line_number": line_number,
@@ -904,7 +908,8 @@ async def receive_scan_results(
             "last_scan": datetime.now().isoformat(),
             "vulnerability_count": vuln_count,
             "last_scan_branch": payload.branch,
-            "last_commit_sha": payload.commit_sha
+            "last_commit_sha": payload.commit_sha,
+            "base_commit": payload.commit_sha
         }}
     )
     

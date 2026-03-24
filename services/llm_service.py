@@ -132,7 +132,7 @@ def build_function_chunk_prompt(
         calls        = [str(c) for c in (w.get("calls")        or []) if c is not None]
         modules_used = [str(m) for m in (w.get("modules_used") or []) if m is not None]
         env = w.get("environment", "BACKEND")
-        auth = "YES" if w.get("has_auth_check", True) else "NO (Potential IDOR)"
+        auth = "Present" if w.get("has_auth_check", True) else "None detected"
         func_parts.append(
             f"[{i}] {w.get('function_name', '?')} ({w.get('file', '?')})\n"
             f"    Environment : {env}\n"
@@ -150,7 +150,7 @@ def build_function_chunk_prompt(
         "EXCLUSION RULES (CRITICAL):\n"
         "1. FRONTEND RULE: If 'Environment' is 'BROWSER (Frontend)', it is MATHEMATICALLY IMPOSSIBLE for it to have SQL Injection, Command Injection, or Path Traversal. Ignore generic fetch() or console.log() calls here.\n"
         "2. ORM RULE: Assume Supabase, Prisma, and TypeORM queries are perfectly parameterized by default. Do NOT flag them for SQLi.\n"
-        "3. IDOR CHECK: If the function updates/fetches database records but 'Auth Checks' is 'NO', you MUST flag it as 'IDOR / Broken Access Control'.\n"
+        "3. VULNERABILITY HIERARCHY: If 'Auth Checks' is 'None detected', do NOT blindly flag it as IDOR. You MUST check for Injection first. If you see SQL string concatenation (SQLi), subprocess execution (Command Injection), os.remove/open (Path Traversal), or resolve_entities=True (XXE/Deserialization), you MUST flag the Injection flaw. Injection is always a higher priority than IDOR.\n"
         "4. FORMAT STRINGS: In JavaScript/TypeScript, template literals (e.g., `console.log(`Error: ${err}`)`) are safe. Do NOT flag them as Unsafe Format Strings (this is a C/C++ concept).\n\n"
         "SINK CONTEXT:\n"
         f"Known sink modules: {', '.join(sink_modules) if sink_modules else 'none'}\n"

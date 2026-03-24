@@ -18,6 +18,7 @@ class Repository(BaseModel):
     status: str = 'connected'  # connected, scanning, error
     risk_score: str = 'A'  # A, B, C, D, F
     total_vulnerabilities: int = 0
+    base_commit: Optional[str] = ""
     last_scan: Optional[datetime] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now())
 

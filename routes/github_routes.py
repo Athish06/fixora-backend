@@ -769,6 +769,7 @@ async def connect_github_repos(
                     "source": "github",
                     "risk_score": "N/A",
                     "vulnerability_count": 0,
+                    "base_commit": "",
                     "last_scan": None,
                     "created_at": datetime.now().isoformat()
                 }
@@ -1160,6 +1161,18 @@ async def start_repository_scan(
         except Exception as e:
             logger.warning(f"Failed to refresh secrets (non-critical): {e}")
     
+    # Compute effective base commit for diff mode.
+    # Priority: explicit request base_commit -> repository base_commit -> repository last_commit_sha.
+    effective_base_commit = (scan_request.base_commit or "").strip()
+    if scan_request.scan_mode == "diff" and not effective_base_commit:
+        effective_base_commit = (
+            (repo.get("base_commit") or repo.get("last_commit_sha") or "").strip()
+        )
+        if effective_base_commit:
+            logger.info(
+                f"Using stored repository base_commit for diff scan: {effective_base_commit}"
+            )
+
     # Create scan record
     scan_id = str(uuid.uuid4())
     scan_record = {
@@ -1168,7 +1181,7 @@ async def start_repository_scan(
         "user_id": current_user.user_id,
         "branch": scan_request.branch,
         "scan_mode": scan_request.scan_mode,
-        "base_commit": scan_request.base_commit,
+        "base_commit": effective_base_commit if scan_request.scan_mode == "diff" else "",
         "status": "pending",
         "progress": 0,
         "phase": "wrapper_hunter",
@@ -1205,7 +1218,7 @@ async def start_repository_scan(
             repo=repo_name,
             scan_id=scan_id,
             target_branch=scan_request.branch,
-            base_commit=scan_request.base_commit or ""
+            base_commit=scan_record["base_commit"]
         )
         
         if triggered:
