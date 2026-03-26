@@ -177,7 +177,7 @@ def _build_wrapper_rule(
 
     wraps_text = ", ".join(calls) if calls else "dangerous sink calls"
 
-    # Dynamic impact mapping used in rich markdown output.
+    # 1. Dynamic Impact Mapping
     impact_map = {
         "SQL Injection": "Can leak the entire database, bypass authentication, or destroy critical records.",
         "Command Injection": "Allows an attacker to execute arbitrary OS commands, leading to full server compromise.",
@@ -185,24 +185,49 @@ def _build_wrapper_rule(
         "XSS": "Can steal user session cookies, hijack accounts, or deface the application.",
         "IDOR / Broken Access Control": "Allows attackers to view, edit, or delete private data belonging to other users.",
         "SSRF": "Can force the server to scan internal networks and bypass firewalls.",
-        "Insecure Deserialization": "Can lead to Remote Code Execution (RCE) via malicious payload injection.",
+        "Insecure Deserialization": "Can lead to Remote Code Execution (RCE) via malicious payload injection."
     }
     impact_text = impact_map.get(vuln_type, "Can allow attackers to bypass intended application logic.")
-    lang_ext = "python" if lang_key == "python" else "javascript"
 
+    # 2. Grab the AI's custom exploit
+    ai_exploit = str(wrapper.get("example_exploit", "")).strip()
+    generic_placeholder = (
+        not ai_exploit
+        or "malicious_payload" in ai_exploit.lower()
+        or "user_input" in ai_exploit.lower()
+    )
+    if generic_placeholder:
+        default_exploit_map = {
+            "SQL Injection": "bulk_insert(\"users; DROP TABLE users; --\", data)",
+            "Command Injection": "execute_background_task(\"ping -c 1 127.0.0.1; cat /etc/passwd\")",
+            "Path Traversal": "read_report(\"../../../../etc/passwd\")",
+            "XSS": "render_comment(\"<img src=x onerror=alert(document.cookie)>\")",
+            "SSRF": "fetch_remote(\"http://169.254.169.254/latest/meta-data/\")",
+            "Insecure Deserialization": "load_payload(\"gASV...crafted_pickle...\")",
+            "IDOR / Broken Access Control": "get_invoice(\"another-users-invoice-id\")",
+        }
+        ai_exploit = default_exploit_map.get(vuln_type, "invoke_wrapper(\"crafted attacker input\")")
+
+    if not ai_exploit.startswith("```"):
+        code_lang = "python" if lang_key == "python" else "javascript"
+        ai_exploit = f"```{code_lang}\\n{ai_exploit}\\n```"
+
+    attack_explanation = str(wrapper.get("attack_explanation", "")).strip()
+    if not attack_explanation:
+        attack_explanation = (
+            "The payload reaches the sink without strong validation, so the sink interprets attacker-controlled syntax "
+            "as executable instructions instead of inert data."
+        )
+
+    # 3. The markdown structure
     message = (
-        f"### [ALERT] {vuln_type} in `{func_name}()`\n\n"
-        f"**Mechanism:**\n"
-        f"This function takes untrusted input and passes it directly into `{wraps_text}` without adequate validation or sanitization.\n\n"
-        f"**Example Exploit:**\n"
-        f"```{lang_ext}\n"
-        f"// An attacker passes a malicious payload into the wrapper:\n"
-        f"{func_name}(malicious_payload)\n"
-        f"```\n\n"
-        f"**Data at Risk (Impact):**\n"
-        f"{impact_text}\n\n"
-        f"**AI Analysis:**\n"
-        f"{reason}"
+        f"### Alert: {vuln_type} in `{func_name}()`\n\n"
+        f"**Mechanism:**\nThis function takes untrusted input and passes it directly into `{wraps_text}` without adequate validation or sanitization.\n\n"
+        f"**Example Attack Vector:**\n"
+        f"{ai_exploit}\n\n"
+        f"**How The Attack Works:**\n{attack_explanation}\n\n"
+        f"**Data at Risk (Impact):**\n{impact_text}\n\n"
+        f"**AI Analysis:**\n{reason}"
     )
 
     metadata: Dict[str, Any] = {

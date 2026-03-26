@@ -58,6 +58,8 @@ _PLACEHOLDER_TEXT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+_PLACEHOLDER_SNIPPET_RE = re.compile(r"^\s*requires\s+log(?:in|n)\s*$", flags=re.IGNORECASE)
+
 
 def _normalize_rule_id_to_vuln_type(rule_id: str) -> str:
     """Strict taxonomy normalizer driven by Semgrep check_id."""
@@ -88,6 +90,13 @@ def _clean_placeholder_text(value: str, fallback: str) -> str:
     text = str(value or "").strip()
     if not text or _PLACEHOLDER_TEXT_RE.search(text):
         return fallback
+    return text
+
+
+def _clean_code_snippet(value: str) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text or _PLACEHOLDER_SNIPPET_RE.match(text):
+        return None
     return text
 
 @router.get('/{scan_id}', response_model=ScanResult)
@@ -752,15 +761,42 @@ async def receive_scan_results(
         }
         severity = severity_map.get(severity, "medium")
         
-        # Strict taxonomy normalization from Semgrep check_id
+        # Extract vulnerability type from rule_id or metadata
         rule_id = result.get("check_id", "").lower()
         metadata = extra.get("metadata", {})
 
-        vuln_type = _normalize_rule_id_to_vuln_type(rule_id)
+        # Trust exact AI classification for custom rules.
+        if "fixora-wrapper" in rule_id or "fixora-manual" in rule_id:
+            vuln_type = metadata.get("vulnerability_type", "Security Issue")
+        else:
+            if "xss" in rule_id:
+                vuln_type = "XSS"
+            elif "sql-injection" in rule_id or "sqli" in rule_id:
+                vuln_type = "SQL Injection"
+            elif "command-injection" in rule_id:
+                vuln_type = "Command Injection"
+            elif "path-traversal" in rule_id:
+                vuln_type = "Path Traversal"
+            elif "ssrf" in rule_id:
+                vuln_type = "SSRF"
+            elif "hardcoded" in rule_id or "secret" in rule_id:
+                vuln_type = "Hardcoded Secret"
+            elif "csrf" in rule_id:
+                vuln_type = "CSRF"
+            elif "open-redirect" in rule_id:
+                vuln_type = "Open Redirect"
+            elif "insecure" in rule_id:
+                vuln_type = "Security Misconfiguration"
+            else:
+                vuln_type = rule_id.split(".")[-1].replace("-", " ").title()
+
+        if vuln_type not in VULN_TYPE_TO_CATEGORY:
+            vuln_type = _normalize_rule_id_to_vuln_type(vuln_type)
         category = VULN_TYPE_TO_CATEGORY.get(vuln_type, "Business Logic Flaws")
 
         # Clean weird placeholders from Semgrep description text
-        description = extra.get("message", "No description available").replace("requires login", "").strip()
+        raw_description = str(extra.get("message", "No description available") or "")
+        description = re.sub(r"requires\s+log(?:in|n)", "", raw_description, flags=re.IGNORECASE).strip()
         description = _clean_placeholder_text(
             description,
             f"Potential {vuln_type} detected. Review data flow and controls.",
@@ -807,7 +843,7 @@ async def receive_scan_results(
                         "file_path": file_path,
                         "line_number": line_number,
                         "end_line": end_line,
-                        "code_snippet": extra.get("lines", ""),
+                        "code_snippet": _clean_code_snippet(extra.get("lines", "")),
                         "rule_id": rule_id,
                         "cwe": metadata.get("cwe", []),
                         "owasp": metadata.get("owasp", []),
@@ -844,7 +880,7 @@ async def receive_scan_results(
             "file_path": file_path,
             "line_number": line_number,
             "end_line": end_line,
-            "code_snippet": extra.get("lines", ""),
+            "code_snippet": _clean_code_snippet(extra.get("lines", "")),
             "rule_id": rule_id,
             "cwe": metadata.get("cwe", []),
             "owasp": metadata.get("owasp", []),
