@@ -19,7 +19,11 @@ from schemas.scan import ScanResult
 from services.activity_service import log_activity
 from services.websocket_manager import get_connection_manager
 from services.github_scan_service import GitHubScanService
-from services.llm_service import analyze_wrappers_with_llm
+from services.llm_service import (
+    analyze_wrappers_with_llm,
+    build_module_sink_prompt,
+    build_function_chunk_prompt,
+)
 from services.semgrep_rule_generator import generate_custom_rules, count_generated_rules
 
 router = APIRouter(prefix='/scan', tags=['Scans'])
@@ -398,9 +402,42 @@ async def _store_ai_debug(
     try:
         import json as _json
 
-        # Prompts are now built per-chunk in the 2-phase flow (build_module_sink_prompt /
-        # build_function_chunk_prompt) — no single combined prompt to store here.
-        llm_prompt = "(2-phase analysis: module-sink prompt + per-chunk function prompts)"
+        # Build detailed prompt snapshots for AI debug view.
+        prompt_sections: List[str] = []
+        if isinstance(wrapper_data, dict):
+            wd_results = wrapper_data.get("results", {}) or {}
+            llm_results = (llm_result or {}).get("results", {}) or {}
+
+            for lang_key, env_data in wd_results.items():
+                modules = (env_data or {}).get("modules", {}) or {}
+                wrappers = (env_data or {}).get("wrapper_functions", []) or []
+
+                sink_info = (llm_results.get(lang_key, {}) or {}).get("modules", {}) or {}
+                sink_modules = sink_info.get("sink_modules", []) or []
+                sink_reason = sink_info.get("reason", "") or ""
+
+                prompt_sections.append(f"=== {lang_key.upper()} : PHASE 1 MODULE-SINK PROMPT ===")
+                try:
+                    prompt_sections.append(build_module_sink_prompt(lang_key, modules))
+                except Exception as exc:
+                    prompt_sections.append(f"(Failed to build phase-1 prompt snapshot: {exc})")
+
+                prompt_sections.append(f"=== {lang_key.upper()} : PHASE 2 FUNCTION-CHUNK PROMPT (SAMPLE) ===")
+                try:
+                    sample_wrappers = wrappers[:2]
+                    prompt_sections.append(
+                        build_function_chunk_prompt(
+                            lang_key=lang_key,
+                            modules=modules,
+                            sink_modules=sink_modules,
+                            sink_reason=sink_reason,
+                            wrappers=sample_wrappers,
+                        )
+                    )
+                except Exception as exc:
+                    prompt_sections.append(f"(Failed to build phase-2 prompt snapshot: {exc})")
+
+        llm_prompt = "\n\n".join(prompt_sections).strip() or "(No prompt snapshot available for this scan)"
 
         # Extract failed chunk details and manual review items for dedicated storage
         failed_chunks = []
