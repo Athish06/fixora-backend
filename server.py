@@ -3,8 +3,10 @@ from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
+import asyncio
 
 from config import get_settings, Database
+from routes.scan_routes import fail_timed_out_scans
 from routes import (
     auth_router,
     repository_router,
@@ -30,9 +32,29 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     # Startup
     await Database.connect_db()
+
+    watchdog_task = None
+
+    async def _scan_timeout_watchdog():
+        while True:
+            try:
+                modified = await fail_timed_out_scans(Database.get_db(), timeout_minutes=30)
+                if modified:
+                    logger.warning(f'Scan timeout watchdog marked {modified} stale scan(s) as failed')
+            except Exception as exc:
+                logger.error(f'Scan timeout watchdog error: {exc}')
+            await asyncio.sleep(60)
+
+    watchdog_task = asyncio.create_task(_scan_timeout_watchdog())
     logger.info('Application started')
     yield
     # Shutdown
+    if watchdog_task:
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
     await Database.close_db()
     logger.info('Application shutdown')
 

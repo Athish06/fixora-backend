@@ -10,7 +10,7 @@ import base64
 import json
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from config.database import get_database
 from config.settings import get_settings
 from middleware.auth import get_current_user
@@ -102,6 +102,31 @@ def _clean_code_snippet(value: str) -> Optional[str]:
     if not text or _PLACEHOLDER_SNIPPET_RE.match(text):
         return None
     return text
+
+
+async def fail_timed_out_scans(db, timeout_minutes: int = 30) -> int:
+    """Mark long-running scans as failed if they exceed the timeout window."""
+    cutoff = datetime.now() - timedelta(minutes=timeout_minutes)
+    cutoff_iso = cutoff.isoformat()
+
+    result = await db.scans.update_many(
+        {
+            "status": {"$in": ["pending", "running"]},
+            "$or": [
+                {"started_at": {"$lte": cutoff_iso}},
+                {"created_at": {"$lte": cutoff_iso}},
+            ],
+        },
+        {
+            "$set": {
+                "status": "failed",
+                "error": "Scan timed out",
+                "phase": "timeout",
+                "completed_at": datetime.now().isoformat(),
+            }
+        },
+    )
+    return int(result.modified_count or 0)
 
 @router.get('/{scan_id}', response_model=ScanResult)
 async def get_scan_status(
@@ -199,10 +224,10 @@ async def receive_wrapper_hunter_results(
         logger.error(f"Invalid token: {str(e)}")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
     
-    # Get the scan record
-    scan = await db.scans.find_one({"id": payload.scan_id})
+    # Get the scan record scoped to token-authorized repository
+    scan = await db.scans.find_one({"id": payload.scan_id, "repository_id": repo_id})
     if not scan:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found or access denied")
     
     # ===== LOG WRAPPER HUNTER RESULTS =====
     logger.info("=" * 80)
@@ -266,8 +291,39 @@ async def _process_wrapper_results_in_background(
     """
     import json as json_module
     ws_manager = get_connection_manager()
+    stage = "llm_analysis"
+    llm_result = None
+    custom_rules_yaml = ""
 
     try:
+        if isinstance(wrapper_data, dict) and wrapper_data.get("error_type") == "repo_too_large":
+            limit_details = wrapper_data.get("limit_details") or []
+            detail_msg = "; ".join(
+                d.get("reason", "limit exceeded") for d in limit_details if isinstance(d, dict)
+            )
+            fail_msg = "Repository exceeds wrapper-hunter safety limits."
+            if detail_msg:
+                fail_msg = f"{fail_msg} {detail_msg}"
+
+            await db.scans.update_one(
+                {"id": scan_id},
+                {
+                    "$set": {
+                        "status": "failed",
+                        "phase": "failed_wrapper_hunter_limits",
+                        "error_message": fail_msg,
+                        "completed_at": datetime.utcnow(),
+                    }
+                },
+            )
+            await ws_manager.send_to_scan(scan_id, {
+                "type": "scan_failed",
+                "scan_id": scan_id,
+                "message": fail_msg,
+            })
+            logger.warning(f"[BG] Aborting scan {scan_id}: {fail_msg}")
+            return
+
         # ── LLM ANALYSIS ──────────────────────────────────────────────────────
         logger.info(f"[BG] Starting LLM analysis for scan {scan_id}")
         await ws_manager.send_to_scan(scan_id, {
@@ -330,6 +386,7 @@ async def _process_wrapper_results_in_background(
                 "custom_rules_yaml": custom_rules_yaml,
             }}
         )
+        stage = "store_ai_debug"
 
         # Build chunk summary for WebSocket
         failed_count = chunk_meta["failed"] if chunk_meta else 0
@@ -363,6 +420,7 @@ async def _process_wrapper_results_in_background(
             custom_rules_yaml, vuln_wrapper_count, sink_module_count, rules_count, db,
             chunk_meta=chunk_meta
         )
+        stage = "trigger_semgrep"
 
         # ── TRIGGER SEMGREP ──────────────────────────────────────────────────
         await _trigger_semgrep_after_wrapper_analysis(
@@ -372,14 +430,25 @@ async def _process_wrapper_results_in_background(
 
     except Exception as exc:
         logger.error(f"[BG] Error processing wrapper results for scan {scan_id}: {exc}")
+        failure_update = {
+            "status": "failed",
+            "error": str(exc),
+            "phase": f"failed_{stage}",
+            "completed_at": datetime.now().isoformat(),
+        }
+        if llm_result is not None:
+            failure_update["llm_result"] = llm_result
+        if custom_rules_yaml:
+            failure_update["custom_rules_yaml"] = custom_rules_yaml
+
         await db.scans.update_one(
             {"id": scan_id},
-            {"$set": {"status": "failed", "error": str(exc)}}
+            {"$set": failure_update}
         )
         await ws_manager.send_to_scan(scan_id, {
             "type": "scan_failed",
             "scan_id": scan_id,
-            "message": f"Error during AI analysis: {str(exc)}"
+            "message": f"Error during {stage}: {str(exc)}"
         })
 
 
@@ -712,14 +781,14 @@ async def receive_scan_results(
             detail="Invalid token"
         )
     
-    # Get the scan record
-    scan = await db.scans.find_one({"id": payload.scan_id})
+    # Get the scan record scoped to token-authorized repository
+    scan = await db.scans.find_one({"id": payload.scan_id, "repository_id": repo_id})
     
     if not scan:
         logger.warning(f"Scan not found: {payload.scan_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Scan not found"
+            detail="Scan not found or access denied"
         )
     
     logger.info(f"Processing scan results for {payload.scan_id} - Repository: {payload.repository}, Branch: {payload.branch}")

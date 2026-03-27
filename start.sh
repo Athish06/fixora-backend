@@ -7,4 +7,4 @@ PORT=${PORT:-8000}
 echo "Starting Fixora API on 0.0.0.0:$PORT"
 
 # Start uvicorn with production settings
-uvicorn server:app --host 0.0.0.0 --port $PORT --workers 2
+uvicorn server:app --host 0.0.0.0 --port $PORT --workers 1

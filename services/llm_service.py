@@ -6,6 +6,11 @@ import os
 from typing import Dict, Any, Optional
 from config.settings import get_settings
 
+try:
+    import tiktoken
+except Exception:  # pragma: no cover
+    tiktoken = None
+
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
@@ -304,6 +309,29 @@ PROMPT_OVERHEAD_TOKENS = 600
 # chunking behavior.
 FUNCTION_BUDGET_PER_CHUNK = EFFECTIVE_TPM - PROMPT_OVERHEAD_TOKENS
 
+# Hard upper bound for repository size at analysis stage.
+# If wrapper extraction would generate too many chunks, fail fast so scans
+# terminate cleanly instead of running for a very long time.
+MAX_PHASE2_CHUNKS = int(os.getenv("GROQ_MAX_PHASE2_CHUNKS", "120"))
+
+_TOKEN_ENCODER = None
+if tiktoken is not None:
+    try:
+        _TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        _TOKEN_ENCODER = None
+
+
+def _estimate_text_tokens(text: str) -> int:
+    """Estimate token count using cl100k_base when available."""
+    if _TOKEN_ENCODER is not None:
+        try:
+            return len(_TOKEN_ENCODER.encode(text or ""))
+        except Exception:
+            pass
+    # Fallback heuristic if tokenizer unavailable at runtime.
+    return max(1, len(text or "") // 4)
+
 
 def _estimate_function_tokens(func: dict) -> int:
     """
@@ -311,8 +339,7 @@ def _estimate_function_tokens(func: dict) -> int:
     prompt.  Uses the same truncation cap (SOURCE_CODE_CHAR_LIMIT) so the
     estimate reflects what will actually be sent.
 
-    Adds a +30 token overhead per function for template formatting (brackets,
-    labels, whitespace).
+    Uses real tokenization via cl100k_base when available.
     """
     src = (func.get("source_code") or "")[:SOURCE_CODE_CHAR_LIMIT]
     calls = [str(c) for c in (func.get("calls") or []) if c is not None]
@@ -326,7 +353,7 @@ def _estimate_function_tokens(func: dict) -> int:
         ", ".join(mods),
         src,
     ])
-    return max(1, len(text) // 4) + 30  # +30 for per-function prompt formatting
+    return _estimate_text_tokens(text)
 
 
 def _build_dynamic_chunks(all_wrappers: list) -> list:
@@ -473,6 +500,13 @@ async def analyze_wrappers_with_llm(
     # Total calls = 1 Phase 1 per language-with-wrappers + all Phase 2 chunks
     langs_with_wrappers = list(chunks_by_lang.keys())
     total_calls = len(langs_with_wrappers) + total_phase2_chunks
+
+    if total_phase2_chunks > MAX_PHASE2_CHUNKS:
+        raise ValueError(
+            "Repository too large to scan: "
+            f"estimated {total_phase2_chunks} analysis chunks exceeds limit "
+            f"({MAX_PHASE2_CHUNKS})."
+        )
 
     if total_phase2_chunks == 0:
         final_merged_result["analysis_summary"] = "No wrapper functions to analyse."
@@ -796,7 +830,7 @@ async def _call_groq_module_phase(
     # Module-only prompts are very small — rough estimate
     estimated_tokens = max(
         200,
-        len(prompt) // 4 + 100,
+        _estimate_text_tokens(prompt),
     )
     context_payload = {"language": lang_key, "results": {lang_key: {"modules": modules}}}
 
@@ -1154,6 +1188,8 @@ def _repair_truncated_json(text: str) -> Optional[Dict]:
         result = json.loads(t)
         if isinstance(result, dict):
             logger.warning(f"Repaired truncated JSON (closed {len(opens)} bracket(s))")
+            result["_truncated"] = True
+            result["_repair_warning"] = "JSON was truncated and repaired - analysis may be incomplete"
             return result
     except json.JSONDecodeError:
         pass

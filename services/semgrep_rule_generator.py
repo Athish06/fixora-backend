@@ -245,21 +245,56 @@ def _build_wrapper_rule(
     if owasp:
         metadata["owasp"] = owasp
 
-    # ── Build language-specific patterns matching the DEFINITION, not calls ──
+    def _safe_ident(name: str) -> bool:
+        return bool(name) and name.replace("_", "a").isalnum() and not name[0].isdigit()
+
+    # Build sink call patterns from wrapper call metadata.
+    sink_patterns: List[Dict[str, str]] = []
+    seen_sink = set()
+    for raw_call in calls or []:
+        call = str(raw_call or "").strip().replace("()", "")
+        if not call:
+            continue
+        exact = f"{call}(...)"
+        if exact not in seen_sink:
+            sink_patterns.append({"pattern": exact})
+            seen_sink.add(exact)
+
+        method = call.split(".")[-1]
+        if _safe_ident(method):
+            wildcard = f"$OBJ.{method}(...)"
+            if wildcard not in seen_sink:
+                sink_patterns.append({"pattern": wildcard})
+                seen_sink.add(wildcard)
+            direct = f"{method}(...)"
+            if direct not in seen_sink:
+                sink_patterns.append({"pattern": direct})
+                seen_sink.add(direct)
+
+    # ── Build language-specific patterns ──
     # Any non-python key (react, javascript, node, etc.) uses JS patterns.
     if lang_key == "python":
-        rule: Dict[str, Any] = {
-            "id": rule_id,
-            # Match the function definition itself so Semgrep flags
-            # the vulnerable code block even for framework endpoints
-            # (FastAPI routes, Django views, etc.) that are never
-            # called explicitly in user code.
-            "pattern": f"def {func_name}(...):\n  ...",
-            "message": message,
-            "severity": semgrep_severity,
-            "languages": ["python"],
-            "metadata": metadata,
-        }
+        if sink_patterns:
+            rule = {
+                "id": rule_id,
+                "patterns": [
+                    {"pattern-inside": f"def {func_name}(...):\n  ..."},
+                    {"pattern-either": sink_patterns},
+                ],
+                "message": message,
+                "severity": semgrep_severity,
+                "languages": ["python"],
+                "metadata": metadata,
+            }
+        else:
+            rule = {
+                "id": rule_id,
+                "pattern": f"def {func_name}(...):\n  ...",
+                "message": message,
+                "severity": semgrep_severity,
+                "languages": ["python"],
+                "metadata": metadata,
+            }
     else:
         # JavaScript / TypeScript — build patterns based on whether the name
         # is a plain identifier or a dotted path (e.g. module.exports.userSearch).
@@ -273,10 +308,10 @@ def _build_wrapper_rule(
         clean_name = func_name.replace("()", "").strip()
         is_dotted = "." in clean_name
 
-        patterns = []
+        def_patterns = []
         if not is_dotted:
             # Simple identifier — all forms are valid JS
-            patterns += [
+            def_patterns += [
                 {"pattern": f"function {clean_name}(...) {{ ... }}"},
                 {"pattern": f"const {clean_name} = (...) => {{ ... }}"},
                 {"pattern": f"let {clean_name} = (...) => {{ ... }}"},
@@ -289,19 +324,32 @@ def _build_wrapper_rule(
             ]
         # Assignment patterns work for ANY name form, including dotted paths
         # like module.exports.userSearch = function(req, res) { ... }
-        patterns += [
+        def_patterns += [
             {"pattern": f"{clean_name} = (...) => {{ ... }}"},
             {"pattern": f"{clean_name} = function(...) {{ ... }}"},
         ]
 
-        rule: Dict[str, Any] = {
-            "id": rule_id,
-            "pattern-either": patterns,
-            "message": message,
-            "severity": semgrep_severity,
-            "languages": ["javascript", "typescript"],
-            "metadata": metadata,
-        }
+        if sink_patterns:
+            rule = {
+                "id": rule_id,
+                "patterns": [
+                    {"pattern-either": def_patterns},
+                    {"pattern-either": sink_patterns},
+                ],
+                "message": message,
+                "severity": semgrep_severity,
+                "languages": ["javascript", "typescript"],
+                "metadata": metadata,
+            }
+        else:
+            rule = {
+                "id": rule_id,
+                "pattern-either": def_patterns,
+                "message": message,
+                "severity": semgrep_severity,
+                "languages": ["javascript", "typescript"],
+                "metadata": metadata,
+            }
 
     return rule
 

@@ -70,30 +70,51 @@ jobs:
           ]);
           const JS_EXTS = new Set(['.js','.jsx','.ts','.tsx','.mjs','.cjs']);
           const FRONTEND_IMPORTS = new Set(['react','vue','next','solid-js']);
+          const MAX_JS_FILES = 2500;
+          const MAX_JS_FILE_BYTES = 1024 * 1024;
+          const MAX_JS_WRAPPERS = 3000;
 
           const DANGEROUS_GLOBALS = new Set([
+              // Code Execution
               'eval','Function','setTimeout','setInterval','setImmediate',
+              // SSRF / Network Requests
+              'fetch', 'XMLHttpRequest'
           ]);
+
           const DANGEROUS_SINK_METHODS = new Set([
+              // Database / NoSQL
               'query','execute','exec','aggregate','raw',
               'find','findOne','findById','findOneAndUpdate','findOneAndDelete',
               'deleteOne','deleteMany','updateOne','updateMany','insertOne','insertMany',
               'replaceOne','bulkWrite','distinct','countDocuments',
+              // OS / Command execution
               'execSync','spawn','spawnSync','execFile','execFileSync','fork',
-              'write','writeln','insertAdjacentHTML',
-              'deserialize','unserialize',
+              // File System / Path Traversal
+              'readFile','readFileSync','writeFile','writeFileSync','appendFile',
+              'unlink','unlinkSync','rm','rmdir','mkdir',
+              // SSRF / Network Requests
+              'get','post','put','patch','request','send',
+              // XSS / DOM Manipulation
+              'write','writeln','insertAdjacentHTML','dangerouslySetInnerHTML',
+              // Deserialization & XML/XXE
+              'deserialize','unserialize','parse','parseString','load'
           ]);
 
           function walkDir(dir, cb) {
               let entries;
               try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
-              catch(e) { return; }
+              catch(e) { return true; }
               for (const ent of entries) {
                   if (ent.isDirectory() && !IGNORE_DIRS.has(ent.name))
-                      walkDir(path.join(dir, ent.name), cb);
+                      {
+                          if (walkDir(path.join(dir, ent.name), cb) === false) return false;
+                      }
                   else if (ent.isFile() && JS_EXTS.has(path.extname(ent.name)))
-                      cb(path.join(dir, ent.name));
+                      {
+                          if (cb(path.join(dir, ent.name)) === false) return false;
+                      }
               }
+              return true;
           }
 
           function parseFile(fp, src) {
@@ -308,17 +329,44 @@ jobs:
           const targetFiles = JSON.parse(process.argv[5] || '[]');
           const allImports = new Set();
           const allWrappers = [];
+          let scannedJsFiles = 0;
+          let skippedLargeJsFiles = 0;
+          let limitExceeded = false;
+          let limitReason = '';
 
           function parseAndCollect(fp) {
+              if (limitExceeded) return false;
+              if (scannedJsFiles >= MAX_JS_FILES) {
+                  limitExceeded = true;
+                  limitReason = `JS file limit exceeded (${MAX_JS_FILES})`;
+                  return false;
+              }
+              let stat;
+              try { stat = fs.statSync(fp); } catch(e) { return true; }
+              if (!stat || !stat.isFile()) return true;
+              if (stat.size > MAX_JS_FILE_BYTES) {
+                  skippedLargeJsFiles += 1;
+                  return true;
+              }
+
               let src;
               try { src = fs.readFileSync(fp, 'utf8'); } catch(e) { return; }
+              scannedJsFiles += 1;
               const ast = parseFile(fp, src);
-              if (!ast || !ast.program) return;
+              if (!ast || !ast.program) return true;
               const rel = path.relative(displayRoot, fp);
               const { imports, alias } = collectImports(ast.program.body);
               imports.forEach(i => allImports.add(i));
               const wrappers = extractFile(ast, src, rel, alias, imports);
-              allWrappers.push(...wrappers);
+              for (const w of wrappers) {
+                  if (allWrappers.length >= MAX_JS_WRAPPERS) {
+                      limitExceeded = true;
+                      limitReason = `JS wrapper limit exceeded (${MAX_JS_WRAPPERS})`;
+                      return false;
+                  }
+                  allWrappers.push(w);
+              }
+              return true;
           }
 
           if (Array.isArray(targetFiles) && targetFiles.length > 0) {
@@ -328,16 +376,23 @@ jobs:
                   const ext = path.extname(fp).toLowerCase();
                   if (!JS_EXTS.has(ext)) continue;
                   if (!fs.existsSync(fp)) continue;
-                  parseAndCollect(fp);
+                  if (parseAndCollect(fp) === false) break;
               }
           } else {
-              walkDir(scanRoot, (fp) => {
-                  parseAndCollect(fp);
-              });
+              walkDir(scanRoot, (fp) => parseAndCollect(fp));
           }
           process.stdout.write(JSON.stringify({
               from_imports: [...allImports].sort(),
               wrappers: allWrappers,
+              limit_exceeded: limitExceeded,
+              limit_reason: limitReason,
+              limits: {
+                  scanned_files: scannedJsFiles,
+                  skipped_large_files: skippedLargeJsFiles,
+                  max_files: MAX_JS_FILES,
+                  max_file_bytes: MAX_JS_FILE_BYTES,
+                  max_wrappers: MAX_JS_WRAPPERS,
+              },
           }));
           JS_EXTRACTOR_SCRIPT
 
@@ -356,6 +411,11 @@ jobs:
               "coverage", ".tox", "egg-info", ".eggs", "site-packages",
               ".github", ".vscode",
           }
+
+          MAX_PY_FILES_PER_TARGET = 2500
+          MAX_PY_FILE_BYTES = 1024 * 1024
+          MAX_PY_WRAPPERS_PER_TARGET = 3000
+          MAX_TOTAL_WRAPPERS = 6000
 
           # ─── TARGET ORCHESTRATOR (multi-language monorepo aware) ───────────────────
           SOURCE_DIR_CANDIDATES = ("src", "lib", "app")
@@ -632,10 +692,40 @@ jobs:
           def detect_environment(filepath):
               return "BACKEND (Python)"
 
-          def _iter_target_python_files(scan_root, target_files=None):
+          def _iter_target_python_files(scan_root, target_files=None, limit_state=None):
+              scanned = 0
+
+              def _mark_exceeded(reason):
+                  if limit_state is not None and not limit_state.get("exceeded"):
+                      limit_state["exceeded"] = True
+                      limit_state["reason"] = reason
+
+              def _consider_file(fp):
+                  nonlocal scanned
+                  if scanned >= MAX_PY_FILES_PER_TARGET:
+                      _mark_exceeded(f"Python file limit exceeded ({MAX_PY_FILES_PER_TARGET})")
+                      return None
+                  try:
+                      size = os.path.getsize(fp)
+                  except Exception:
+                      return False
+                  if size > MAX_PY_FILE_BYTES:
+                      if limit_state is not None:
+                          limit_state["skipped_large_files"] = limit_state.get("skipped_large_files", 0) + 1
+                      return False
+                  scanned += 1
+                  if limit_state is not None:
+                      limit_state["scanned_files"] = scanned
+                  return True
+
               if target_files is not None:
                   for fp in target_files:
                       if fp.endswith(".py") and os.path.isfile(fp):
+                          state = _consider_file(fp)
+                          if state is None:
+                              break
+                          if state is False:
+                              continue
                           yield fp
                   return
 
@@ -643,12 +733,18 @@ jobs:
                   dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
                   for fn in filenames:
                       if fn.endswith(".py"):
-                          yield os.path.join(dirpath, fn)
+                          fp = os.path.join(dirpath, fn)
+                          state = _consider_file(fp)
+                          if state is None:
+                              return
+                          if state is False:
+                              continue
+                          yield fp
 
-          def collect_python_imports(scan_root, target_files=None):
+          def collect_python_imports(scan_root, target_files=None, limit_state=None):
               # Walk .py files in scope; collect every top-level module name imported
               found = set()
-              for fp in _iter_target_python_files(scan_root, target_files=target_files):
+              for fp in _iter_target_python_files(scan_root, target_files=target_files, limit_state=limit_state):
                   try:
                       with open(fp, "r", errors="ignore") as f:
                           source = f.read()
@@ -703,21 +799,28 @@ jobs:
               return None
 
           # Known dangerous method names — indicate security-relevant operations
-          # even when called on LOCAL objects (e.g. cursor.execute, proc.communicate).
-          # These catch cases where the AST can't trace variable origin back to a module.
           DANGEROUS_SINK_METHODS = {
-              # Database / SQL
-              "execute", "executemany", "executescript", "mogrify", "callproc",
-              "raw", "extra",
+              # Relational Database / SQL
+              "execute", "executemany", "executescript", "mogrify", "callproc", "raw", "extra",
+              # NoSQL (MongoDB / CouchDB)
+              "find", "find_one", "aggregate", "insert", "update", "delete_many", "update_one",
               # OS / Command execution
-              "system", "popen",
+              "system", "popen", "run", "call", "check_output", "spawn", "fork", "communicate",
               # Request / SSRF
-              "urlopen", "urlretrieve",
-              # Deserialization (when on unknown objects)
-              "loads", "load",
+              "urlopen", "urlretrieve", "request", "get", "post", "put", "patch",
+              # Deserialization & XXE (XML)
+              "loads", "load", "fromstring", "parse", "XMLParser", "XML", "unpickle", "yaml_load",
+              # File System (Path Traversal / Deletion)
+              "remove", "unlink", "rmdir", "rename", "replace", "mkdir", "makedirs",
+              # PDF / Rendering (XSS)
+              "drawString", "render", "render_template", "Template",
+              # Crypto / Hashing (Weak Crypto)
+              "md5", "sha1", "Cipher", "encrypt", "decrypt",
+              # LDAP & XPath
+              "search_s", "xpath"
           }
 
-          def extract_python_wrappers(scan_root, all_modules, display_root, target_files=None):
+          def extract_python_wrappers(scan_root, all_modules, display_root, target_files=None, limit_state=None):
               # Find every function that:
               #   1. Calls any module from all_modules (existing), OR
               #   2. Calls a method on a variable derived from an imported module
@@ -725,8 +828,9 @@ jobs:
               #   3. Calls a known dangerous method on ANY object (fallback)
               wrappers = []
               target = set(all_modules)
-              dangerous_builtins = {"eval", "exec", "__import__", "compile", "open", "globals", "locals"}
-              for fp in _iter_target_python_files(scan_root, target_files=target_files):
+              dangerous_builtins = {"eval", "exec", "__import__", "compile", "open", "globals", "locals", "getattr", "setattr"}
+              reached_wrapper_limit = False
+              for fp in _iter_target_python_files(scan_root, target_files=target_files, limit_state=limit_state):
                   fn = os.path.basename(fp)
                   if not fn.endswith(".py"):
                       continue
@@ -752,6 +856,14 @@ jobs:
                   rel = os.path.relpath(fp, display_root).replace("\\\\", "/")
                   for node in ast.walk(tree):
                       if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                          if len(wrappers) >= MAX_PY_WRAPPERS_PER_TARGET:
+                              reached_wrapper_limit = True
+                              if limit_state is not None and not limit_state.get("exceeded"):
+                                  limit_state["exceeded"] = True
+                                  limit_state["reason"] = (
+                                      f"Python wrapper limit exceeded ({MAX_PY_WRAPPERS_PER_TARGET})"
+                                  )
+                              break
                           # ── Pass 1: Track variables derived from imports ──
                           # Handles chains like:
                           #   conn = sqlite3.connect(...)   → conn linked to sqlite3
@@ -847,6 +959,8 @@ jobs:
                                   "modules_used": list(set(calls_found.values())),
                                   "source_code": func_src,
                               })
+                  if reached_wrapper_limit:
+                      break
               return wrappers
 
           # ─── ORCHESTRATOR ─────────────────────────────────────────────────────────────
@@ -915,6 +1029,8 @@ jobs:
               results = {}
               scan_targets = []
               wrapper_seen = {"python": set(), "react": set()}
+              repo_limit_errors = []
+              total_wrappers = 0
 
               for t in targets:
                   lang = t["language"]
@@ -923,6 +1039,8 @@ jobs:
                   changed_for_target = _target_changed_files(changed_files_abs, scan_abs, lang)
 
                   if lang == "python":
+                      import_limit_state = {}
+                      wrapper_limit_state = {}
                       manifest_pkgs = sorted(set(
                           parse_requirements_txt(root_abs)
                           + parse_setup_py(root_abs)
@@ -932,6 +1050,7 @@ jobs:
                       import_mods = collect_python_imports(
                           scan_abs,
                           target_files=(changed_for_target if changed_files_abs else None),
+                          limit_state=import_limit_state,
                       )
                       all_modules = sorted(set(manifest_pkgs) | set(import_mods))
                       wrappers = extract_python_wrappers(
@@ -939,7 +1058,20 @@ jobs:
                           all_modules,
                           repo_root,
                           target_files=(changed_for_target if changed_files_abs else None),
+                          limit_state=wrapper_limit_state,
                       )
+                      if import_limit_state.get("exceeded"):
+                          repo_limit_errors.append({
+                              "language": lang,
+                              "scan_path": t["scan_path"],
+                              "reason": import_limit_state.get("reason"),
+                          })
+                      if wrapper_limit_state.get("exceeded"):
+                          repo_limit_errors.append({
+                              "language": lang,
+                              "scan_path": t["scan_path"],
+                              "reason": wrapper_limit_state.get("reason"),
+                          })
                   else:
                       manifest_pkgs = parse_package_json(root_abs)
                       rel_changed = []
@@ -957,6 +1089,12 @@ jobs:
                       import_mods = js_result.get("from_imports", [])
                       all_modules = sorted(set(manifest_pkgs) | set(import_mods))
                       wrappers = js_result.get("wrappers", [])
+                      if js_result.get("limit_exceeded"):
+                          repo_limit_errors.append({
+                              "language": lang,
+                              "scan_path": t["scan_path"],
+                              "reason": js_result.get("limit_reason") or "JS extraction limit exceeded",
+                          })
 
                   target_modules = {
                       "from_manifest": manifest_pkgs,
@@ -972,6 +1110,14 @@ jobs:
                       "modules": target_modules,
                       "wrapper_count": len(wrappers),
                   })
+
+                  total_wrappers += len(wrappers)
+                  if total_wrappers > MAX_TOTAL_WRAPPERS:
+                      repo_limit_errors.append({
+                          "language": lang,
+                          "scan_path": t["scan_path"],
+                          "reason": f"Total wrapper limit exceeded ({MAX_TOTAL_WRAPPERS})",
+                      })
 
                   _ensure_lang_section(results, lang)
                   _extend_unique(results[lang]["modules"]["from_manifest"], manifest_pkgs)
@@ -990,6 +1136,22 @@ jobs:
                           continue
                       wrapper_seen[lang].add(key)
                       results[lang]["wrapper_functions"].append(w)
+
+              if repo_limit_errors:
+                  return {
+                      "success": False,
+                      "error_type": "repo_too_large",
+                      "error": "Repository exceeds wrapper-hunter safety limits. Narrow scan scope or split the repository.",
+                      "limit_details": repo_limit_errors,
+                      "language": "unknown",
+                      "results": {},
+                      "scan_targets": scan_targets,
+                      "orchestrator": {
+                          "anchors_found": len(found_anchors),
+                          "targets_selected": len(scan_targets),
+                          "phantom_roots": sorted(phantom_roots),
+                      },
+                  }
 
               langs = sorted(results.keys())
               if len(langs) == 2:
@@ -1143,7 +1305,7 @@ jobs:
             EXTRA_CONFIG="--config .fixora-rules.yml"
           fi
           FIXORA_EXCLUDE="--exclude '.github/workflows/fixora-scan.yml' --exclude '.github/workflows/fixora-wrapper-hunter.yml'"
-          semgrep scan --config auto $EXTRA_CONFIG $FIXORA_EXCLUDE --json --output semgrep-results.json . || true
+          semgrep scan --config "p/default" --config "p/security-audit" --config "p/owasp-top-ten" $EXTRA_CONFIG $FIXORA_EXCLUDE --json --output semgrep-results.json . || true
 
       - name: Run Semgrep Scan (Diff)
         if: ${{ (github.event.client_payload.scan_mode || github.event.inputs.scan_mode) == 'diff' && (github.event.client_payload.base_commit || github.event.inputs.base_commit) != '' }}
@@ -1159,7 +1321,7 @@ jobs:
           grep -v -E 'fixora-scan\.yml|fixora-wrapper-hunter\.yml' all_changed_files.txt > changed_files.txt || true
           FIXORA_EXCLUDE="--exclude '.github/workflows/fixora-scan.yml' --exclude '.github/workflows/fixora-wrapper-hunter.yml'"
           if [ -s changed_files.txt ]; then
-            semgrep scan --config auto $EXTRA_CONFIG $FIXORA_EXCLUDE --json --output semgrep-results.json $(cat changed_files.txt | tr '\\n' ' ') || true
+            semgrep scan --config "p/default" --config "p/security-audit" --config "p/owasp-top-ten" $EXTRA_CONFIG $FIXORA_EXCLUDE --json --output semgrep-results.json $(cat changed_files.txt | tr '\\n' ' ') || true
           else
             echo '{"results": [], "errors": []}' > semgrep-results.json
           fi

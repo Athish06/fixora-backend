@@ -73,19 +73,21 @@ class ConnectionManager:
     
     async def send_to_scan(self, scan_id: str, message: dict) -> bool:
         """Send a message to a specific scan's WebSocket connection"""
-        if scan_id not in self.scan_connections:
+        async with self._lock:
+            websocket = self.scan_connections.get(scan_id)
+        if websocket is None:
             logger.debug(f"No active connection for scan {scan_id}")
             return False
         
         try:
-            await self.scan_connections[scan_id].send_json(message)
+            await websocket.send_json(message)
             logger.info(f"Sent message to scan {scan_id}")
             return True
         except Exception as e:
             logger.error(f"Error sending to scan socket: {e}")
             # Clean up dead connection
             async with self._lock:
-                if scan_id in self.scan_connections:
+                if self.scan_connections.get(scan_id) is websocket:
                     del self.scan_connections[scan_id]
                 if scan_id in self.scan_owners:
                     del self.scan_owners[scan_id]
@@ -94,11 +96,19 @@ class ConnectionManager:
     async def send_to_user(self, user_id: str, message: dict):
         """Send a message to all connections for a specific user (including scan connections)"""
         sent = False
+
+        async with self._lock:
+            user_sockets = list(self.user_connections.get(user_id, set()))
+            owned_scan_sockets = [
+                (scan_id, self.scan_connections.get(scan_id))
+                for scan_id, owner_id in self.scan_owners.items()
+                if owner_id == user_id
+            ]
         
         # Send to general user connections
-        if user_id in self.user_connections:
+        if user_sockets:
             dead_connections = set()
-            for connection in self.user_connections[user_id]:
+            for connection in user_sockets:
                 try:
                     await connection.send_json(message)
                     sent = True
@@ -108,18 +118,27 @@ class ConnectionManager:
             
             # Clean up dead connections
             async with self._lock:
-                for conn in dead_connections:
-                    self.user_connections[user_id].discard(conn)
+                current = self.user_connections.get(user_id)
+                if current is not None:
+                    for conn in dead_connections:
+                        current.discard(conn)
+                    if not current:
+                        del self.user_connections[user_id]
         
         # Also send to any scan connections owned by this user
-        for scan_id, owner_id in list(self.scan_owners.items()):
-            if owner_id == user_id:
-                try:
-                    if scan_id in self.scan_connections:
-                        await self.scan_connections[scan_id].send_json(message)
-                        sent = True
-                except Exception as e:
-                    logger.error(f"Error sending to scan socket {scan_id}: {e}")
+        for scan_id, websocket in owned_scan_sockets:
+            if websocket is None:
+                continue
+            try:
+                await websocket.send_json(message)
+                sent = True
+            except Exception as e:
+                logger.error(f"Error sending to scan socket {scan_id}: {e}")
+                async with self._lock:
+                    if self.scan_connections.get(scan_id) is websocket:
+                        del self.scan_connections[scan_id]
+                    if scan_id in self.scan_owners:
+                        del self.scan_owners[scan_id]
         
         return sent
     
