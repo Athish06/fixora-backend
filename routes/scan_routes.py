@@ -741,6 +741,71 @@ async def receive_scan_results(
     db = Depends(get_database)
 ):
     """
+    Guard wrapper for Semgrep webhook processing.
+    Any unexpected runtime crash marks the scan as failed and notifies the frontend,
+    so the UI never hangs in a running state.
+    """
+    try:
+        return await _receive_scan_results_impl(payload, x_fixora_token, db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Fatal error parsing scan results for scan {payload.scan_id}: {e}")
+
+        scan_doc = await db.scans.find_one(
+            {"id": payload.scan_id},
+            {"_id": 0, "id": 1, "status": 1, "user_id": 1},
+        )
+
+        if scan_doc and scan_doc.get("status") not in ["completed", "failed"]:
+            await db.scans.update_one(
+                {"id": payload.scan_id},
+                {
+                    "$set": {
+                        "status": "failed",
+                        "progress": 100,
+                        "phase": "failed_results_processing",
+                        "error_message": "Backend crashed while parsing scan results.",
+                        "completed_at": datetime.now().isoformat(),
+                    }
+                },
+            )
+
+            ws_manager = get_connection_manager()
+            await ws_manager.send_to_scan(
+                payload.scan_id,
+                {
+                    "type": "scan_failed",
+                    "scan_id": payload.scan_id,
+                    "message": "Scan failed while parsing results.",
+                },
+            )
+
+            user_id = scan_doc.get("user_id")
+            if user_id:
+                await ws_manager.send_to_user(
+                    user_id,
+                    {
+                        "type": "scan_failed",
+                        "scan_id": payload.scan_id,
+                        "message": "Scan failed while parsing results.",
+                    },
+                )
+
+        return {
+            "success": False,
+            "status": "error",
+            "scan_id": payload.scan_id,
+            "message": "Backend crashed while parsing results, but frontend was unlocked.",
+        }
+
+
+async def _receive_scan_results_impl(
+    payload: ScanWebhookPayload,
+    x_fixora_token: str,
+    db
+):
+    """
     Webhook endpoint to receive scan results from GitHub Actions.
     Validates the token and processes Semgrep results.
     """

@@ -1324,27 +1324,31 @@ jobs:
           fi
           BASE_COMMIT="${{ github.event.client_payload.base_commit || github.event.inputs.base_commit }}"
           git diff --name-only $BASE_COMMIT HEAD > all_changed_files.txt
-                    # Exclude Fixora scanner/config files so Semgrep doesn't flag them
-                    grep -v -E 'fixora-scan\.yml|fixora-wrapper-hunter\.yml|fixora_wrapper_hunter\.yml|\.fixora-rules\.yml|\.semgrep\.yml|semgrep_rules\.yml' all_changed_files.txt > changed_files.txt || true
-                    FIXORA_EXCLUDE="--exclude '.github/workflows/fixora-scan.yml' --exclude '.github/workflows/fixora-wrapper-hunter.yml' --exclude '.fixora-rules.yml' --exclude '.semgrep.yml' --exclude 'semgrep_rules.yml' --exclude 'fixora_wrapper_hunter.yml' --exclude '**/fixora_wrapper_hunter.yml' --exclude '**/semgrep_rules.yml'"
+          # Exclude Fixora scanner/config files so Semgrep doesn't flag them
+          grep -v -E 'fixora-scan\.yml|fixora-wrapper-hunter\.yml|fixora_wrapper_hunter\.yml|\.fixora-rules\.yml|\.semgrep\.yml|semgrep_rules\.yml' all_changed_files.txt > changed_files.txt || true
+          FIXORA_EXCLUDE="--exclude '.github/workflows/fixora-scan.yml' --exclude '.github/workflows/fixora-wrapper-hunter.yml' --exclude '.fixora-rules.yml' --exclude '.semgrep.yml' --exclude 'semgrep_rules.yml' --exclude 'fixora_wrapper_hunter.yml' --exclude '**/fixora_wrapper_hunter.yml' --exclude '**/semgrep_rules.yml'"
           if [ -s changed_files.txt ]; then
             semgrep scan --config "p/default" --config "p/security-audit" --config "p/owasp-top-ten" $EXTRA_CONFIG $FIXORA_EXCLUDE --json --output semgrep-results.json $(cat changed_files.txt | tr '\\n' ' ') || true
           else
             echo '{"results": [], "errors": []}' > semgrep-results.json
           fi
 
-      - name: Send Results to Fixora
+      - name: Send Results to Fixora Backend
+        if: always()
         run: |
           SCAN_ID="${{ github.event.client_payload.scan_id || github.event.inputs.scan_id }}"
           TARGET_BRANCH="${{ github.event.client_payload.target_branch || github.event.inputs.target_branch }}"
           SCAN_MODE="${{ github.event.client_payload.scan_mode || github.event.inputs.scan_mode }}"
-          
-          if [ -f semgrep-results.json ]; then
-            echo "Sending results to Fixora backend: ${{ secrets.FIXORA_API_URL }}"
-            echo "Using API token: ${FIXORA_API_TOKEN:0:10}... (masked for security)"
-            
-            # Create payload
-            cat > payload.json << EOF
+
+          # Force safe fallback so backend always receives a completion payload.
+          if [ -s semgrep-results.json ]; then
+            echo "Results found. Sending to backend..."
+          else
+            echo "semgrep-results.json is missing or empty! Using safe fallback to unlock frontend."
+            echo '{"results": [], "errors": []}' > semgrep-results.json
+          fi
+
+          cat > payload.json << EOF
           {
             "scan_id": "$SCAN_ID",
             "repository": "${{ github.repository }}",
@@ -1354,37 +1358,34 @@ jobs:
             "results": $(cat semgrep-results.json)
           }
           EOF
-            
-            # Send to Fixora with retry logic
-            MAX_RETRIES=3
-            RETRY_COUNT=0
-            
-            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-              echo "Attempting to send results (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
-              if curl -X POST "${{ secrets.FIXORA_API_URL }}/api/scan/webhook/results" \
-                -H "Content-Type: application/json" \
-                -H "X-Fixora-Token: ${{ secrets.FIXORA_API_TOKEN }}" \
-                -d @payload.json \
-                --max-time 30 \
-                --retry 2 \
-                --retry-delay 5; then
-                echo "✅ Results sent successfully"
-                exit 0
-              else
-                RETRY_COUNT=$((RETRY_COUNT + 1))
-                echo "⚠️  Attempt $RETRY_COUNT failed. Retrying..."
-                sleep 5
-              fi
-            done
-            
-            echo "❌ Failed to send results after $MAX_RETRIES attempts"
-            echo "This usually means your Fixora backend is not publicly accessible."
-            echo "For local development, use ngrok or similar to expose your backend."
-            echo "Backend URL configured: ${{ secrets.FIXORA_API_URL }}"
-            exit 1
-          else
-            echo "⚠️  No results file found"
-          fi
+
+          # Send to Fixora with retry logic
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "Attempting to send results (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
+            if curl -L -X POST "${{ secrets.FIXORA_API_URL }}/api/scan/webhook/results" \
+              -H "Content-Type: application/json" \
+              -H "X-Fixora-Token: ${{ secrets.FIXORA_API_TOKEN }}" \
+              --data-binary @payload.json \
+              --max-time 30 \
+              --retry 2 \
+              --retry-delay 5; then
+              echo "✅ Results sent successfully"
+              exit 0
+            else
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              echo "⚠️  Attempt $RETRY_COUNT failed. Retrying..."
+              sleep 5
+            fi
+          done
+
+          echo "❌ Failed to send results after $MAX_RETRIES attempts"
+          echo "This usually means your Fixora backend is not publicly accessible."
+          echo "For local development, use ngrok or similar to expose your backend."
+          echo "Backend URL configured: ${{ secrets.FIXORA_API_URL }}"
+          exit 1
 
       - name: Upload Scan Artifacts
         uses: actions/upload-artifact@v4
