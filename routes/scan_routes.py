@@ -1225,6 +1225,7 @@ async def receive_scan_results(
     
     # Close the scan-specific WebSocket connection
     if scan_socket_sent:
+        await asyncio.sleep(0.35)
         await ws_manager.disconnect_scan(payload.scan_id)
         logger.info(f"Closed WebSocket for scan {payload.scan_id}")
     
