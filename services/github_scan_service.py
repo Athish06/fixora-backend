@@ -82,11 +82,11 @@ jobs:
           ]);
 
           const DANGEROUS_SINK_METHODS = new Set([
-              // Database / NoSQL
+              // Database / NoSQL (includes legacy driver methods)
               'query','execute','exec','aggregate','raw',
               'find','findOne','findById','findOneAndUpdate','findOneAndDelete',
               'deleteOne','deleteMany','updateOne','updateMany','insertOne','insertMany',
-              'replaceOne','bulkWrite','distinct','countDocuments',
+              'replaceOne','bulkWrite','distinct','countDocuments','insert','update','remove',
               // OS / Command execution
               'execSync','spawn','spawnSync','execFile','execFileSync','fork',
               // File System / Path Traversal
@@ -175,16 +175,18 @@ jobs:
                           if (d.init && d.init.type === 'CallExpression' &&
                               d.init.callee && d.init.callee.name === 'require' &&
                               d.init.arguments[0] && d.init.arguments[0].value) {
-                              const mod = normMod(d.init.arguments[0].value);
+                              const rawMod = d.init.arguments[0].value;
+                              const mod = normMod(rawMod);
+                              const moduleLabel = mod || String(rawMod || 'local-module');
                               if (mod) {
                                   imports.add(mod);
-                                  if (d.id.type === 'Identifier') {
-                                      alias[d.id.name] = mod;
-                                  } else if (d.id.type === 'ObjectPattern') {
-                                      for (const p of d.id.properties) {
-                                          const nm = (p.value || p.key);
-                                          if (nm && nm.name) alias[nm.name] = mod;
-                                      }
+                              }
+                              if (d.id.type === 'Identifier') {
+                                  alias[d.id.name] = moduleLabel;
+                              } else if (d.id.type === 'ObjectPattern') {
+                                  for (const p of d.id.properties) {
+                                      const nm = (p.value || p.key);
+                                      if (nm && nm.name) alias[nm.name] = moduleLabel;
                                   }
                               }
                           }
@@ -488,8 +490,13 @@ jobs:
                           return True
               return False
 
-          def _pick_scan_path(root_path):
-              # src-layout optimization: prefer src/lib/app over root scan
+          def _pick_scan_path(root_path, language):
+              # For React/Node projects, always scan repository root so root files
+              # (e.g. server.js) are never skipped.
+              if language == "react":
+                  return root_path
+
+              # Keep src-layout optimization for Python projects.
               for name in SOURCE_DIR_CANDIDATES:
                   p = os.path.join(root_path, name)
                   if os.path.isdir(p):
@@ -550,7 +557,7 @@ jobs:
                       })
                       continue
 
-                  scan_abs = _pick_scan_path(root_abs)
+                  scan_abs = _pick_scan_path(root_abs, lang)
                   targets.append({
                       "language": lang,
                       "root_abs": root_abs,

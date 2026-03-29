@@ -247,7 +247,7 @@ def _build_wrapper_rule(
 
     # 3. The markdown structure
     message = (
-        f"### 🚨 {vuln_type} via `{parameter}`\n\n"
+        f"### {vuln_type} via `{parameter}`\n\n"
         f"**Vulnerable Sink:** Passes untrusted data directly to `{wraps_text}`.\n\n"
         f"**Live Exploit Vector:**\n"
         f"{injected_code_block}\n\n"
