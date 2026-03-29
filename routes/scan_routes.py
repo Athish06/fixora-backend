@@ -911,6 +911,11 @@ async def receive_scan_results(
         file_path = result.get("path", "")
         line_number = result.get("start", {}).get("line", 0)
         end_line = result.get("end", {}).get("line", 0)
+        vulnerable_parameter = metadata.get("vulnerable_parameter", None)
+        malicious_payload = metadata.get("malicious_payload", None)
+        exploit_explanation = metadata.get("exploit_explanation", None)
+        exploit_injected_example = metadata.get("exploit_injected_example", None)
+        impact_summary = metadata.get("impact_summary", None)
 
         # Stable fingerprint to identify the same finding across multiple scans.
         legacy_key = (
@@ -950,6 +955,11 @@ async def receive_scan_results(
                         "line_number": line_number,
                         "end_line": end_line,
                         "code_snippet": _clean_code_snippet(extra.get("lines", "")),
+                        "vulnerable_parameter": vulnerable_parameter,
+                        "malicious_payload": malicious_payload,
+                        "exploit_explanation": exploit_explanation,
+                        "exploit_injected_example": exploit_injected_example,
+                        "impact_summary": impact_summary,
                         "rule_id": rule_id,
                         "cwe": metadata.get("cwe", []),
                         "owasp": metadata.get("owasp", []),
@@ -987,6 +997,11 @@ async def receive_scan_results(
             "line_number": line_number,
             "end_line": end_line,
             "code_snippet": _clean_code_snippet(extra.get("lines", "")),
+            "vulnerable_parameter": vulnerable_parameter,
+            "malicious_payload": malicious_payload,
+            "exploit_explanation": exploit_explanation,
+            "exploit_injected_example": exploit_injected_example,
+            "impact_summary": impact_summary,
             "rule_id": rule_id,
             "cwe": metadata.get("cwe", []),
             "owasp": metadata.get("owasp", []),

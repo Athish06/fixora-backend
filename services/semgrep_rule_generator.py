@@ -3,6 +3,7 @@
 # vulnerable wrapper functions that Semgrep wouldn't know about.
 
 import logging
+import json
 import yaml
 from typing import Dict, Any, List
 
@@ -189,12 +190,30 @@ def _build_wrapper_rule(
     }
     impact_text = impact_map.get(vuln_type, "Can allow attackers to bypass intended application logic.")
 
-    # 2. Grab the AI's custom exploit
-    ai_exploit = str(wrapper.get("example_exploit", "")).strip()
+    # 2. Grab the AI's custom exploit fields (new schema + legacy fallback)
+    parameter = str(wrapper.get("vulnerable_parameter", "")).strip() or "input"
+    malicious_payload_raw = wrapper.get("malicious_payload", "")
+    explanation = str(
+        wrapper.get("exploit_explanation") or wrapper.get("attack_explanation") or ""
+    ).strip() or "Payload triggers the vulnerability."
+    impact_summary = str(wrapper.get("impact_summary", "")).strip()
+
+    if malicious_payload_raw is None:
+        malicious_payload = ""
+    elif isinstance(malicious_payload_raw, str):
+        malicious_payload = malicious_payload_raw.strip()
+    else:
+        try:
+            malicious_payload = json.dumps(malicious_payload_raw, ensure_ascii=True)
+        except Exception:
+            malicious_payload = str(malicious_payload_raw).strip()
+
+    # Legacy fallback path
+    payload = malicious_payload or str(wrapper.get("example_exploit", "")).strip()
     generic_placeholder = (
-        not ai_exploit
-        or "malicious_payload" in ai_exploit.lower()
-        or "user_input" in ai_exploit.lower()
+        not payload
+        or "malicious_payload" in payload.lower()
+        or "user_input" in payload.lower()
     )
     if generic_placeholder:
         default_exploit_map = {
@@ -206,28 +225,34 @@ def _build_wrapper_rule(
             "Insecure Deserialization": "load_payload(\"gASV...crafted_pickle...\")",
             "IDOR / Broken Access Control": "get_invoice(\"another-users-invoice-id\")",
         }
-        ai_exploit = default_exploit_map.get(vuln_type, "invoke_wrapper(\"crafted attacker input\")")
+        payload = default_exploit_map.get(vuln_type, "<malicious_data>")
 
-    if not ai_exploit.startswith("```"):
-        code_lang = "python" if lang_key == "python" else "javascript"
-        ai_exploit = f"```{code_lang}\\n{ai_exploit}\\n```"
+    code_lang = "python" if lang_key == "python" else "javascript"
 
-    attack_explanation = str(wrapper.get("attack_explanation", "")).strip()
-    if not attack_explanation:
-        attack_explanation = (
-            "The payload reaches the sink without strong validation, so the sink interprets attacker-controlled syntax "
-            "as executable instructions instead of inert data."
-        )
+    injected_example = str(wrapper.get("exploit_injected_example", "")).strip()
+    if not injected_example:
+        injected_example = f"{func_name}({parameter} = {payload})"
+
+    injected_code_block = (
+        f"```{code_lang}\\n"
+        f"// Target Function: {func_name}()\\n"
+        f"// Parameter: {parameter}\\n\\n"
+        f"// Attacker executes:\\n"
+        f"{injected_example}\\n"
+        f"```"
+    )
+
+    if not impact_summary:
+        impact_summary = impact_text
 
     # 3. The markdown structure
     message = (
-        f"### Alert: {vuln_type} in `{func_name}()`\n\n"
-        f"**Mechanism:**\nThis function takes untrusted input and passes it directly into `{wraps_text}` without adequate validation or sanitization.\n\n"
-        f"**Example Attack Vector:**\n"
-        f"{ai_exploit}\n\n"
-        f"**How The Attack Works:**\n{attack_explanation}\n\n"
-        f"**Data at Risk (Impact):**\n{impact_text}\n\n"
-        f"**AI Analysis:**\n{reason}"
+        f"### 🚨 {vuln_type} via `{parameter}`\n\n"
+        f"**Vulnerable Sink:** Passes untrusted data directly to `{wraps_text}`.\n\n"
+        f"**Live Exploit Vector:**\n"
+        f"{injected_code_block}\n\n"
+        f"**Outcome:**\n{explanation}\n\n"
+        f"**Data at Risk (Impact):**\n{impact_summary}"
     )
 
     metadata: Dict[str, Any] = {
@@ -239,6 +264,11 @@ def _build_wrapper_rule(
         "wrapper_defined_in": file_path,
         "wraps": calls,
         "modules_used": modules,
+        "vulnerable_parameter": parameter,
+        "malicious_payload": payload,
+        "exploit_explanation": explanation,
+        "exploit_injected_example": injected_example,
+        "impact_summary": impact_summary,
     }
     if cwe:
         metadata["cwe"] = cwe

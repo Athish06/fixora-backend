@@ -121,7 +121,11 @@ def build_function_chunk_prompt(
                   "severity": "HIGH",
                   "calls": [...],
                   "modules_used": [...],
-                  "reason": "..."
+                                    "reason": "...",
+                                    "vulnerable_parameter": "...",
+                                    "malicious_payload": "...",
+                                    "exploit_explanation": "...",
+                                    "impact_summary": "..."
                 }
               ]
             }
@@ -160,7 +164,7 @@ def build_function_chunk_prompt(
         f"Analyse the {lang_display} wrapper functions below.  "
         "For each function, determine:\n"
         "  - Does it pass user-controlled data to a dangerous sink WITHOUT sanitisation?\n"
-        "  - If YES -> include it in the output with vulnerability_type, severity, reason, example_exploit, and attack_explanation.\n"
+        "  - If YES -> include it in the output with vulnerability_type, severity, reason, vulnerable_parameter, malicious_payload, exploit_explanation, and impact_summary.\n"
         "  - If NO  -> skip it entirely.\n\n"
         "=== STRICT TAXONOMY & EXCLUSION RULES ===\n"
         "1. ALLOWED CATEGORIES: You MUST classify vulnerabilities into exactly one of these types: ['SQL Injection', 'Command Injection', 'Path Traversal', 'XSS', 'SSRF', 'Insecure Deserialization', 'IDOR / Broken Access Control', 'Cryptographic Failure', 'Hardcoded Secret', 'Security Misconfiguration', 'Business Logic Flaw'].\n"
@@ -175,8 +179,10 @@ def build_function_chunk_prompt(
         + sink_ctx
         + "RESPOND WITH ONLY VALID JSON. No markdown, no text outside the JSON.\n"
         "IMPORTANT: Do NOT include \"source_code\" in your output - I already have it.\n"
-        "IMPORTANT: example_exploit MUST be a concrete malicious payload example string, not placeholders like 'malicious_payload' or 'user_input'.\n"
-        "IMPORTANT: attack_explanation MUST be 1-2 short sentences explaining exactly how that payload reaches and abuses the sink.\n"
+        "IMPORTANT: vulnerable_parameter MUST be the exact tainted argument/path (e.g., 'user_id', 'req.body.username', 'request.query_params[\"id\"]').\n"
+        "IMPORTANT: malicious_payload MUST contain ONLY the raw payload value (string/object/array). No comments, no surrounding function call code.\n"
+        "IMPORTANT: exploit_explanation MUST be 1-2 short sentences that explain exactly how this payload is inserted into the vulnerable flow and reaches the sink.\n"
+        "IMPORTANT: impact_summary MUST clearly state what data can be leaked/lost/modified and the likely business impact.\n"
         "Keep output compact so the full JSON fits within token limits.\n\n"
         "Use this EXACT structure:\n\n"
         "{\n"
@@ -192,8 +198,10 @@ def build_function_chunk_prompt(
         '          "calls": ["sqlite3.execute"],\n'
         '          "modules_used": ["sqlite3"],\n'
         '          "reason": "User input concatenated directly into SQL query.",\n'
-        '          "example_exploit": "bulk_insert(\"users; DROP TABLE users; --\", data)",\n'
-        '          "attack_explanation": "The payload closes the intended SQL value and injects a destructive second statement that the sink executes."\n'
+        '          "vulnerable_parameter": "user_id",\n'
+        '          "malicious_payload": "1 OR 1=1 --",\n'
+        '          "exploit_explanation": "The attacker-controlled user_id is concatenated into the SQL WHERE clause, so the payload converts the predicate into an always-true condition.",\n'
+        '          "impact_summary": "Attackers can exfiltrate all rows from the table and bypass authorization checks tied to user scoping."\n'
         '        }\n'
         '      ]\n'
         '    }\n'
