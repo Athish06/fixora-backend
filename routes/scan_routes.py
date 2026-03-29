@@ -813,20 +813,25 @@ async def receive_scan_results(
             "file_path": 1,
             "line_number": 1,
             "end_line": 1,
+            "all_affected_lines": 1,
             "description": 1,
         },
     ).sort("created_at", 1).to_list(50000)
 
     existing_by_fingerprint = {}
+    existing_by_signature = {}
     existing_by_legacy = {}
     duplicate_doc_ids = []
     canonical_by_key = {}
+    seen_signature_keys = set()
     for doc in existing_docs:
-        legacy_key = (
-            f"{doc.get('rule_id', '')}|{doc.get('file_path', '')}|"
-            f"{doc.get('line_number', 0)}|{doc.get('end_line', 0)}|"
-            f"{(doc.get('description') or '').strip()}"
-        )
+        signature_key = f"{doc.get('rule_id', '')}|{doc.get('file_path', '')}"
+        if signature_key in seen_signature_keys:
+            duplicate_doc_ids.append(doc["id"])
+            continue
+        seen_signature_keys.add(signature_key)
+
+        legacy_key = signature_key
         canonical_key = doc.get("fingerprint") or f"legacy::{legacy_key}"
         if canonical_key in canonical_by_key:
             duplicate_doc_ids.append(doc["id"])
@@ -836,6 +841,7 @@ async def receive_scan_results(
         fp = doc.get("fingerprint")
         if fp:
             existing_by_fingerprint[fp] = doc
+        existing_by_signature[signature_key] = doc
         existing_by_legacy[legacy_key] = doc
 
     if duplicate_doc_ids:
@@ -845,11 +851,49 @@ async def receive_scan_results(
             f"for repository {repo_id} before processing scan {payload.scan_id}"
         )
 
-    # De-duplicate repeated Semgrep entries inside the same webhook payload.
-    seen_in_this_scan = set()
+    # ---------------------------------------------------------
+    # 1. SMART DE-DUPLICATOR: Group by Rule ID and File Path
+    # ---------------------------------------------------------
+    grouped_findings = {}
+    for result in semgrep_results:
+        rule_id = str(result.get("check_id", "unknown-rule") or "unknown-rule").lower()
+        file_path = result.get("path", "unknown-file")
+        line_num = int(result.get("start", {}).get("line", 0) or 0)
+        signature = f"{rule_id}:{file_path}"
+
+        if signature not in grouped_findings:
+            grouped_findings[signature] = dict(result)
+            grouped_findings[signature]["all_affected_lines"] = [line_num] if line_num > 0 else []
+        else:
+            if line_num > 0 and line_num not in grouped_findings[signature]["all_affected_lines"]:
+                grouped_findings[signature]["all_affected_lines"].append(line_num)
+                grouped_findings[signature]["all_affected_lines"].sort()
+
+    unique_findings = list(grouped_findings.values())
+
+    # Normalize grouped line anchors for downstream DB and UI handling.
+    for finding in unique_findings:
+        lines = [int(x) for x in (finding.get("all_affected_lines") or []) if int(x) > 0]
+        if not lines:
+            fallback_line = int(finding.get("start", {}).get("line", 0) or 0)
+            lines = [fallback_line] if fallback_line > 0 else [0]
+        lines = sorted(set(lines))
+        finding["all_affected_lines"] = lines
+        if isinstance(finding.get("start"), dict):
+            finding["start"]["line"] = lines[0]
+        else:
+            finding["start"] = {"line": lines[0]}
+        if isinstance(finding.get("end"), dict):
+            finding["end"]["line"] = lines[-1]
+        else:
+            finding["end"] = {"line": lines[-1]}
+
     updated_existing_count = 0
     
-    for result in semgrep_results:
+    # ---------------------------------------------------------
+    # 2. PROCESS UNIQUE FINDINGS INTO THE DATABASE
+    # ---------------------------------------------------------
+    for result in unique_findings:
         # Extract severity from Semgrep metadata
         extra = result.get("extra", {})
         metadata = extra.get("metadata", {})
@@ -900,8 +944,19 @@ async def receive_scan_results(
             vuln_type = _normalize_rule_id_to_vuln_type(vuln_type)
         category = VULN_TYPE_TO_CATEGORY.get(vuln_type, "Business Logic Flaws")
 
+        lines_list = result.get("all_affected_lines", [result.get("start", {}).get("line", 0)])
+        lines_list = [int(x) for x in lines_list if int(x) > 0] or [0]
+        formatted_lines = ", ".join(map(str, lines_list))
+        primary_line = lines_list[0]
+
         # Clean weird placeholders from Semgrep description text
-        raw_description = str(extra.get("message", "No description available") or "")
+        original_message = str(extra.get("message", "No description available") or "")
+        injected_message = (
+            f"**Exact Affected Lines:** `[ {formatted_lines} ]`\n\n{original_message}"
+            if formatted_lines
+            else original_message
+        )
+        raw_description = injected_message
         description = re.sub(r"requires\s+log(?:in|n)", "", raw_description, flags=re.IGNORECASE).strip()
         description = _clean_placeholder_text(
             description,
@@ -909,8 +964,8 @@ async def receive_scan_results(
         )
         reason = description
         file_path = result.get("path", "")
-        line_number = result.get("start", {}).get("line", 0)
-        end_line = result.get("end", {}).get("line", 0)
+        line_number = primary_line
+        end_line = lines_list[-1]
         vulnerable_parameter = metadata.get("vulnerable_parameter", None)
         malicious_payload = metadata.get("malicious_payload", None)
         exploit_explanation = metadata.get("exploit_explanation", None)
@@ -918,16 +973,15 @@ async def receive_scan_results(
         impact_summary = metadata.get("impact_summary", None)
 
         # Stable fingerprint to identify the same finding across multiple scans.
-        legacy_key = (
-            f"{rule_id}|{file_path}|{line_number}|{end_line}|{description.strip()}"
+        signature_key = f"{rule_id}|{file_path}"
+        legacy_key = signature_key
+        fingerprint = hashlib.sha256(signature_key.encode("utf-8")).hexdigest()
+
+        existing = (
+            existing_by_fingerprint.get(fingerprint)
+            or existing_by_signature.get(signature_key)
+            or existing_by_legacy.get(legacy_key)
         )
-        fingerprint = hashlib.sha256(legacy_key.encode("utf-8")).hexdigest()
-
-        if fingerprint in seen_in_this_scan:
-            continue
-        seen_in_this_scan.add(fingerprint)
-
-        existing = existing_by_fingerprint.get(fingerprint) or existing_by_legacy.get(legacy_key)
 
         raw_title = result.get("check_id", "Unknown vulnerability").split(".")[-1].replace("-", " ").title()
         title = _clean_placeholder_text(raw_title, vuln_type)
@@ -954,6 +1008,7 @@ async def receive_scan_results(
                         "file_path": file_path,
                         "line_number": line_number,
                         "end_line": end_line,
+                        "all_affected_lines": lines_list,
                         "code_snippet": _clean_code_snippet(extra.get("lines", "")),
                         "vulnerable_parameter": vulnerable_parameter,
                         "malicious_payload": malicious_payload,
@@ -996,6 +1051,7 @@ async def receive_scan_results(
             "file_path": file_path,
             "line_number": line_number,
             "end_line": end_line,
+            "all_affected_lines": lines_list,
             "code_snippet": _clean_code_snippet(extra.get("lines", "")),
             "vulnerable_parameter": vulnerable_parameter,
             "malicious_payload": malicious_payload,
@@ -1023,6 +1079,7 @@ async def receive_scan_results(
         new_vulnerabilities.append(vulnerability)
         current_scan_vulnerabilities.append(normalized_vuln)
         existing_by_fingerprint[fingerprint] = {"id": vulnerability["id"], "fingerprint": fingerprint}
+        existing_by_signature[signature_key] = {"id": vulnerability["id"], "fingerprint": fingerprint}
         existing_by_legacy[legacy_key] = {"id": vulnerability["id"], "fingerprint": fingerprint}
     
     # Insert only genuinely new vulnerabilities; existing ones were updated in-place.
