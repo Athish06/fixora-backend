@@ -266,7 +266,112 @@ def _normalize_vulnerability_type(value: Any) -> Optional[str]:
         return normalized
     if raw in ALLOWED_VULNERABILITY_TYPES:
         return raw
+
+    fuzzy = key.replace("_", " ").replace("-", " ")
+    if any(tok in fuzzy for tok in ["sql", "nosql", "ldap", "xpath"]):
+        return "SQL Injection"
+    if any(tok in fuzzy for tok in ["command", "rce", "exec", "shell"]):
+        return "Command Injection"
+    if any(tok in fuzzy for tok in ["path travers", "directory travers", "lfi", "file inclusion"]):
+        return "Path Traversal"
+    if any(tok in fuzzy for tok in ["xss", "cross site scripting", "cross-site scripting"]):
+        return "XSS"
+    if "ssrf" in fuzzy:
+        return "SSRF"
+    if any(tok in fuzzy for tok in ["deserial", "xxe"]):
+        return "Insecure Deserialization"
+    if any(tok in fuzzy for tok in ["idor", "bola", "access control", "authorization"]):
+        return "IDOR / Broken Access Control"
+    if any(tok in fuzzy for tok in ["crypto", "cryptographic", "hash", "cipher"]):
+        return "Cryptographic Failure"
+    if any(tok in fuzzy for tok in ["hardcoded", "secret", "credential", "token", "password"]):
+        return "Hardcoded Secret"
+    if any(tok in fuzzy for tok in ["business logic", "workflow bypass", "logic flaw"]):
+        return "Business Logic Flaw"
+    if any(tok in fuzzy for tok in ["misconfig", "misconfiguration", "cors", "headers"]):
+        return "Security Misconfiguration"
+
     return None
+
+
+def _coalesce_wrapper_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Accept compatibility key variants while preserving canonical output keys."""
+    item = dict(row)
+
+    if item.get("malicious_payload") is None and item.get("proof_of_concept_payload") is not None:
+        item["malicious_payload"] = item.get("proof_of_concept_payload")
+
+    if not item.get("exploit_explanation") and item.get("vulnerability_mechanism"):
+        item["exploit_explanation"] = item.get("vulnerability_mechanism")
+
+    return item
+
+
+def _infer_vulnerability_type_from_context(row: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    """Infer a stable allowed vulnerability type when model labels are missing or variant."""
+    explicit = _normalize_vulnerability_type(row.get("vulnerability_type"))
+    if explicit:
+        return explicit
+
+    row_calls = row.get("calls") if isinstance(row.get("calls"), list) else []
+    row_modules = row.get("modules_used") if isinstance(row.get("modules_used"), list) else []
+    ctx_calls = ctx.get("calls") if isinstance(ctx.get("calls"), list) else []
+    ctx_modules = ctx.get("modules_used") if isinstance(ctx.get("modules_used"), list) else []
+
+    haystack = " ".join([
+        str(row.get("reason") or ""),
+        str(row.get("title") or ""),
+        str(row.get("description") or ""),
+        " ".join(str(x) for x in row_calls),
+        " ".join(str(x) for x in row_modules),
+        " ".join(str(x) for x in ctx_calls),
+        " ".join(str(x) for x in ctx_modules),
+    ]).lower()
+
+    if any(tok in haystack for tok in ["sql", "nosql", "sqlite", "query", "where "]):
+        return "SQL Injection"
+    if any(tok in haystack for tok in ["subprocess", "os.system", "popen", "exec", "shell="]):
+        return "Command Injection"
+    if any(tok in haystack for tok in ["path", "traversal", "../", "dirname", "open("]):
+        return "Path Traversal"
+    if any(tok in haystack for tok in ["xss", "innerhtml", "dangerouslysetinnerhtml", "onerror="]):
+        return "XSS"
+    if any(tok in haystack for tok in ["ssrf", "169.254.169.254", "requests.get", "urlopen("]):
+        return "SSRF"
+    if any(tok in haystack for tok in ["deserialize", "pickle", "yaml.load", "xxe"]):
+        return "Insecure Deserialization"
+    if any(tok in haystack for tok in ["idor", "bola", "access control", "unauthorized", "authorization"]):
+        return "IDOR / Broken Access Control"
+    if any(tok in haystack for tok in ["md5", "sha1", "weak crypto", "weak hash", "cipher"]):
+        return "Cryptographic Failure"
+    if any(tok in haystack for tok in ["secret", "token", "password", "api key", "hardcoded"]):
+        return "Hardcoded Secret"
+    if any(tok in haystack for tok in ["business logic", "workflow bypass", "logic flaw"]):
+        return "Business Logic Flaw"
+
+    # Last-resort canonical fallback to avoid silently dropping model findings.
+    return "Security Misconfiguration"
+
+
+def _extract_wrapper_rows(ai_output: Any) -> list:
+    """Extract wrapper rows from common model output variants without changing canonical schema."""
+    if not isinstance(ai_output, dict):
+        return []
+
+    for key in ("wrapper_functions", "vulnerabilities", "findings", "wrappers"):
+        rows = ai_output.get(key)
+        if isinstance(rows, list):
+            return rows
+
+    nested_results = ai_output.get("results")
+    if isinstance(nested_results, dict):
+        for section in nested_results.values():
+            if isinstance(section, dict):
+                rows = section.get("wrapper_functions")
+                if isinstance(rows, list):
+                    return rows
+
+    return []
 
 
 def _sanitize_llm_wrappers(chunk_wrappers: list, ai_wrappers: list) -> list:
@@ -275,31 +380,74 @@ def _sanitize_llm_wrappers(chunk_wrappers: list, ai_wrappers: list) -> list:
         return []
 
     context_by_key = {}
+    context_by_name = {}
     for w in chunk_wrappers:
         fn = str(w.get("function_name") or "").strip()
         fp = str(w.get("file") or "").strip()
         context_by_key[(fn, fp)] = w
+        if fn:
+            context_by_name.setdefault(fn, []).append(w)
 
     cleaned = []
+    drop_stats = {
+        "non_dict": 0,
+        "frontend_filtered": 0,
+        "coerced_type": 0,
+    }
+
     for row in ai_wrappers:
         if not isinstance(row, dict):
+            drop_stats["non_dict"] += 1
             continue
 
-        vuln_type = _normalize_vulnerability_type(row.get("vulnerability_type"))
-        if not vuln_type:
-            continue
+        item = _coalesce_wrapper_fields(row)
 
-        fn = str(row.get("function_name") or "").strip()
-        fp = str(row.get("file") or "").strip()
-        ctx = context_by_key.get((fn, fp), {})
+        fn = str(item.get("function_name") or "").strip()
+        fp = str(item.get("file") or "").strip()
+        ctx = context_by_key.get((fn, fp))
+
+        if not ctx and fn and fn in context_by_name:
+            candidates = context_by_name[fn]
+            if len(candidates) == 1:
+                ctx = candidates[0]
+            elif fp:
+                file_base = fp.replace("\\", "/").split("/")[-1].lower()
+                matched = [
+                    c for c in candidates
+                    if str(c.get("file") or "").replace("\\", "/").split("/")[-1].lower() == file_base
+                ]
+                if len(matched) == 1:
+                    ctx = matched[0]
+
+        ctx = ctx or {}
+        vuln_type = _infer_vulnerability_type_from_context(item, ctx)
+        if _normalize_vulnerability_type(item.get("vulnerability_type")) is None:
+            drop_stats["coerced_type"] += 1
+
         env = str(ctx.get("environment") or "BACKEND")
 
         if env == "BROWSER (Frontend)" and vuln_type in FRONTEND_IMPOSSIBLE_TYPES:
+            drop_stats["frontend_filtered"] += 1
             continue
 
-        item = dict(row)
         item["vulnerability_type"] = vuln_type
+
+        if not item.get("function_name") and ctx.get("function_name"):
+            item["function_name"] = ctx.get("function_name")
+        if not item.get("file") and ctx.get("file"):
+            item["file"] = ctx.get("file")
+
         cleaned.append(item)
+
+    if any(drop_stats.values()):
+        logger.info(
+            "LLM sanitize stats: total=%s kept=%s non_dict=%s frontend_filtered=%s coerced_type=%s",
+            len(ai_wrappers),
+            len(cleaned),
+            drop_stats["non_dict"],
+            drop_stats["frontend_filtered"],
+            drop_stats["coerced_type"],
+        )
 
     return cleaned
 
@@ -678,13 +826,28 @@ async def analyze_wrappers_with_llm(
                                 total_sinks.add(sink)
 
                     # Merge vulnerable wrapper functions
-                    new_wrappers = ai_output.get("wrapper_functions", [])
-                    if isinstance(new_wrappers, list):
-                        new_wrappers = _sanitize_llm_wrappers(chunk, new_wrappers)
+                    raw_wrappers = _extract_wrapper_rows(ai_output)
+                    if not raw_wrappers and isinstance(chunk_result, dict):
+                        raw_wrappers = _extract_wrapper_rows(chunk_result)
+
+                    if isinstance(raw_wrappers, list):
+                        kept_wrappers = _sanitize_llm_wrappers(chunk, raw_wrappers)
+                        dropped_count = len(raw_wrappers) - len(kept_wrappers)
+                        if dropped_count > 0:
+                            logger.info(
+                                "Chunk %s/%s [%s]: raw_wrapper_rows=%s kept=%s dropped=%s",
+                                chunk_idx + 1,
+                                len(chunks),
+                                lang_key,
+                                len(raw_wrappers),
+                                len(kept_wrappers),
+                                dropped_count,
+                            )
+
                         final_merged_result["results"][lang_key]["wrapper_functions"].extend(
-                            new_wrappers
+                            kept_wrappers
                         )
-                        total_vuln_wrappers += len(new_wrappers)
+                        total_vuln_wrappers += len(kept_wrappers)
 
             # ── Progress + ETA callback ───────────────────────────────────
             if progress_callback:
