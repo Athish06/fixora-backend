@@ -163,7 +163,7 @@ def build_function_chunk_prompt(
         f"=== TASK ===\n"
         f"Analyse the {lang_display} wrapper functions below.  "
         "For each function, determine:\n"
-        "  - Does it pass user-controlled data to a dangerous sink WITHOUT sanitisation?\n"
+        "  - Does it pass user-controlled data (or likely user-controlled function parameters) to a dangerous sink WITHOUT sanitisation?\n"
         "  - If YES -> include it in the output with vulnerability_type, severity, reason, vulnerable_parameter, malicious_payload, exploit_explanation, and impact_summary.\n"
         "  - If NO  -> skip it entirely.\n\n"
         "=== STRICT TAXONOMY & EXCLUSION RULES ===\n"
@@ -172,9 +172,14 @@ def build_function_chunk_prompt(
         "3. SANITISATION RECOGNITION (CRITICAL): If the code uses strict Regex (e.g., `re.match`), explicit allowlists (e.g., `in ['jpg', 'png']`), or strict type casting (e.g., `int(user_id)`) before hitting the sink, it is NOT vulnerable. Do NOT flag it as a vulnerability.\n"
         "4. FRONTEND RULE: If this is a React/Browser environment, it cannot have SQL/Command Injection.\n"
         "5. VULNERABILITY HIERARCHY: Injections (SQLi, Command, Path) always take precedence over IDOR. Look for Injections first.\n\n"
+        "=== TAINT INFERENCE RULES (IMPORTANT) ===\n"
+        "A. These functions are pre-filtered wrappers that already call dangerous sinks; assume they are reachable unless code clearly proves internal-only constant input.\n"
+        "B. For backend code, treat function parameters as potentially user-controlled by default unless strict sanitisation/allowlisting is present.\n"
+        "C. You do NOT need full caller-graph proof. If unsanitized parameters are concatenated/interpolated/formatted into SQL/command/path/URL sinks, mark vulnerable.\n"
+        "D. If taint source is probable but not explicit in the snippet, still report with severity MEDIUM and explain the assumption clearly.\n\n"
         "SEVERITY GUIDELINES:\n"
         "  HIGH   - Direct path from user input to sink, no sanitisation\n"
-        "  MEDIUM - Partial sanitisation or indirect taint path\n"
+        "  MEDIUM - Partial sanitisation, indirect taint path, or probable taint from unsanitized function parameters\n"
         "  LOW    - Theoretical risk, unlikely to be exploitable as-is\n\n"
         + sink_ctx
         + "RESPOND WITH ONLY VALID JSON. No markdown, no text outside the JSON.\n"
@@ -223,21 +228,35 @@ def _normalize_vulnerability_type(value: Any) -> Optional[str]:
     aliases = {
         "sqli": "SQL Injection",
         "sql injection": "SQL Injection",
+        "nosql injection": "SQL Injection",
+        "ldap injection": "SQL Injection",
+        "xpath injection": "SQL Injection",
         "command injection": "Command Injection",
+        "os command injection": "Command Injection",
+        "rce": "Command Injection",
+        "remote code execution": "Command Injection",
         "path traversal": "Path Traversal",
+        "directory traversal": "Path Traversal",
+        "lfi": "Path Traversal",
+        "local file inclusion": "Path Traversal",
         "xss": "XSS",
         "cross site scripting": "XSS",
         "cross-site scripting": "XSS",
         "ssrf": "SSRF",
         "insecure deserialization": "Insecure Deserialization",
+        "xxe": "Insecure Deserialization",
         "idor": "IDOR / Broken Access Control",
         "bola": "IDOR / Broken Access Control",
+        "broken object level authorization": "IDOR / Broken Access Control",
         "idor / broken access control": "IDOR / Broken Access Control",
         "broken access control": "IDOR / Broken Access Control",
         "cryptographic failure": "Cryptographic Failure",
         "hardcoded secret": "Hardcoded Secret",
         "hardcoded secrets": "Hardcoded Secret",
+        "hardcoded credential": "Hardcoded Secret",
+        "hardcoded credentials": "Hardcoded Secret",
         "business logic flaw": "Business Logic Flaw",
+        "business logic flaws": "Business Logic Flaw",
         "security misconfiguration": "Security Misconfiguration",
     }
 
