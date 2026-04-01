@@ -68,7 +68,7 @@ jobs:
               'coverage','.tox','egg-info','.eggs','site-packages',
               '.github','.vscode','vendor','bower_components',
           ]);
-          const JS_EXTS = new Set(['.js','.jsx','.ts','.tsx','.mjs','.cjs']);
+          const JS_EXTS = new Set(['.js','.jsx','.ts','.tsx','.mjs','.cjs','.mts','.cts']);
           const FRONTEND_IMPORTS = new Set(['react','vue','next','solid-js']);
           const MAX_JS_FILES = 2500;
           const MAX_JS_FILE_BYTES = 1024 * 1024;
@@ -125,43 +125,65 @@ jobs:
 
           function parseFile(fp, src) {
               const ext = path.extname(fp);
-              const plugins = [
+              const basePlugins = [
                   'dynamicImport','optionalChaining','nullishCoalescingOperator',
                   'classProperties','classPrivateProperties','classPrivateMethods',
                   'exportDefaultFrom','exportNamespaceFrom','decorators-legacy',
                   'topLevelAwait','importMeta','objectRestSpread','hashbang',
               ];
-              if (ext === '.ts' || ext === '.tsx') plugins.push('typescript');
-              if (ext === '.jsx' || ext === '.tsx' || ext === '.js' || ext === '.mjs')
-                  plugins.push('jsx');
-              try {
-                  return parse(src, {
-                      sourceType: 'unambiguous',
-                      allowImportExportEverywhere: true,
-                      allowReturnOutsideFunction: true,
-                      allowSuperOutsideMethod: true,
-                      plugins,
-                      errorRecovery: true,
-                  });
-              } catch(e) { return null; }
+              if (ext === '.ts' || ext === '.tsx' || ext === '.mts' || ext === '.cts') {
+                  basePlugins.push('typescript');
+              }
+              if (ext === '.jsx' || ext === '.tsx' || ext === '.js' || ext === '.mjs') {
+                  basePlugins.push('jsx');
+              }
+
+              const pluginVariants = [basePlugins];
+              if (ext === '.js' || ext === '.jsx' || ext === '.mjs' || ext === '.cjs') {
+                  pluginVariants.push([...basePlugins, 'flow', 'flowComments']);
+              }
+
+              for (const sourceType of ['unambiguous', 'module', 'script']) {
+                  for (const plugins of pluginVariants) {
+                      try {
+                          const ast = parse(src, {
+                              sourceType,
+                              allowImportExportEverywhere: true,
+                              allowReturnOutsideFunction: true,
+                              allowSuperOutsideMethod: true,
+                              plugins,
+                              errorRecovery: true,
+                          });
+                          if (ast && ast.program) return ast;
+                      } catch(e) {
+                          // Try next parser mode/plugin set.
+                      }
+                  }
+              }
+              return null;
           }
 
-              function memberProp(node) {
-                  if (!node || !node.property) return null;
-                  return node.property.name || node.property.value || null;
+          function memberProp(node) {
+              if (!node || !node.property) return null;
+              if (node.computed) {
+                  if (node.property.type === 'StringLiteral') return node.property.value;
+                  if (node.property.type === 'Identifier') return node.property.name;
+                  return null;
               }
+              return node.property.name || node.property.value || null;
+          }
 
           function callName(node) {
               if (!node) return null;
               if (node.type === 'Identifier') return node.name;
-                  if (node.type === 'ThisExpression') return 'this';
-                  if (node.type === 'Super') return 'super';
-                  if (node.type === 'CallExpression' || node.type === 'OptionalCallExpression') {
-                      return callName(node.callee);
-                  }
-                  if ((node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') && !node.computed) {
+              if (node.type === 'ThisExpression') return 'this';
+              if (node.type === 'Super') return 'super';
+              if (node.type === 'CallExpression' || node.type === 'OptionalCallExpression') {
+                  return callName(node.callee);
+              }
+              if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
                   const o = callName(node.object);
-                      const p = memberProp(node);
+                  const p = memberProp(node);
                   return o && p ? o + '.' + p : (p || o);
               }
               return null;
@@ -198,6 +220,20 @@ jobs:
                       node.arguments && node.arguments[0] && node.arguments[0].value) {
                       const mod = normMod(node.arguments[0].value);
                       if (mod) imports.add(mod);
+                  }
+
+                  if (node.type === 'AssignmentExpression' &&
+                      node.right && node.right.type === 'CallExpression' &&
+                      node.right.callee && node.right.callee.type === 'Identifier' &&
+                      node.right.callee.name === 'require' &&
+                      node.right.arguments && node.right.arguments[0] && node.right.arguments[0].value) {
+                      const rawMod = node.right.arguments[0].value;
+                      const mod = normMod(rawMod);
+                      const moduleLabel = mod || String(rawMod || 'local-module');
+                      if (mod) imports.add(mod);
+                      if (node.left && node.left.type === 'Identifier') {
+                          alias[node.left.name] = moduleLabel;
+                      }
                   }
 
                   if (node.type === 'VariableDeclaration') {
@@ -274,7 +310,7 @@ jobs:
               function visit(node) {
                   if (!node || typeof node !== 'object') return;
                   if (node !== fnNode && isFn(node)) return;
-                  if (node.type === 'CallExpression') {
+                  if (node.type === 'CallExpression' || node.type === 'OptionalCallExpression') {
                       const cn = callName(node.callee);
                       if (cn) {
                           const root = cn.split('.')[0];
@@ -529,7 +565,7 @@ jobs:
                   }
                   return true;
               }
-              const rel = path.relative(displayRoot, fp);
+              const rel = path.relative(displayRoot, fp).replace(/\\/g, '/');
               const { imports, alias } = collectImports(ast.program.body);
               imports.forEach(i => allImports.add(i));
               const wrappers = extractFile(ast, src, rel, alias, imports);
@@ -655,7 +691,7 @@ jobs:
           def _lang_exts(language):
               if language == "python":
                   return (".py",)
-              return (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+              return (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts")
 
           def _has_lang_file_immediate(root_path, language):
               exts = _lang_exts(language)
@@ -970,12 +1006,44 @@ jobs:
                       capture_output=True, text=True, timeout=120
                   )
                   if result.returncode != 0:
-                      print(f"JS extractor error: {result.stderr[:500]}", file=sys.stderr)
-                      return {"from_imports": [], "wrappers": []}
-                  return json.loads(result.stdout)
+                      err_sample = (result.stderr or "")[:500]
+                      print(f"JS extractor error: {err_sample}", file=sys.stderr)
+                      return {
+                          "from_imports": [],
+                          "wrappers": [],
+                          "extractor_error": "node_exit_nonzero",
+                          "extractor_error_detail": err_sample,
+                      }
+
+                  raw = (result.stdout or "").strip()
+                  if not raw:
+                      err_sample = (result.stderr or "")[:500]
+                      return {
+                          "from_imports": [],
+                          "wrappers": [],
+                          "extractor_error": "empty_stdout",
+                          "extractor_error_detail": err_sample,
+                      }
+
+                  try:
+                      return json.loads(raw)
+                  except Exception as je:
+                      print(f"JS extractor returned invalid JSON: {je}", file=sys.stderr)
+                      return {
+                          "from_imports": [],
+                          "wrappers": [],
+                          "extractor_error": "invalid_json_stdout",
+                          "extractor_error_detail": str(je),
+                          "extractor_stdout_sample": raw[:500],
+                      }
               except Exception as e:
                   print(f"JS extractor failed: {e}", file=sys.stderr)
-                  return {"from_imports": [], "wrappers": []}
+                  return {
+                      "from_imports": [],
+                      "wrappers": [],
+                      "extractor_error": "python_wrapper_exception",
+                      "extractor_error_detail": str(e),
+                  }
 
           # ─── PYTHON WRAPPER EXTRACTION (AST) ─────────────────────────────────────────
           def _get_call_name(call_node):
@@ -1349,6 +1417,7 @@ jobs:
               scan_targets = []
               wrapper_seen = {"python": set(), "react": set()}
               repo_limit_errors = []
+              extractor_warnings = []
               total_wrappers = 0
 
               for t in targets:
@@ -1436,6 +1505,18 @@ jobs:
                       import_mods = js_result.get("from_imports", [])
                       all_modules = sorted(set(manifest_pkgs) | set(import_mods))
                       wrappers = js_result.get("wrappers", [])
+                      js_limits = js_result.get("limits") if isinstance(js_result.get("limits"), dict) else {}
+                      js_parse_samples = js_result.get("parse_error_samples")
+                      extractor_error = js_result.get("extractor_error")
+
+                      if extractor_error:
+                          extractor_warnings.append({
+                              "language": lang,
+                              "scan_path": t["scan_path"],
+                              "error": extractor_error,
+                              "detail": js_result.get("extractor_error_detail", ""),
+                              "stdout_sample": js_result.get("extractor_stdout_sample", ""),
+                          })
                       if js_result.get("limit_exceeded"):
                           repo_limit_errors.append({
                               "language": lang,
@@ -1449,14 +1530,21 @@ jobs:
                       "all": all_modules,
                   }
 
-                  scan_targets.append({
+                  target_entry = {
                       "language": lang,
                       "root_path": t["root_path"],
                       "scan_path": t["scan_path"],
                       "anchor_files": t["anchor_files"],
                       "modules": target_modules,
                       "wrapper_count": len(wrappers),
-                  })
+                  }
+                  if lang == "react":
+                      target_entry["js_limits"] = js_limits
+                      if isinstance(js_parse_samples, list) and js_parse_samples:
+                          target_entry["js_parse_error_samples"] = js_parse_samples
+                      if extractor_error:
+                          target_entry["js_extractor_error"] = extractor_error
+                  scan_targets.append(target_entry)
 
                   total_wrappers += len(wrappers)
                   if total_wrappers > MAX_TOTAL_WRAPPERS:
@@ -1497,6 +1585,7 @@ jobs:
                           "anchors_found": len(found_anchors),
                           "targets_selected": len(scan_targets),
                           "phantom_roots": sorted(phantom_roots),
+                          "extractor_warnings": extractor_warnings,
                       },
                   }
 
@@ -1516,6 +1605,7 @@ jobs:
                       "anchors_found": len(found_anchors),
                       "targets_selected": len(scan_targets),
                       "phantom_roots_skipped": phantom_roots,
+                      "extractor_warnings": extractor_warnings,
                   },
               }
 
