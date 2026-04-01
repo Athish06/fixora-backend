@@ -459,6 +459,11 @@ def _sanitize_llm_wrappers(chunk_wrappers: list, ai_wrappers: list) -> list:
 MAX_RETRIES = 3                  # Retry attempts per chunk (helps transient 429s)
 SOURCE_CODE_CHAR_LIMIT = 1500   # Max chars of source_code sent per function (~375 tokens)
 
+# If a chunk is too large (HTTP 413), retry with progressively smaller source
+# slices before escalating to manual review.
+MANUAL_REVIEW_RECOVERY_LIMITS = [900, 600, 350]
+MANUAL_REVIEW_MICRO_LIMIT = 220
+
 # ── Rate limiting (Groq) ─────────────────────────────────────────────────────
 # These defaults match the dashboard limits shown in your screenshots:
 # ~30 RPM and ~12K TPM for the selected model.
@@ -798,17 +803,43 @@ async def analyze_wrappers_with_llm(
 
             # ── Handle 413 → manual review ────────────────────────────────
             if meta["status"] == "manual_review":
-                manual_review_required.append({
-                    "chunk_index":    meta["chunk_index"],
-                    "lang":           meta["lang"],
-                    "function_names": meta["function_names"],
-                    "reason": (
-                        "Request too large for AI analysis (HTTP 413). "
-                        "Review these functions manually."
-                    ),
-                    "wrapper_count": len(meta["function_names"]),
-                    "was_oversized_estimate": oversized,
-                })
+                recovered_wrappers, unresolved_names = await _recover_too_large_chunk(
+                    language=language,
+                    lang_key=lang_key,
+                    modules=modules,
+                    sink_modules=sink_modules,
+                    sink_reason=sink_reason,
+                    chunk=chunk,
+                    chunk_idx=chunk_idx,
+                    total_chunks=len(chunks),
+                    rate_state=rate_state,
+                )
+
+                if recovered_wrappers:
+                    final_merged_result["results"][lang_key]["wrapper_functions"].extend(
+                        recovered_wrappers
+                    )
+                    total_vuln_wrappers += len(recovered_wrappers)
+
+                if unresolved_names:
+                    manual_review_required.append({
+                        "chunk_index": meta["chunk_index"],
+                        "lang": meta["lang"],
+                        "function_names": unresolved_names,
+                        "reason": (
+                            "Request too large for AI analysis after reduced-size retries (HTTP 413). "
+                            "Review these functions manually."
+                        ),
+                        "wrapper_count": len(unresolved_names),
+                        "was_oversized_estimate": oversized,
+                    })
+                else:
+                    logger.info(
+                        "Recovered previously too-large chunk %s/%s [%s] via reduced-size fallback.",
+                        chunk_idx + 1,
+                        len(chunks),
+                        lang_key,
+                    )
 
             elif meta["status"] == "success" and chunk_result:
                 # ── Merge successful results ──────────────────────────────
@@ -1232,6 +1263,158 @@ async def _call_groq_api(prompt: str, context_payload: Dict[str, Any]) -> Dict[s
     except Exception as exc:
         logger.error(f"Error calling Groq LLM on chunk: {exc}")
         return _empty_result(context_payload, error=str(exc))
+
+
+def _truncate_wrappers_for_retry(wrappers: list, char_limit: int) -> list:
+    """Return a shallow-copied wrapper list with shorter source snippets."""
+    return [
+        {**w, "source_code": (w.get("source_code") or "")[:char_limit]}
+        for w in (wrappers or [])
+    ]
+
+
+def _extract_and_sanitize_wrappers(
+    chunk_context: list,
+    lang_key: str,
+    chunk_result: Dict[str, Any] | None,
+) -> list:
+    """Extract wrapper rows from model output variants and sanitize to canonical schema."""
+    if not isinstance(chunk_result, dict):
+        return []
+
+    chunk_results = chunk_result.get("results", {})
+    ai_output = chunk_results.get(lang_key) or next(iter(chunk_results.values()), None)
+
+    raw_rows = _extract_wrapper_rows(ai_output) if isinstance(ai_output, dict) else []
+    if not raw_rows:
+        raw_rows = _extract_wrapper_rows(chunk_result)
+
+    if not isinstance(raw_rows, list):
+        return []
+
+    return _sanitize_llm_wrappers(chunk_context, raw_rows)
+
+
+async def _recover_too_large_chunk(
+    language: str,
+    lang_key: str,
+    modules: Dict[str, Any],
+    sink_modules: list,
+    sink_reason: str,
+    chunk: list,
+    chunk_idx: int,
+    total_chunks: int,
+    rate_state: dict,
+) -> tuple[list, list]:
+    """
+    Try to recover a 413/manual-review chunk using tighter source truncation.
+
+    Returns:
+      (recovered_vulnerable_wrappers, unresolved_function_names)
+    """
+    recovered: list = []
+
+    # Pass 1: retry whole chunk with progressively smaller source slices.
+    for char_limit in MANUAL_REVIEW_RECOVERY_LIMITS:
+        retry_chunk = _truncate_wrappers_for_retry(chunk, char_limit)
+        retry_prompt = build_function_chunk_prompt(
+            lang_key=lang_key,
+            modules=modules,
+            sink_modules=sink_modules,
+            sink_reason=sink_reason,
+            wrappers=retry_chunk,
+        )
+        retry_payload = {
+            "language": language,
+            "results": {
+                lang_key: {
+                    "modules": modules,
+                    "wrapper_functions": retry_chunk,
+                }
+            },
+        }
+        retry_tokens = max(200, _estimate_text_tokens(retry_prompt))
+
+        await _rate_limit_wait(rate_state, retry_tokens)
+        retry_result, retry_meta = await _call_groq_with_retry(
+            retry_payload,
+            retry_prompt,
+            chunk_idx,
+            total_chunks,
+            lang_key,
+            retry_tokens,
+            rate_state,
+        )
+        _record_request(rate_state, retry_tokens)
+
+        if retry_meta.get("status") == "success" and retry_result:
+            recovered = _extract_and_sanitize_wrappers(chunk, lang_key, retry_result)
+            logger.info(
+                "Recovered chunk %s/%s [%s] with reduced source limit=%s chars (wrappers=%s).",
+                chunk_idx + 1,
+                total_chunks,
+                lang_key,
+                char_limit,
+                len(recovered),
+            )
+            return recovered, []
+
+    # Pass 2: if whole-chunk retries still fail, split into per-function micro requests.
+    unresolved: list = []
+    seen_recovered = set()
+    for fn_wrapper in chunk:
+        fn_name = str(fn_wrapper.get("function_name") or "?")
+        micro_chunk = _truncate_wrappers_for_retry([fn_wrapper], MANUAL_REVIEW_MICRO_LIMIT)
+        micro_prompt = build_function_chunk_prompt(
+            lang_key=lang_key,
+            modules=modules,
+            sink_modules=sink_modules,
+            sink_reason=sink_reason,
+            wrappers=micro_chunk,
+        )
+        micro_payload = {
+            "language": language,
+            "results": {
+                lang_key: {
+                    "modules": modules,
+                    "wrapper_functions": micro_chunk,
+                }
+            },
+        }
+        micro_tokens = max(200, _estimate_text_tokens(micro_prompt))
+
+        await _rate_limit_wait(rate_state, micro_tokens)
+        micro_result, micro_meta = await _call_groq_with_retry(
+            micro_payload,
+            micro_prompt,
+            chunk_idx,
+            total_chunks,
+            lang_key,
+            micro_tokens,
+            rate_state,
+        )
+        _record_request(rate_state, micro_tokens)
+
+        if micro_meta.get("status") == "success" and micro_result:
+            micro_wrappers = _extract_and_sanitize_wrappers([fn_wrapper], lang_key, micro_result)
+            for row in micro_wrappers:
+                key = (str(row.get("function_name") or ""), str(row.get("file") or ""), str(row.get("vulnerability_type") or ""))
+                if key not in seen_recovered:
+                    seen_recovered.add(key)
+                    recovered.append(row)
+            continue
+
+        unresolved.append(fn_name)
+
+    logger.info(
+        "Micro-recovery for chunk %s/%s [%s]: recovered=%s unresolved=%s",
+        chunk_idx + 1,
+        total_chunks,
+        lang_key,
+        len(recovered),
+        len(unresolved),
+    )
+    return recovered, unresolved
 
 
 # ─────────────────────────────────────────────────────────────────────────────
