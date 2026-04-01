@@ -129,7 +129,7 @@ jobs:
                   'dynamicImport','optionalChaining','nullishCoalescingOperator',
                   'classProperties','classPrivateProperties','classPrivateMethods',
                   'exportDefaultFrom','exportNamespaceFrom','decorators-legacy',
-                  'topLevelAwait','importMeta','objectRestSpread',
+                  'topLevelAwait','importMeta','objectRestSpread','hashbang',
               ];
               if (ext === '.ts' || ext === '.tsx') plugins.push('typescript');
               if (ext === '.jsx' || ext === '.tsx' || ext === '.js' || ext === '.mjs')
@@ -146,12 +146,22 @@ jobs:
               } catch(e) { return null; }
           }
 
+              function memberProp(node) {
+                  if (!node || !node.property) return null;
+                  return node.property.name || node.property.value || null;
+              }
+
           function callName(node) {
               if (!node) return null;
               if (node.type === 'Identifier') return node.name;
-              if (node.type === 'MemberExpression' && !node.computed) {
+                  if (node.type === 'ThisExpression') return 'this';
+                  if (node.type === 'Super') return 'super';
+                  if (node.type === 'CallExpression' || node.type === 'OptionalCallExpression') {
+                      return callName(node.callee);
+                  }
+                  if ((node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') && !node.computed) {
                   const o = callName(node.object);
-                  const p = node.property.name || node.property.value;
+                      const p = memberProp(node);
                   return o && p ? o + '.' + p : (p || o);
               }
               return null;
@@ -176,6 +186,20 @@ jobs:
                               alias[s.local.name] = mod;
                       }
                   }
+
+                  if (node.type === 'ImportExpression' && node.source && node.source.value) {
+                      const mod = normMod(node.source.value);
+                      if (mod) imports.add(mod);
+                  }
+
+                  if (node.type === 'CallExpression' &&
+                      node.callee && node.callee.type === 'Identifier' &&
+                      node.callee.name === 'require' &&
+                      node.arguments && node.arguments[0] && node.arguments[0].value) {
+                      const mod = normMod(node.arguments[0].value);
+                      if (mod) imports.add(mod);
+                  }
+
                   if (node.type === 'VariableDeclaration') {
                       for (const d of node.declarations) {
                           if (d.init && d.init.type === 'CallExpression' &&
@@ -254,7 +278,11 @@ jobs:
                       const cn = callName(node.callee);
                       if (cn) {
                           const root = cn.split('.')[0];
-                          const method = cn.includes('.') ? cn.split('.').pop() : null;
+                          const calleeMethod = (
+                              node.callee &&
+                              (node.callee.type === 'MemberExpression' || node.callee.type === 'OptionalMemberExpression')
+                          ) ? memberProp(node.callee) : null;
+                          const method = cn.includes('.') ? cn.split('.').pop() : calleeMethod;
                           if (DANGEROUS_GLOBALS.has(cn) || DANGEROUS_GLOBALS.has(root))
                               calls[cn] = 'builtins';
                           else if (aliasMap[root])
@@ -469,7 +497,9 @@ jobs:
           const allImports = new Set();
           const allWrappers = [];
           let scannedJsFiles = 0;
+          let parseFailedJsFiles = 0;
           let skippedLargeJsFiles = 0;
+          const parseErrorSamples = [];
           let limitExceeded = false;
           let limitReason = '';
 
@@ -492,7 +522,13 @@ jobs:
               try { src = fs.readFileSync(fp, 'utf8'); } catch(e) { return; }
               scannedJsFiles += 1;
               const ast = parseFile(fp, src);
-              if (!ast || !ast.program) return true;
+              if (!ast || !ast.program) {
+                  parseFailedJsFiles += 1;
+                  if (parseErrorSamples.length < 25) {
+                      parseErrorSamples.push(path.relative(displayRoot, fp).replace(/\\/g, '/'));
+                  }
+                  return true;
+              }
               const rel = path.relative(displayRoot, fp);
               const { imports, alias } = collectImports(ast.program.body);
               imports.forEach(i => allImports.add(i));
@@ -540,11 +576,13 @@ jobs:
               limit_reason: limitReason,
               limits: {
                   scanned_files: scannedJsFiles,
+                  parse_failed_files: parseFailedJsFiles,
                   skipped_large_files: skippedLargeJsFiles,
                   max_files: MAX_JS_FILES,
                   max_file_bytes: MAX_JS_FILE_BYTES,
                   max_wrappers: MAX_JS_WRAPPERS,
               },
+              parse_error_samples: parseErrorSamples,
           }));
           JS_EXTRACTOR_SCRIPT
 
