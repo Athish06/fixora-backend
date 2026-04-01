@@ -270,7 +270,7 @@ jobs:
           }
 
           function detectEnvironment(relPath, importsList) {
-              const norm = String(relPath || '').replace(/\\/g, '/').toLowerCase();
+              const norm = String(relPath || '').replace(/\\\\/g, '/').toLowerCase();
               const isTsxJsx = /\.(tsx|jsx)$/i.test(norm);
               const hasFrontendPath = /\/(components|pages|views|hooks|ui|layouts)\//i.test(norm);
               const hasFrontendImport = (importsList || []).some((i) => FRONTEND_IMPORTS.has(String(i || '').toLowerCase()));
@@ -561,11 +561,11 @@ jobs:
               if (!ast || !ast.program) {
                   parseFailedJsFiles += 1;
                   if (parseErrorSamples.length < 25) {
-                      parseErrorSamples.push(path.relative(displayRoot, fp).replace(/\\/g, '/'));
+                      parseErrorSamples.push(path.relative(displayRoot, fp).replace(/\\\\/g, '/'));
                   }
                   return true;
               }
-              const rel = path.relative(displayRoot, fp).replace(/\\/g, '/');
+              const rel = path.relative(displayRoot, fp).replace(/\\\\/g, '/');
               const { imports, alias } = collectImports(ast.program.body);
               imports.forEach(i => allImports.add(i));
               const wrappers = extractFile(ast, src, rel, alias, imports);
