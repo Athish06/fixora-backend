@@ -32,13 +32,17 @@ settings = get_settings()
 
 UNIFIED_VULN_CATEGORIES = [
     "Injection (SQL/NoSQL/LDAP/Command/Path Traversal)",
+    "Broken Authentication",
     "Broken Access Control (IDOR/BOLA)",
+    "Missing Authentication / Unauthenticated Access",
+    "Mass Assignment",
     "Cross-Site Scripting (XSS)",
     "Server-Side Request Forgery (SSRF)",
     "Insecure Deserialization",
     "Hardcoded Secrets / Credentials",
     "Cryptographic Failures",
-    "Security Misconfiguration (CORS, Headers)",
+    "Security Misconfiguration (CORS, Headers, Debug)",
+    "Input Validation Failure",
     "Insecure Design / Architecture",
     "Business Logic Flaws",
 ]
@@ -52,8 +56,16 @@ VULN_TYPE_TO_CATEGORY = {
     "Insecure Deserialization": "Insecure Deserialization",
     "Hardcoded Secret": "Hardcoded Secrets / Credentials",
     "Cryptographic Failure": "Cryptographic Failures",
+    "Broken Authentication": "Broken Authentication",
+    "Plaintext Password": "Broken Authentication",
+    "Missing Authentication": "Missing Authentication / Unauthenticated Access",
+    "Unauthenticated Endpoint": "Missing Authentication / Unauthenticated Access",
+    "Mass Assignment": "Mass Assignment",
+    "Input Validation Failure": "Input Validation Failure",
+    "ReDoS": "Input Validation Failure",
     "IDOR / Broken Access Control": "Broken Access Control (IDOR/BOLA)",
-    "Security Misconfiguration": "Security Misconfiguration (CORS, Headers)",
+    "Security Misconfiguration": "Security Misconfiguration (CORS, Headers, Debug)",
+    "Debug Mode Enabled": "Security Misconfiguration (CORS, Headers, Debug)",
     "Business Logic Flaw": "Business Logic Flaws",
 }
 
@@ -79,10 +91,24 @@ def _normalize_rule_id_to_vuln_type(rule_id: str) -> str:
         return "SSRF"
     if any(x in rule_id for x in ["deserialization", "pickle", "yaml.load", "xxe", "xml-external-entity", "resolve_entities"]):
         return "Insecure Deserialization"
-    if any(x in rule_id for x in ["secret", "hardcoded", "password", "token", "key"]):
+    if any(x in rule_id for x in ["secret", "hardcoded", "token", "key"]):
         return "Hardcoded Secret"
     if any(x in rule_id for x in ["crypto", "hash", "md5", "sha1", "cipher", "random", "jwt"]):
         return "Cryptographic Failure"
+    if any(x in rule_id for x in ["plaintext-password", "plaintext_password", "weak-password", "weak_password", "password-storage", "password_storage", "insecure-password", "insecure_password", "hardcoded-password", "hardcoded_password"]):
+        return "Plaintext Password"
+    if any(x in rule_id for x in ["debug", "debug-mode", "debug_mode", "debug-enabled", "debug_enabled"]):
+        return "Debug Mode Enabled"
+    if any(x in rule_id for x in ["mass-assignment", "mass_assignment", "massassignment", "parameter-pollution", "parameter_pollution", "over-posting", "overposting"]):
+        return "Mass Assignment"
+    if any(x in rule_id for x in ["redos", "regex-dos", "regex_dos", "catastrophic-backtrack", "catastrophic_backtrack", "catastrophic-backtracking", "catastrophic_backtracking"]):
+        return "ReDoS"
+    if any(x in rule_id for x in ["no-auth", "no_auth", "missing-auth", "missing_auth", "missing-authentication", "missing_authentication", "unauthenticated", "anonymous-access", "anonymous_access", "unprotected-route", "unprotected_route"]):
+        return "Missing Authentication"
+    if any(x in rule_id for x in ["broken-auth", "broken_auth", "broken-authentication", "broken_authentication", "weak-auth", "weak_auth", "auth-bypass", "auth_bypass"]):
+        return "Broken Authentication"
+    if any(x in rule_id for x in ["rate-limit", "brute-force", "no-rate-limit"]):
+        return "Security Misconfiguration"
     if any(x in rule_id for x in ["idor", "bola", "authz", "access-control", "permission"]):
         return "IDOR / Broken Access Control"
     if any(x in rule_id for x in ["cors", "cookie", "config", "header"]):

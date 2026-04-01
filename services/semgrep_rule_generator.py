@@ -30,6 +30,12 @@ VULN_TYPE_TO_CWE: Dict[str, List[str]] = {
     "Log Injection":        ["CWE-117"],
     "NoSQL Injection":      ["CWE-943"],
     "Prototype Pollution":  ["CWE-1321"],
+    "Plaintext Password":   ["CWE-256", "CWE-916"],
+    "Broken Authentication": ["CWE-287"],
+    "Missing Authentication": ["CWE-306"],
+    "Mass Assignment":      ["CWE-915"],
+    "Input Validation Failure": ["CWE-400", "CWE-1333"],
+    "Debug Mode Enabled":   ["CWE-94"],
 }
 
 SEVERITY_TO_SEMGREP = {
@@ -60,6 +66,12 @@ VULN_TYPE_TO_OWASP: Dict[str, List[str]] = {
     "Open Redirect":        ["A01:2021"],
     "Code Injection":       ["A03:2021"],
     "NoSQL Injection":      ["A03:2021"],
+    "Plaintext Password":   ["A02:2021"],
+    "Broken Authentication": ["A07:2021"],
+    "Missing Authentication": ["A01:2021"],
+    "Mass Assignment":      ["A03:2021"],
+    "Input Validation Failure": ["A03:2021"],
+    "Debug Mode Enabled":   ["A05:2021"],
 }
 
 
@@ -186,7 +198,13 @@ def _build_wrapper_rule(
         "XSS": "Can steal user session cookies, hijack accounts, or deface the application.",
         "IDOR / Broken Access Control": "Allows attackers to view, edit, or delete private data belonging to other users.",
         "SSRF": "Can force the server to scan internal networks and bypass firewalls.",
-        "Insecure Deserialization": "Can lead to Remote Code Execution (RCE) via malicious payload injection."
+        "Insecure Deserialization": "Can lead to Remote Code Execution (RCE) via malicious payload injection.",
+        "Plaintext Password": "Database dump immediately exposes all user passwords in plain text. Account takeover at scale with zero cracking effort.",
+        "Broken Authentication": "Attackers bypass authentication entirely or forge valid sessions.",
+        "Missing Authentication": "Any unauthenticated user can access sensitive data, admin functions, or user credentials without any token.",
+        "Mass Assignment": "Attackers inject privileged fields (admin=true, role=admin) during registration/update to escalate privileges.",
+        "Input Validation Failure": "Specially crafted input causes catastrophic regex backtracking, leading to CPU exhaustion and denial of service.",
+        "Debug Mode Enabled": "Interactive debugger exposed in production allows arbitrary code execution in the server process.",
     }
     impact_text = impact_map.get(vuln_type, "Can allow attackers to bypass intended application logic.")
 

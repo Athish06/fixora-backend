@@ -26,12 +26,20 @@ ALLOWED_VULNERABILITY_TYPES = {
     "Hardcoded Secret",
     "Business Logic Flaw",
     "Security Misconfiguration",
+    "Plaintext Password",
+    "Broken Authentication",
+    "Missing Authentication",
+    "Mass Assignment",
+    "Input Validation Failure",
+    "Debug Mode Enabled",
 }
 
 FRONTEND_IMPOSSIBLE_TYPES = {
     "SQL Injection",
     "Command Injection",
     "Path Traversal",
+    "Missing Authentication",
+    "Mass Assignment",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -167,16 +175,23 @@ def build_function_chunk_prompt(
         "  - If YES -> include it in the output with vulnerability_type, severity, reason, vulnerable_parameter, malicious_payload, exploit_explanation, and impact_summary.\n"
         "  - If NO  -> skip it entirely.\n\n"
         "=== STRICT TAXONOMY & EXCLUSION RULES ===\n"
-        "1. ALLOWED CATEGORIES: You MUST classify vulnerabilities into exactly one of these types: ['SQL Injection', 'Command Injection', 'Path Traversal', 'XSS', 'SSRF', 'Insecure Deserialization', 'IDOR / Broken Access Control', 'Cryptographic Failure', 'Hardcoded Secret', 'Security Misconfiguration', 'Business Logic Flaw'].\n"
+        "1. ALLOWED CATEGORIES: You MUST classify vulnerabilities into exactly one of these types: ['SQL Injection', 'Command Injection', 'Path Traversal', 'XSS', 'SSRF', 'Insecure Deserialization', 'IDOR / Broken Access Control', 'Cryptographic Failure', 'Hardcoded Secret', 'Security Misconfiguration', 'Business Logic Flaw', 'Plaintext Password', 'Broken Authentication', 'Missing Authentication', 'Mass Assignment', 'Input Validation Failure', 'Debug Mode Enabled'].\n"
         "2. BUSINESS LOGIC FLAWS: Only use this category for logic/workflow bypasses (e.g., skipping a payment step). Do NOT use this for injections.\n"
         "3. SANITISATION RECOGNITION (CRITICAL): If the code uses strict Regex (e.g., `re.match`), explicit allowlists (e.g., `in ['jpg', 'png']`), or strict type casting (e.g., `int(user_id)`) before hitting the sink, it is NOT vulnerable. Do NOT flag it as a vulnerability.\n"
-        "4. FRONTEND RULE: If this is a React/Browser environment, it cannot have SQL/Command Injection.\n"
+        "4. FRONTEND RULE: If this is a React/Browser environment, it cannot have SQL Injection, Command Injection, Path Traversal, Missing Authentication, or Mass Assignment.\n"
         "5. VULNERABILITY HIERARCHY: Injections (SQLi, Command, Path) always take precedence over IDOR. Look for Injections first.\n\n"
+        "6. PLAINTEXT PASSWORD: If a function compares passwords with == instead of using a hashing library (bcrypt, hashlib with salt, etc.), classify as 'Plaintext Password'. This is HIGH severity.\n"
+        "7. MISSING AUTHENTICATION: If a function is a route handler (Flask route, FastAPI endpoint, Express route) with no auth check/decorator AND accesses user data, credentials, or admin info, classify as 'Missing Authentication'. HIGH severity.\n"
+        "8. MASS ASSIGNMENT: If a function accepts arbitrary request body fields and passes them directly to a model/ORM constructor or update() without field allowlisting, classify as 'Mass Assignment'.\n"
+        "9. INPUT VALIDATION FAILURE: If a function uses a complex regex with potential for catastrophic backtracking (ReDoS), or fails to validate/sanitize types properly, classify as 'Input Validation Failure'.\n\n"
         "=== TAINT INFERENCE RULES (IMPORTANT) ===\n"
         "A. These functions are pre-filtered wrappers that already call dangerous sinks; assume they are reachable unless code clearly proves internal-only constant input.\n"
         "B. For backend code, treat function parameters as potentially user-controlled by default unless strict sanitisation/allowlisting is present.\n"
         "C. You do NOT need full caller-graph proof. If unsanitized parameters are concatenated/interpolated/formatted into SQL/command/path/URL sinks, mark vulnerable.\n"
-        "D. If taint source is probable but not explicit in the snippet, still report with severity MEDIUM and explain the assumption clearly.\n\n"
+        "D. If taint source is probable but not explicit in the snippet, still report with severity MEDIUM and explain the assumption clearly.\n"
+        "E. ANTI-PATTERN DETECTION: Some wrappers are marked with anti_pattern field. If anti_pattern == 'plaintext_password_comparison', classify as 'Plaintext Password' with HIGH severity. If anti_pattern == 'missing_authentication', classify as 'Missing Authentication' with HIGH severity without further analysis needed.\n"
+        "F. MASS ASSIGNMENT DETECTION: If a function accepts **kwargs, request.json, request.form, or a dict of user-provided fields and passes it to Model(...) / .update(**data) / .create(**data) without explicit field filtering, classify as 'Mass Assignment'.\n"
+        "G. CONFIGURATION DETECTION: If a function runs the app/server in debug mode (for example app.run(debug=True), app.run(host='0.0.0.0', debug=True), or equivalent JS dev debug exposure in production), classify as 'Debug Mode Enabled'.\n\n"
         "SEVERITY GUIDELINES:\n"
         "  HIGH   - Direct path from user input to sink, no sanitisation\n"
         "  MEDIUM - Partial sanitisation, indirect taint path, or probable taint from unsanitized function parameters\n"
@@ -258,6 +273,20 @@ def _normalize_vulnerability_type(value: Any) -> Optional[str]:
         "business logic flaw": "Business Logic Flaw",
         "business logic flaws": "Business Logic Flaw",
         "security misconfiguration": "Security Misconfiguration",
+        "plaintext password": "Plaintext Password",
+        "plaintext credential": "Plaintext Password",
+        "insecure password storage": "Plaintext Password",
+        "password in plain text": "Plaintext Password",
+        "broken authentication": "Broken Authentication",
+        "missing authentication": "Missing Authentication",
+        "no authentication": "Missing Authentication",
+        "unauthenticated endpoint": "Missing Authentication",
+        "mass assignment": "Mass Assignment",
+        "parameter pollution": "Mass Assignment",
+        "input validation failure": "Input Validation Failure",
+        "redos": "Input Validation Failure",
+        "regex dos": "Input Validation Failure",
+        "debug mode enabled": "Debug Mode Enabled",
     }
 
     key = raw.lower()
@@ -282,6 +311,16 @@ def _normalize_vulnerability_type(value: Any) -> Optional[str]:
         return "Insecure Deserialization"
     if any(tok in fuzzy for tok in ["idor", "bola", "access control", "authorization"]):
         return "IDOR / Broken Access Control"
+    if any(tok in fuzzy for tok in ["plaintext", "plain text", "password storage", "insecure password"]):
+        return "Plaintext Password"
+    if any(tok in fuzzy for tok in ["mass assign", "parameter pollution", "bulk assign"]):
+        return "Mass Assignment"
+    if any(tok in fuzzy for tok in ["missing auth", "no auth", "unauthenticated", "anonymous access"]):
+        return "Missing Authentication"
+    if any(tok in fuzzy for tok in ["redos", "regex dos", "catastrophic backtrack", "input validation"]):
+        return "Input Validation Failure"
+    if "debug mode" in fuzzy or "debug enabled" in fuzzy:
+        return "Debug Mode Enabled"
     if any(tok in fuzzy for tok in ["crypto", "cryptographic", "hash", "cipher"]):
         return "Cryptographic Failure"
     if any(tok in fuzzy for tok in ["hardcoded", "secret", "credential", "token", "password"]):
@@ -340,8 +379,20 @@ def _infer_vulnerability_type_from_context(row: Dict[str, Any], ctx: Dict[str, A
         return "SSRF"
     if any(tok in haystack for tok in ["deserialize", "pickle", "yaml.load", "xxe"]):
         return "Insecure Deserialization"
+    if any(tok in haystack for tok in ["missing authentication", "missing auth", "no authentication", "no auth", "unauthenticated", "anonymous access"]):
+        return "Missing Authentication"
+    if any(tok in haystack for tok in ["broken authentication", "auth bypass", "authentication bypass"]):
+        return "Broken Authentication"
     if any(tok in haystack for tok in ["idor", "bola", "access control", "unauthorized", "authorization"]):
         return "IDOR / Broken Access Control"
+    if any(tok in haystack for tok in ["plaintext password", "plain text password", "password in plain text", "insecure password storage", "password comparison"]):
+        return "Plaintext Password"
+    if any(tok in haystack for tok in ["mass assignment", "parameter pollution", "bulk assign", "unrestricted field"]):
+        return "Mass Assignment"
+    if any(tok in haystack for tok in ["input validation failure", "redos", "regex dos", "catastrophic backtrack", "catastrophic backtracking"]):
+        return "Input Validation Failure"
+    if any(tok in haystack for tok in ["debug mode", "debug enabled", "debug=true", "app.debug"]):
+        return "Debug Mode Enabled"
     if any(tok in haystack for tok in ["md5", "sha1", "weak crypto", "weak hash", "cipher"]):
         return "Cryptographic Failure"
     if any(tok in haystack for tok in ["secret", "token", "password", "api key", "hardcoded"]):
