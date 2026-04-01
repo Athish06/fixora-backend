@@ -1183,7 +1183,7 @@ jobs:
                   except Exception:
                       continue
 
-                  rel = os.path.relpath(fp, display_root).replace("\\", "/")
+                  rel = os.path.relpath(fp, display_root).replace("\\\\", "/")
 
                   for node in ast.walk(tree):
                       if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
