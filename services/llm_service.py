@@ -535,10 +535,39 @@ RATE_LIMIT_JITTER_MAX = int(os.getenv("GROQ_RATE_LIMIT_JITTER_MAX", "10"))
 # Estimated token cost of prompt overhead per chunk:
 # system message + module list headers + formatting (~600 tokens)
 PROMPT_OVERHEAD_TOKENS = 600
-# Token budget available for function content inside a single Groq request.
-# Keep this tied directly to effective TPM to preserve the original greedy
-# chunking behavior.
-FUNCTION_BUDGET_PER_CHUNK = EFFECTIVE_TPM - PROMPT_OVERHEAD_TOKENS
+
+# Completion and request sizing knobs.
+MAX_COMPLETION_TOKENS = int(os.getenv("GROQ_MAX_COMPLETION_TOKENS", "8192"))
+MIN_COMPLETION_TOKENS = int(os.getenv("GROQ_MIN_COMPLETION_TOKENS", "512"))
+
+# Headroom below the provider hard TPM to absorb chat/protocol token overhead.
+REQUEST_TOKEN_SAFETY_MARGIN_TOKENS = int(
+    os.getenv("GROQ_REQUEST_TOKEN_SAFETY_MARGIN_TOKENS", "900")
+)
+
+# Estimated system/chat scaffolding tokens outside the user prompt body.
+SYSTEM_PROMPT_OVERHEAD_TOKENS = int(
+    os.getenv("GROQ_SYSTEM_PROMPT_OVERHEAD_TOKENS", "120")
+)
+
+_DEFAULT_SINGLE_REQUEST_BUDGET = max(
+    1024,
+    GROQ_TPM_LIMIT - REQUEST_TOKEN_SAFETY_MARGIN_TOKENS,
+)
+SINGLE_REQUEST_TOKEN_BUDGET = min(
+    GROQ_TPM_LIMIT,
+    int(os.getenv("GROQ_SINGLE_REQUEST_TOKEN_BUDGET", str(_DEFAULT_SINGLE_REQUEST_BUDGET))),
+)
+
+# Token budget available for function content inside a single request,
+# after reserving room for prompt scaffolding and minimum completion tokens.
+FUNCTION_BUDGET_PER_CHUNK = max(
+    256,
+    SINGLE_REQUEST_TOKEN_BUDGET
+    - PROMPT_OVERHEAD_TOKENS
+    - SYSTEM_PROMPT_OVERHEAD_TOKENS
+    - MIN_COMPLETION_TOKENS,
+)
 
 # Hard upper bound for repository size at analysis stage.
 # If wrapper extraction would generate too many chunks, fail fast so scans
@@ -553,6 +582,14 @@ if tiktoken is not None:
         _TOKEN_ENCODER = None
 
 
+SYSTEM_PROMPT_CONTENT = (
+    "You are an expert application-security engineer. "
+    "You analyze code for vulnerabilities and respond ONLY with valid JSON. "
+    "Never include markdown code fences or any text outside the JSON object. "
+    "Do NOT include a \"source_code\" field in your output."
+)
+
+
 def _estimate_text_tokens(text: str) -> int:
     """Estimate token count using cl100k_base when available."""
     if _TOKEN_ENCODER is not None:
@@ -562,6 +599,26 @@ def _estimate_text_tokens(text: str) -> int:
             pass
     # Fallback heuristic if tokenizer unavailable at runtime.
     return max(1, len(text or "") // 4)
+
+
+def _estimate_prompt_tokens(prompt: str) -> int:
+    """Estimate full input tokens (user prompt + system/chat scaffolding)."""
+    return _estimate_text_tokens(prompt) + SYSTEM_PROMPT_OVERHEAD_TOKENS
+
+
+def _pick_completion_tokens(prompt_tokens: int) -> int:
+    """Pick the largest safe completion size for this prompt within request budget."""
+    remaining = SINGLE_REQUEST_TOKEN_BUDGET - int(prompt_tokens)
+    if remaining <= 0:
+        return 64
+    if remaining >= MIN_COMPLETION_TOKENS:
+        return min(MAX_COMPLETION_TOKENS, remaining)
+    return max(64, min(MAX_COMPLETION_TOKENS, remaining))
+
+
+def _estimate_request_tokens(prompt: str, max_completion_tokens: int) -> int:
+    """Estimate total request tokens = prompt input + requested completion."""
+    return _estimate_prompt_tokens(prompt) + int(max_completion_tokens)
 
 
 def _estimate_function_tokens(func: dict) -> int:
@@ -805,8 +862,6 @@ async def analyze_wrappers_with_llm(
         for chunk_idx, chunk_info in enumerate(chunks):
             chunk     = chunk_info["funcs"]
             oversized = chunk_info["oversized"]
-            # Total estimated tokens = function content + prompt overhead
-            estimated_tokens = chunk_info["func_tokens"] + PROMPT_OVERHEAD_TOKENS
 
             # Build phase-2 prompt with truncated source_code
             truncated_chunk = [
@@ -816,6 +871,9 @@ async def analyze_wrappers_with_llm(
             prompt = build_function_chunk_prompt(
                 lang_key, modules, sink_modules, sink_reason, truncated_chunk
             )
+            prompt_tokens = _estimate_prompt_tokens(prompt)
+            max_completion_tokens = _pick_completion_tokens(prompt_tokens)
+            estimated_tokens = _estimate_request_tokens(prompt, max_completion_tokens)
 
             chunk_payload = {
                 "language": language,
@@ -827,27 +885,51 @@ async def analyze_wrappers_with_llm(
                 },
             }
 
-            # ── Rate-limit gate ───────────────────────────────────────────
-            await _rate_limit_wait(rate_state, estimated_tokens)
+            chunk_result = None
+            if estimated_tokens > SINGLE_REQUEST_TOKEN_BUDGET and max_completion_tokens <= 64:
+                logger.warning(
+                    "  Phase 2 chunk %s/%s [%s] preflight too large "
+                    "(est=%s, budget=%s, input~%s). "
+                    "Skipping direct call and entering reduced-size recovery.",
+                    chunk_idx + 1,
+                    len(chunks),
+                    lang_key,
+                    estimated_tokens,
+                    SINGLE_REQUEST_TOKEN_BUDGET,
+                    prompt_tokens,
+                )
+                meta = {
+                    "chunk_index": chunk_idx,
+                    "lang": lang_key,
+                    "function_names": [w.get("function_name", "?") for w in chunk],
+                    "status": "manual_review",
+                    "attempts": 0,
+                    "error": "Preflight oversized request estimate exceeded per-request budget",
+                }
+            else:
+                # ── Rate-limit gate ───────────────────────────────────────────
+                await _rate_limit_wait(rate_state, estimated_tokens)
 
-            logger.info(
-                f"  Phase 2 chunk {chunk_idx+1}/{len(chunks)} [{lang_key}] "
-                f"({len(chunk)} fn(s), ~{estimated_tokens} est. tokens)"
-                + (" [OVERSIZED — single fn exceeds budget, may 413]" if oversized else "")
-            )
+                logger.info(
+                    f"  Phase 2 chunk {chunk_idx+1}/{len(chunks)} [{lang_key}] "
+                    f"({len(chunk)} fn(s), ~{estimated_tokens} est. req tokens, "
+                    f"input~{prompt_tokens}, max_tokens={max_completion_tokens})"
+                    + (" [OVERSIZED — single fn exceeds budget, may 413]" if oversized else "")
+                )
 
-            # ── Call Groq with retry / error handling ─────────────────────
-            chunk_result, meta = await _call_groq_with_retry(
-                chunk_payload, prompt, chunk_idx, len(chunks), lang_key,
-                estimated_tokens, rate_state,
-            )
+                # ── Call Groq with retry / error handling ─────────────────────
+                chunk_result, meta = await _call_groq_with_retry(
+                    chunk_payload, prompt, chunk_idx, len(chunks), lang_key,
+                    estimated_tokens, max_completion_tokens, rate_state,
+                )
 
             # Annotate meta with chunk-level details before storing
             meta["oversized"]  = oversized
             meta["func_count"] = len(chunk)
 
             # Record this request against the rate window
-            _record_request(rate_state, estimated_tokens)
+            if meta.get("attempts", 0) > 0:
+                _record_request(rate_state, estimated_tokens)
 
             all_chunk_meta.append(meta)
             processed_total += 1
@@ -1001,12 +1083,13 @@ async def _rate_limit_wait(state: dict, estimated_tokens: int):
     import time
     import asyncio
 
-    if estimated_tokens > EFFECTIVE_TPM:
-        # Oversized estimates can happen for huge single-function chunks.
-        # Let the call proceed and rely on HTTP 413 handling instead of deadlocking.
+    if estimated_tokens > SINGLE_REQUEST_TOKEN_BUDGET:
+        # This request likely exceeds provider hard limits even after budgeting.
+        # Let it proceed so existing 413/manual-review recovery path can run.
         logger.warning(
-            f"Estimated request ({estimated_tokens} tokens) exceeds effective TPM "
-            f"({EFFECTIVE_TPM}). Sending anyway and relying on 413/manual-review fallback."
+            f"Estimated request ({estimated_tokens} tokens) exceeds per-request budget "
+            f"({SINGLE_REQUEST_TOKEN_BUDGET}). Sending anyway and relying on "
+            "413/manual-review fallback."
         )
         return
 
@@ -1031,9 +1114,13 @@ async def _rate_limit_wait(state: dict, estimated_tokens: int):
             state["tokens_this_minute"] = 0
             return
 
+        # Allow a single large request to use a fresh window even when it
+        # exceeds EFFECTIVE_TPM, while still preventing bursts.
+        window_token_limit = max(EFFECTIVE_TPM, estimated_tokens)
+
         needs_wait = (
             state["requests_this_minute"] >= MAX_RPM
-            or state["tokens_this_minute"] + estimated_tokens > EFFECTIVE_TPM
+            or state["tokens_this_minute"] + estimated_tokens > window_token_limit
         )
         if not needs_wait:
             return
@@ -1099,11 +1186,9 @@ async def _call_groq_module_phase(
     import asyncio
 
     prompt = build_module_sink_prompt(lang_key, modules)
-    # Module-only prompts are very small — rough estimate
-    estimated_tokens = max(
-        200,
-        _estimate_text_tokens(prompt),
-    )
+    prompt_tokens = _estimate_prompt_tokens(prompt)
+    max_completion_tokens = _pick_completion_tokens(prompt_tokens)
+    estimated_tokens = _estimate_request_tokens(prompt, max_completion_tokens)
     context_payload = {"language": lang_key, "results": {lang_key: {"modules": modules}}}
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -1111,7 +1196,11 @@ async def _call_groq_module_phase(
             f"  Phase 1 [{lang_key}] — module sink detection, attempt {attempt}/{MAX_RETRIES}"
         )
         await _rate_limit_wait(rate_state, estimated_tokens)
-        result = await _call_groq_api(prompt, context_payload)
+        result = await _call_groq_api(
+            prompt,
+            context_payload,
+            max_completion_tokens=max_completion_tokens,
+        )
         _record_request(rate_state, estimated_tokens)
 
         if not result or result.get("error"):
@@ -1161,6 +1250,7 @@ async def _call_groq_with_retry(
     total_chunks: int,
     lang_key: str,
     estimated_tokens: int,
+    max_completion_tokens: int,
     rate_state: dict,
 ) -> tuple:
     """
@@ -1193,7 +1283,11 @@ async def _call_groq_with_retry(
             f"  Chunk {chunk_index+1}/{total_chunks} [{lang_key}] — "
             f"attempt {attempt}/{MAX_RETRIES}"
         )
-        result = await _call_groq_api(prompt, chunk_payload)
+        result = await _call_groq_api(
+            prompt,
+            chunk_payload,
+            max_completion_tokens=max_completion_tokens,
+        )
 
         # ── Success ───────────────────────────────────────────────────────
         if result and not result.get("error"):
@@ -1243,7 +1337,11 @@ async def _call_groq_with_retry(
     return None, meta
 
 
-async def _call_groq_api(prompt: str, context_payload: Dict[str, Any]) -> Dict[str, Any]:
+async def _call_groq_api(
+    prompt: str,
+    context_payload: Dict[str, Any],
+    max_completion_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
     """Make a single Groq API call with the pre-built *prompt*.
 
     *context_payload* is only used for error fallback metadata (language key,
@@ -1269,24 +1367,27 @@ async def _call_groq_api(prompt: str, context_payload: Dict[str, Any]) -> Dict[s
             api_key=groq_token,
         )
 
+        if max_completion_tokens is None:
+            prompt_tokens = _estimate_prompt_tokens(prompt)
+            max_completion_tokens = _pick_completion_tokens(prompt_tokens)
+        else:
+            max_completion_tokens = int(max_completion_tokens)
+
+        max_completion_tokens = max(64, min(MAX_COMPLETION_TOKENS, max_completion_tokens))
+
         completion = await client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "You are an expert application-security engineer. "
-                        "You analyze code for vulnerabilities and respond ONLY with valid JSON. "
-                        "Never include markdown code fences or any text outside the JSON object. "
-                        "Do NOT include a \"source_code\" field in your output."
-                    ),
+                    "content": SYSTEM_PROMPT_CONTENT,
                 },
                 {
                     "role": "user",
                     "content": prompt,
                 },
             ],
-            max_tokens=8192,
+            max_tokens=max_completion_tokens,
             temperature=0.1,
             response_format={"type": "json_object"},
         )
@@ -1384,7 +1485,22 @@ async def _recover_too_large_chunk(
                 }
             },
         }
-        retry_tokens = max(200, _estimate_text_tokens(retry_prompt))
+        retry_prompt_tokens = _estimate_prompt_tokens(retry_prompt)
+        retry_max_completion = _pick_completion_tokens(retry_prompt_tokens)
+        retry_tokens = _estimate_request_tokens(retry_prompt, retry_max_completion)
+
+        if retry_tokens > SINGLE_REQUEST_TOKEN_BUDGET and retry_max_completion <= 64:
+            logger.info(
+                "Skipping recovery attempt for chunk %s/%s [%s] at source_limit=%s: "
+                "still over request budget (est=%s, budget=%s).",
+                chunk_idx + 1,
+                total_chunks,
+                lang_key,
+                char_limit,
+                retry_tokens,
+                SINGLE_REQUEST_TOKEN_BUDGET,
+            )
+            continue
 
         await _rate_limit_wait(rate_state, retry_tokens)
         retry_result, retry_meta = await _call_groq_with_retry(
@@ -1394,6 +1510,7 @@ async def _recover_too_large_chunk(
             total_chunks,
             lang_key,
             retry_tokens,
+            retry_max_completion,
             rate_state,
         )
         _record_request(rate_state, retry_tokens)
@@ -1432,7 +1549,21 @@ async def _recover_too_large_chunk(
                 }
             },
         }
-        micro_tokens = max(200, _estimate_text_tokens(micro_prompt))
+        micro_prompt_tokens = _estimate_prompt_tokens(micro_prompt)
+        micro_max_completion = _pick_completion_tokens(micro_prompt_tokens)
+        micro_tokens = _estimate_request_tokens(micro_prompt, micro_max_completion)
+
+        if micro_tokens > SINGLE_REQUEST_TOKEN_BUDGET and micro_max_completion <= 64:
+            logger.info(
+                "Skipping micro-recovery for function %s [%s]: still over request budget "
+                "(est=%s, budget=%s).",
+                fn_name,
+                lang_key,
+                micro_tokens,
+                SINGLE_REQUEST_TOKEN_BUDGET,
+            )
+            unresolved.append(fn_name)
+            continue
 
         await _rate_limit_wait(rate_state, micro_tokens)
         micro_result, micro_meta = await _call_groq_with_retry(
@@ -1442,6 +1573,7 @@ async def _recover_too_large_chunk(
             total_chunks,
             lang_key,
             micro_tokens,
+            micro_max_completion,
             rate_state,
         )
         _record_request(rate_state, micro_tokens)
