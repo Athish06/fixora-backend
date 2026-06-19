@@ -165,6 +165,16 @@ async def get_scan_status(
     if not scan:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Scan not found')
     
+    # Ownership check: verify the scan's repository belongs to this user
+    repo = await db.repositories.find_one({
+        'id': scan.get('repository_id'),
+        'user_id': current_user.user_id
+    })
+    if not repo:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Access denied')
+    
+    # Map DB 'id' field to Pydantic 'scan_id' to prevent ValidationError
+    scan['scan_id'] = scan.pop('id', scan_id)
     return ScanResult(**scan)
 
 
@@ -403,22 +413,39 @@ async def _process_wrapper_results_in_background(
         else:
             logger.info("[BG] No vulnerable wrappers found — skipping custom rule generation")
 
-        await db.scans.update_one(
-            {"id": scan_id},
-            {"$set": {
-                "progress": 45,
-                "phase": "triggering_semgrep",
-                "llm_result": llm_result,
-                "custom_rules_yaml": custom_rules_yaml,
-            }}
-        )
-        stage = "store_ai_debug"
-
-        # Build chunk summary for WebSocket
+        # Persist LLM failure warnings to the scan record (H3 fix)
         failed_count = chunk_meta["failed"] if chunk_meta else 0
         total_chunks = chunk_meta["total_chunks"] if chunk_meta else 0
         manual_review_count = chunk_meta.get("manual_review", 0) if chunk_meta else 0
-        chunk_status_msg = ""
+        ai_warning = ""
+        if failed_count:
+            ai_warning += (
+                f"⚠️ {failed_count}/{total_chunks} AI analysis chunks failed "
+                f"(likely rate-limited). Some vulnerabilities may not have been detected. "
+            )
+        if manual_review_count:
+            ai_warning += (
+                f"⚠️ {manual_review_count} chunk(s) were too large for AI analysis "
+                f"and require manual review."
+            )
+
+        scan_update = {
+            "progress": 45,
+            "phase": "triggering_semgrep",
+            "llm_result": llm_result,
+            "custom_rules_yaml": custom_rules_yaml,
+        }
+        if ai_warning:
+            scan_update["ai_analysis_warning"] = ai_warning.strip()
+            logger.warning(f"[BG] Scan {scan_id}: {ai_warning.strip()}")
+
+        await db.scans.update_one(
+            {"id": scan_id},
+            {"$set": scan_update}
+        )
+        stage = "store_ai_debug"
+
+        # Build chunk summary for WebSocket (uses values computed above for H3)
         if failed_count:
             chunk_status_msg = f" ({failed_count}/{total_chunks} chunks failed after retries)"
         if manual_review_count:
@@ -836,8 +863,6 @@ async def _receive_scan_results_impl(
     Validates the token and processes Semgrep results.
     """
     logger.info(f"Received webhook for scan {payload.scan_id}")
-    logger.info(f"Received token: {x_fixora_token}")
-    logger.info(f"Using JWT secret key for verification (first 10 chars): {settings.jwt_secret_key[:10]}...")
     
     try:
         # Validate the token

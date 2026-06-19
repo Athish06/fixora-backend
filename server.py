@@ -38,9 +38,40 @@ async def lifespan(app: FastAPI):
     async def _scan_timeout_watchdog():
         while True:
             try:
-                modified = await fail_timed_out_scans(Database.get_db(), timeout_minutes=30)
+                db = Database.get_db()
+                modified = await fail_timed_out_scans(db, timeout_minutes=30)
                 if modified:
                     logger.warning(f'Scan timeout watchdog marked {modified} stale scan(s) as failed')
+                    
+                    # Push WebSocket notification for timed-out scans (M1 fix)
+                    try:
+                        from services.websocket_manager import get_connection_manager
+                        ws_manager = get_connection_manager()
+                        
+                        # Fetch the scans we just failed so we can notify their owners
+                        timed_out_scans = await db.scans.find(
+                            {"status": "failed", "phase": "timeout"},
+                            {"_id": 0, "id": 1, "user_id": 1}
+                        ).to_list(modified)
+                        
+                        for scan_doc in timed_out_scans:
+                            scan_id = scan_doc.get("id")
+                            user_id = scan_doc.get("user_id")
+                            if scan_id:
+                                await ws_manager.send_to_scan(scan_id, {
+                                    "type": "scan_failed",
+                                    "scan_id": scan_id,
+                                    "message": "Scan timed out after 30 minutes without completing."
+                                })
+                            if user_id:
+                                await ws_manager.send_to_user(user_id, {
+                                    "type": "scan_failed",
+                                    "scan_id": scan_id,
+                                    "message": "Scan timed out after 30 minutes without completing."
+                                })
+                    except Exception as e:
+                        logger.error(f'Watchdog WS notification error: {e}')
+
             except Exception as exc:
                 logger.error(f'Scan timeout watchdog error: {exc}')
             await asyncio.sleep(60)
@@ -66,10 +97,13 @@ app = FastAPI(
 )
 
 # CORS
+origins = settings.cors_origins.split(',')
+is_wildcard = '*' in origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins.split(','),
-    allow_credentials=True,
+    allow_origins=origins,
+    allow_credentials=not is_wildcard,  # Cannot use credentials when origins contains '*'
     allow_methods=['*'],
     allow_headers=['*'],
 )

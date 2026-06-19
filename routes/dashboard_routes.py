@@ -36,10 +36,10 @@ async def get_dashboard_stats(
         'status': 'open'
     })
     
-    # Count pending PRs
-    pending_prs = await db.pull_requests.count_documents({
+    # Count AI-verified vulnerabilities (real metric, not hardcoded)
+    ai_verified_count = await db.vulnerabilities.count_documents({
         'repository_id': {'$in': repo_ids},
-        'status': {'$in': ['pending', 'open']}
+        'ai_verified': True
     })
     
     # Calculate risk score
@@ -68,7 +68,6 @@ async def get_dashboard_stats(
         critical_vulnerabilities=critical,
         high_vulnerabilities=high,
         risk_score=risk_score,
-        pending_prs=pending_prs,
-        ai_false_positives_prevented=int(total_vulns * 0.85),  # Mock: AI filtered 85%
+        ai_false_positives_prevented=ai_verified_count,
         scans_this_week=scans_this_week
     )

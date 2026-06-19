@@ -156,7 +156,7 @@ def build_function_chunk_prompt(
         calls        = [str(c) for c in (w.get("calls")        or []) if c is not None]
         modules_used = [str(m) for m in (w.get("modules_used") or []) if m is not None]
         env = w.get("environment", "BACKEND")
-        auth = "Present" if w.get("has_auth_check", True) else "None detected"
+        auth = "Present (heuristic — verify manually)" if w.get("has_auth_check", True) else "None detected (heuristic — may have false negatives)"
         func_parts.append(
             f"[{i}] {w.get('function_name', '?')} ({w.get('file', '?')})\n"
             f"    Environment : {env}\n"

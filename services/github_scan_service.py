@@ -19,7 +19,7 @@ WRAPPER_WORKFLOW_FILE_PATH = ".github/workflows/fixora-wrapper-hunter.yml"
 CUSTOM_RULES_FILE_PATH = ".fixora-rules.yml"
 
 # ============== WRAPPER HUNTER WORKFLOW TEMPLATE ==============
-WRAPPER_HUNTER_TEMPLATE = '''name: Fixora Wrapper Hunter
+WRAPPER_HUNTER_TEMPLATE = r'''name: Fixora Wrapper Hunter
 
 on:
   repository_dispatch:
@@ -1629,7 +1629,22 @@ jobs:
           fi
           python3 /tmp/wrapper_hunter.py
 
+      - name: Report Failure to Fixora
+        if: failure()
+        run: |
+          SCAN_ID="${{ github.event.client_payload.scan_id || github.event.inputs.scan_id }}"
+          echo "Wrapper hunter step failed — reporting failure to Fixora backend..."
+          FAIL_DATA='{"error_type":"wrapper_hunter_crashed","error":"Wrapper hunter workflow step failed"}'
+          ENCODED=$(echo "$FAIL_DATA" | base64 -w0)
+          echo '{"scan_id":"'"$SCAN_ID"'","repository":"${{ github.repository }}","encoded_data":"'"$ENCODED"'"}' > /tmp/fail-payload.json
+          curl -s -X POST "${{ secrets.FIXORA_API_URL }}/api/scan/webhook/wrapper-results" \
+            -H "Content-Type: application/json" \
+            -H "X-Fixora-Token: ${{ secrets.FIXORA_API_TOKEN }}" \
+            -d @/tmp/fail-payload.json \
+            --max-time 30 || true
+
       - name: Send Wrapper Hunter Results to Fixora
+        if: always()
         run: |
           SCAN_ID="${{ github.event.client_payload.scan_id || github.event.inputs.scan_id }}"
           
@@ -1688,7 +1703,7 @@ jobs:
 '''
 
 # Semgrep workflow template
-WORKFLOW_TEMPLATE = '''name: Fixora Security Scan
+WORKFLOW_TEMPLATE = r'''name: Fixora Security Scan
 
 on:
   repository_dispatch:
@@ -2542,10 +2557,9 @@ def generate_repo_api_token(repo_id: str, user_id: str) -> str:
         "user_id": user_id,
         "type": "scan_webhook",
         "iat": datetime.utcnow(),
-        "exp": datetime.utcnow() + timedelta(days=365)  # Long-lived token for Actions
+        "exp": datetime.utcnow() + timedelta(days=30)  # 30-day token for Actions (M2 fix)
     }
     
     token = jwt.encode(payload, settings.jwt_secret_key, algorithm="HS256")
-    logger.info(f"Generated API token for repo {repo_id}: {token}")
-    logger.info(f"Using JWT secret key (first 10 chars): {settings.jwt_secret_key[:10]}...")
+    logger.info(f"Generated API token for repo {repo_id} (token_len={len(token)})")
     return token

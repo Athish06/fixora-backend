@@ -89,16 +89,6 @@ async def websocket_notifications(
 
 @router.get("/ws/status")
 async def websocket_status():
-    """Get WebSocket connection status"""
-    manager = get_connection_manager()
-    return {
-        "total_connections": manager.get_connection_count(),
-        "scan_connections": manager.get_scan_connection_count()
-    }
-
-
-@router.get("/ws/status")
-async def websocket_status():
     """Check WebSocket service status and connection count"""
     manager = get_connection_manager()
     return {

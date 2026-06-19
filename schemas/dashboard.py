@@ -7,6 +7,5 @@ class DashboardStats(BaseModel):
     critical_vulnerabilities: int
     high_vulnerabilities: int
     risk_score: str
-    pending_prs: int
     ai_false_positives_prevented: int
     scans_this_week: int
