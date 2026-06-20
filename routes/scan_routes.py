@@ -360,6 +360,36 @@ async def _process_wrapper_results_in_background(
             logger.warning(f"[BG] Aborting scan {scan_id}: {fail_msg}")
             return
 
+        # Handle wrapper hunter workflow crash (sent by the if: failure() step in H2)
+        if isinstance(wrapper_data, dict) and wrapper_data.get("error_type") == "wrapper_hunter_crashed":
+            error_detail = wrapper_data.get("error", "Wrapper hunter workflow step failed")
+            fail_msg = f"Wrapper hunter crashed during GitHub Actions execution: {error_detail}"
+
+            await db.scans.update_one(
+                {"id": scan_id},
+                {
+                    "$set": {
+                        "status": "failed",
+                        "phase": "failed_wrapper_hunter_crash",
+                        "error_message": fail_msg,
+                        "completed_at": datetime.utcnow(),
+                    }
+                },
+            )
+            await ws_manager.send_to_scan(scan_id, {
+                "type": "scan_failed",
+                "scan_id": scan_id,
+                "message": fail_msg,
+            })
+            if user_id:
+                await ws_manager.send_to_user(user_id, {
+                    "type": "scan_failed",
+                    "scan_id": scan_id,
+                    "message": fail_msg,
+                })
+            logger.error(f"[BG] Wrapper hunter crashed for scan {scan_id}: {error_detail}")
+            return
+
         # ── LLM ANALYSIS ──────────────────────────────────────────────────────
         logger.info(f"[BG] Starting LLM analysis for scan {scan_id}")
         await ws_manager.send_to_scan(scan_id, {
@@ -1101,6 +1131,7 @@ async def _receive_scan_results_impl(
 
         raw_title = result.get("check_id", "Unknown vulnerability").split(".")[-1].replace("-", " ").title()
         title = _clean_placeholder_text(raw_title, vuln_type)
+        is_ai_verified = rule_id.startswith("fixora-wrapper-") or rule_id.startswith("fixora-manual-review-")
         normalized_vuln = {
             "severity": severity,
             "type": vuln_type,
@@ -1120,6 +1151,7 @@ async def _receive_scan_results_impl(
                         "title": title,
                         "description": description,
                         "reason": reason,
+                        "ai_verified": is_ai_verified,
                         "severity": severity,
                         "file_path": file_path,
                         "line_number": line_number,
@@ -1179,7 +1211,7 @@ async def _receive_scan_results_impl(
             "owasp": metadata.get("owasp", []),
             "fix_regex": extra.get("fix_regex", None),
             "status": "open",
-            "ai_verified": False,
+            "ai_verified": is_ai_verified,
             "ai_confidence": None,
             "ai_reasoning": None,
             "created_at": now_iso,
