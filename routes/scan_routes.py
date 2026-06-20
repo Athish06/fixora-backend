@@ -1269,6 +1269,7 @@ async def _receive_scan_results_impl(
         {"id": repo_id},
         {"$set": {
             "last_scan": datetime.now().isoformat(),
+            "latest_scan_id": payload.scan_id,
             "vulnerability_count": vuln_count,
             "last_scan_branch": payload.branch,
             "last_commit_sha": payload.commit_sha,

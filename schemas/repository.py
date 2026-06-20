@@ -20,6 +20,7 @@ class Repository(BaseModel):
     total_vulnerabilities: int = 0
     base_commit: Optional[str] = ""
     last_scan: Optional[datetime] = None
+    latest_scan_id: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now())
 
 class RepositoryCreate(BaseModel):

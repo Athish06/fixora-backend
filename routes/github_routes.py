@@ -1231,6 +1231,14 @@ async def start_repository_scan(
                 }}
             )
             
+            await db.repositories.update_one(
+                {"id": repo_id},
+                {"$set": {
+                    "status": "scanning",
+                    "latest_scan_id": scan_id
+                }}
+            )
+            
             return {
                 "success": True,
                 "scan_id": scan_id,
