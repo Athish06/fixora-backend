@@ -476,6 +476,7 @@ async def _process_wrapper_results_in_background(
         stage = "store_ai_debug"
 
         # Build chunk summary for WebSocket (uses values computed above for H3)
+        chunk_status_msg = ""
         if failed_count:
             chunk_status_msg = f" ({failed_count}/{total_chunks} chunks failed after retries)"
         if manual_review_count:
