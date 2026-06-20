@@ -7,6 +7,7 @@ from routes.activity_routes import router as activity_router
 from routes.dashboard_routes import router as dashboard_router
 from routes.github_routes import router as github_router
 from routes.websocket_routes import router as websocket_router
+from routes.visualizer_routes import router as visualizer_router
 
 __all__ = [
     'auth_router',
@@ -17,5 +18,6 @@ __all__ = [
     'activity_router',
     'dashboard_router',
     'github_router',
-    'websocket_router'
+    'websocket_router',
+    'visualizer_router',
 ]

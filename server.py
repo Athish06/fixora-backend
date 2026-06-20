@@ -16,7 +16,8 @@ from routes import (
     activity_router,
     dashboard_router,
     github_router,
-    websocket_router
+    websocket_router,
+    visualizer_router,
 )
 
 # Configure logging
@@ -120,6 +121,7 @@ api_router.include_router(ai_debug_router)
 api_router.include_router(activity_router)
 api_router.include_router(dashboard_router)
 api_router.include_router(github_router)
+api_router.include_router(visualizer_router)
 
 # Include API router
 app.include_router(api_router)
