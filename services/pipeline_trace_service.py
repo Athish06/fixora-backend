@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 # CAPS — keep trace JSON lightweight for Render (target < 50 KB)
 # ─────────────────────────────────────────────────────────────────────────────
 MAX_MODULES_PER_LANG = 50
-MAX_SAMPLED_WRAPPERS = 8
+MAX_SAMPLED_WRAPPERS = 100
 MAX_SAMPLED_FINDINGS = 6
 MAX_TRADITIONAL_FINDINGS = 10
 MAX_DYNAMIC_FINDINGS = 10
