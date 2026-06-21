@@ -1838,21 +1838,25 @@ jobs:
           fi
 
           # Build payload using Python to avoid Bash interpolation bugs and ARG_MAX limits
+          # Also Base64 encodes the results to bypass Ngrok/Cloudflare WAF (403 Forbidden)
           python3 -c '
-          import json, sys
+          import json, sys, base64
           try:
               with open("semgrep-results.json", "r") as f:
                   results = json.load(f)
           except Exception:
               results = {"results": [], "errors": []}
               
+          compressed = json.dumps(results, separators=(",", ":")).encode("utf-8")
+          encoded = base64.b64encode(compressed).decode("utf-8")
+          
           payload = {
               "scan_id": sys.argv[1],
               "repository": sys.argv[2],
               "branch": sys.argv[3],
               "scan_mode": sys.argv[4],
               "commit_sha": sys.argv[5],
-              "results": results
+              "encoded_data": encoded
           }
           with open("payload.json", "w") as f:
               json.dump(payload, f)

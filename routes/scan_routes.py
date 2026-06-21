@@ -199,7 +199,7 @@ class ScanWebhookPayload(BaseModel):
     branch: str
     scan_mode: str
     commit_sha: str
-    results: SemgrepPayload
+    encoded_data: str
 
 
 class WrapperHunterPayload(BaseModel):
@@ -940,8 +940,19 @@ async def _receive_scan_results_impl(
     
     logger.info(f"Processing scan results for {payload.scan_id} - Repository: {payload.repository}, Branch: {payload.branch}")
     
-    # Process Semgrep results
-    semgrep_results = payload.results.results
+    # Decode the Base64-encoded payload (sent this way to avoid Cloudflare/Ngrok WAF blocking
+    # requests containing raw exploit-like strings from the semgrep findings)
+    try:
+        decoded_bytes = base64.b64decode(payload.encoded_data)
+        semgrep_results_dict = json.loads(decoded_bytes)
+        semgrep_results = semgrep_results_dict.get("results", [])
+    except Exception as e:
+        logger.error(f"Failed to decode base64 payload: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid encoded_data: must be a base64-encoded JSON string"
+        )
+        
     new_vulnerabilities = []
     current_scan_vulnerabilities = []
     now_iso = datetime.now().isoformat()
