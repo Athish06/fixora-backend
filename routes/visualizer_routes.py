@@ -244,8 +244,19 @@ async def get_ast_tree(
                 if detail:
                     is_sink = True
                     confidence = detail.get("confidence")
-                    category = detail.get("category", "Pattern Match")
-                    note = f"Confirmed vulnerable via {category}"
+                    if confidence == "import_resolved":
+                        note = f"Confirmed vulnerable: '{method}' traces back to imported module."
+                        category = "Import Resolved"
+                    elif confidence == "name_match_unambiguous":
+                        note = f"Confirmed vulnerable: '{method}' is an unambiguous sink method name."
+                        category = "Name Match"
+                    elif confidence == "builtin":
+                        note = f"Confirmed vulnerable: '{method}' is a dangerous builtin function."
+                        category = "Builtin"
+                    else:
+                        # Ambiguous or generic pattern match
+                        category = detail.get("category", "Pattern Match")
+                        note = f"Potential Sink: '{method}' was flagged by analysis pattern."
                 elif method in AMBIGUOUS_SINK_METHODS:
                     is_sink = False
                     note = f"Safe: '{method}' is an ambiguous method name."
