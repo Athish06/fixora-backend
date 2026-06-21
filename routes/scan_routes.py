@@ -1010,22 +1010,36 @@ async def _receive_scan_results_impl(
         )
 
     # ---------------------------------------------------------
-    # 1. SMART DE-DUPLICATOR: Group by Rule ID and File Path
+    # 1. SMART DE-DUPLICATOR: Group by File Path and Line Number
     # ---------------------------------------------------------
     grouped_findings = {}
     for result in semgrep_results:
         rule_id = str(result.get("check_id", "unknown-rule") or "unknown-rule").lower()
         file_path = result.get("path", "unknown-file")
         line_num = int(result.get("start", {}).get("line", 0) or 0)
-        signature = f"{rule_id}:{file_path}"
+        
+        # Group by exact line to merge overlapping rules (e.g., standard vs AI rules on same sink)
+        signature = f"{file_path}:{line_num}"
 
         if signature not in grouped_findings:
             grouped_findings[signature] = dict(result)
+            grouped_findings[signature]["all_rule_ids"] = [rule_id]
             grouped_findings[signature]["all_affected_lines"] = [line_num] if line_num > 0 else []
         else:
-            if line_num > 0 and line_num not in grouped_findings[signature]["all_affected_lines"]:
-                grouped_findings[signature]["all_affected_lines"].append(line_num)
-                grouped_findings[signature]["all_affected_lines"].sort()
+            existing = grouped_findings[signature]
+            if rule_id not in existing["all_rule_ids"]:
+                existing["all_rule_ids"].append(rule_id)
+            
+            # Promote custom AI wrapper rules over standard Semgrep rules if both flag the same line
+            is_new_custom = "fixora-wrapper" in rule_id or "fixora-manual" in rule_id
+            is_existing_custom = "fixora-wrapper" in str(existing.get("check_id", "")).lower() or "fixora-manual" in str(existing.get("check_id", "")).lower()
+            
+            if is_new_custom and not is_existing_custom:
+                # Keep the metadata/description of the highly specific AI rule
+                new_finding = dict(result)
+                new_finding["all_rule_ids"] = existing["all_rule_ids"]
+                new_finding["all_affected_lines"] = existing["all_affected_lines"]
+                grouped_findings[signature] = new_finding
 
     unique_findings = list(grouped_findings.values())
 
