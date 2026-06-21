@@ -131,62 +131,86 @@ async def get_ast_tree(
             return ".".join(reversed(parts))
         return None
 
-    call_details = wrapper.get("call_details", {})
-    children = []
+    import uuid
 
-    # Walk document order
-    for node in ast.walk(tree):
+    call_details = wrapper.get("call_details", {})
+
+    def _build_ast_node(node):
+        if not isinstance(node, ast.AST):
+            return None
+
+        node_type = type(node).__name__
+        label = node_type
+        
+        if isinstance(node, ast.Name):
+            label = f"Name: {node.id}"
+        elif isinstance(node, ast.Constant):
+            label = f"Constant: {repr(node.value)}"
+        elif isinstance(node, ast.arg):
+            label = f"arg: {node.arg}"
+        elif isinstance(node, ast.Attribute):
+            label = f"Attribute: {node.attr}"
+            
+        result = {
+            "id": str(uuid.uuid4()),
+            "type": node_type,
+            "label": label,
+            "line": getattr(node, "lineno", None),
+            "children": [],
+            "is_sink": False,
+            "confidence": None,
+            "category": None,
+            "note": None,
+            "call_str": None,
+        }
+
         if isinstance(node, ast.Call):
             call_str = _get_call_name(node)
-            if not call_str: continue
-
-            # See if this call was flagged in the main scan
-            detail = call_details.get(call_str)
-            
-            method = call_str.rsplit(".", 1)[-1] if "." in call_str else call_str
-            
-            is_sink = False
-            confidence = None
-            category = None
-            note = None
-
-            if detail:
-                is_sink = True
-                confidence = detail.get("confidence")
-                if confidence == "import_resolved":
-                    note = f"Confirmed vulnerable: '{method}' traces back to imported '{detail.get('module')}' module."
-                    category = "Import Resolved"
-                elif confidence == "name_match_unambiguous":
-                    note = f"Confirmed vulnerable: '{method}' is an unambiguous sink method name."
-                    category = "Name Match"
-                elif confidence == "builtin":
-                    note = f"Confirmed vulnerable: '{method}' is a dangerous builtin function."
-                    category = "Builtin"
-            else:
-                # Why wasn't it flagged?
-                if method in AMBIGUOUS_SINK_METHODS:
-                    note = f"Safe: '{method}' is an ambiguous method name with no dangerous import binding."
-                elif call_str in ["<plaintext-password-comparison>"]:
-                    pass
+            if call_str:
+                result["call_str"] = call_str
+                result["label"] = f"Call: {call_str}()"
+                detail = call_details.get(call_str)
+                method = call_str.rsplit(".", 1)[-1] if "." in call_str else call_str
+                if detail:
+                    result["is_sink"] = True
+                    result["confidence"] = detail.get("confidence")
+                    if result["confidence"] == "import_resolved":
+                        result["note"] = f"Confirmed vulnerable: '{method}' traces back to imported '{detail.get('module')}' module."
+                        result["category"] = "Import Resolved"
+                    elif result["confidence"] == "name_match_unambiguous":
+                        result["note"] = f"Confirmed vulnerable: '{method}' is an unambiguous sink method name."
+                        result["category"] = "Name Match"
+                    elif result["confidence"] == "builtin":
+                        result["note"] = f"Confirmed vulnerable: '{method}' is a dangerous builtin function."
+                        result["category"] = "Builtin"
                 else:
-                    note = "Safe: Standard function call."
+                    if method in AMBIGUOUS_SINK_METHODS:
+                        result["note"] = f"Safe: '{method}' is an ambiguous method name with no dangerous import binding."
+                    else:
+                        result["note"] = "Safe: Standard function call."
 
-            children.append({
-                "call": f"{call_str}()",
-                "line": getattr(node, "lineno", None),
-                "resolved_module": detail.get("module") if detail else None,
-                "is_sink": is_sink,
-                "confidence": confidence,
-                "category": category,
-                "note": note
-            })
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                for item in value:
+                    child_node = _build_ast_node(item)
+                    if child_node:
+                        result["children"].append(child_node)
+            elif isinstance(value, ast.AST):
+                child_node = _build_ast_node(value)
+                if child_node:
+                    result["children"].append(child_node)
+                    
+        return result
 
-    # Sort children by line number to ensure document order
-    children.sort(key=lambda x: x["line"] or 0)
+    full_tree = _build_ast_node(tree)
+    
+    # If root is Module, and has 1 child (FunctionDef), we can unwrap it to save a level.
+    if full_tree and full_tree["type"] == "Module" and len(full_tree["children"]) == 1:
+        full_tree = full_tree["children"][0]
 
     return {
         "function_name": function_name,
         "line_start": wrapper.get("line_start"),
         "line_end": wrapper.get("line_end"),
-        "children": children
+        "ast_tree": full_tree
     }
