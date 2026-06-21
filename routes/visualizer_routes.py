@@ -107,8 +107,11 @@ async def get_ast_tree(
         raise HTTPException(status_code=400, detail="AST Tree is currently only supported for Python files")
 
     import ast
-    from services.github_scan_service import UNAMBIGUOUS_SINK_METHODS, AMBIGUOUS_SINK_METHODS
-    ALL_SINKS = UNAMBIGUOUS_SINK_METHODS | AMBIGUOUS_SINK_METHODS
+    AMBIGUOUS_SINK_METHODS = {
+        "get", "post", "put", "patch", "delete", "request", "send",
+        "find", "find_one", "insert", "update", "delete_one", "delete_many",
+        "read", "write", "open", "save", "download",
+    }
 
     try:
         tree = ast.parse(wrapper["source_code"])
