@@ -173,13 +173,13 @@ async def get_ast_tree(
                         result["is_sink"] = True
                         result["confidence"] = detail.get("confidence")
                         if result["confidence"] == "import_resolved":
-                            result["note"] = f"Confirmed vulnerable: '{method}' traces back to imported '{detail.get('module')}' module."
+                            result["note"] = f"Confirmed Sink: '{method}' traces back to imported '{detail.get('module')}' module."
                             result["category"] = "Import Resolved"
                         elif result["confidence"] == "name_match_unambiguous":
-                            result["note"] = f"Confirmed vulnerable: '{method}' is an unambiguous sink method name."
+                            result["note"] = f"Confirmed Sink: '{method}' is an unambiguous sink method name."
                             result["category"] = "Name Match"
                         elif result["confidence"] == "builtin":
-                            result["note"] = f"Confirmed vulnerable: '{method}' is a dangerous builtin function."
+                            result["note"] = f"Confirmed Sink: '{method}' is a dangerous builtin function."
                             result["category"] = "Builtin"
                     else:
                         if method in AMBIGUOUS_SINK_METHODS:
@@ -245,13 +245,13 @@ async def get_ast_tree(
                     is_sink = True
                     confidence = detail.get("confidence")
                     if confidence == "import_resolved":
-                        note = f"Confirmed vulnerable: '{method}' traces back to imported module."
+                        note = f"Confirmed Sink: '{method}' traces back to imported module."
                         category = "Import Resolved"
                     elif confidence == "name_match_unambiguous":
-                        note = f"Confirmed vulnerable: '{method}' is an unambiguous sink method name."
+                        note = f"Confirmed Sink: '{method}' is an unambiguous sink method name."
                         category = "Name Match"
                     elif confidence == "builtin":
-                        note = f"Confirmed vulnerable: '{method}' is a dangerous builtin function."
+                        note = f"Confirmed Sink: '{method}' is a dangerous builtin function."
                         category = "Builtin"
                     else:
                         # Ambiguous or generic pattern match
