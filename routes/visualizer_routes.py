@@ -87,9 +87,9 @@ async def get_ast_tree(
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Find the function source
-    wd_results = ai_debug_doc.get("wrapper_hunter_results", {})
+    wd_results = ai_debug_doc.get("wrapper_hunter_results", {}).get("results", {})
     wrapper = None
-    for section in wd_results.values():
+    for lang_key, section in wd_results.items():
         if not isinstance(section, dict):
             continue
         for w in section.get("wrapper_functions", []):
