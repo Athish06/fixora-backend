@@ -147,8 +147,11 @@ def build_function_chunk_prompt(
     sink_ctx = (
         "SINK CONTEXT:\n"
         f"Known sink modules: {', '.join(sink_modules) if sink_modules else 'none'}\n"
-        f"Sink reason: {sink_reason or 'No pre-identified sink context.'}\n\n"
+        f"Sink reason: {sink_reason or 'No pre-identified sink context.'}\n"
     )
+    if lang_key != "python":
+        sink_ctx += "IMPORTANT NOTE: In Browser/JS/React environments, built-in APIs like `fetch`, `axios` (if global), `XMLHttpRequest`, `localStorage`, `sessionStorage`, `setTimeout`, `eval`, and DOM injection (e.g., `dangerouslySetInnerHTML`) are inherently available and act as sinks or logic boundaries. DO NOT ignore them just because they aren't listed as imported modules.\n"
+    sink_ctx += "\n"
 
     # ── Function list ─────────────────────────────────────────────────────
     func_parts = []

@@ -1837,16 +1837,26 @@ jobs:
             echo '{"results": [], "errors": []}' > semgrep-results.json
           fi
 
-          cat > payload.json << EOF
-          {
-            "scan_id": "$SCAN_ID",
-            "repository": "${{ github.repository }}",
-            "branch": "$TARGET_BRANCH",
-            "scan_mode": "$SCAN_MODE",
-            "commit_sha": "${{ github.sha }}",
-            "results": $(cat semgrep-results.json)
+          # Build payload using Python to avoid Bash interpolation bugs and ARG_MAX limits
+          python3 -c '
+          import json, sys
+          try:
+              with open("semgrep-results.json", "r") as f:
+                  results = json.load(f)
+          except Exception:
+              results = {"results": [], "errors": []}
+              
+          payload = {
+              "scan_id": sys.argv[1],
+              "repository": sys.argv[2],
+              "branch": sys.argv[3],
+              "scan_mode": sys.argv[4],
+              "commit_sha": sys.argv[5],
+              "results": results
           }
-          EOF
+          with open("payload.json", "w") as f:
+              json.dump(payload, f)
+          ' "$SCAN_ID" "${{ github.repository }}" "$TARGET_BRANCH" "$SCAN_MODE" "${{ github.sha }}"
 
           # Send to Fixora with retry logic
           MAX_RETRIES=3
@@ -1854,13 +1864,14 @@ jobs:
 
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
             echo "Attempting to send results (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
-            if curl -L -X POST "${{ secrets.FIXORA_API_URL }}/api/scan/webhook/results" \
+            HTTP_STATUS=$(curl -s -o /tmp/scan-response.txt -w "%{http_code}" -L -X POST "${{ secrets.FIXORA_API_URL }}/api/scan/webhook/results" \
               -H "Content-Type: application/json" \
               -H "X-Fixora-Token: ${{ secrets.FIXORA_API_TOKEN }}" \
               --data-binary @payload.json \
-              --max-time 30 \
-              --retry 2 \
-              --retry-delay 5; then
+              --max-time 60)
+            echo "HTTP status: $HTTP_STATUS"
+            cat /tmp/scan-response.txt || true
+            if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
               echo "✅ Results sent successfully"
               exit 0
             else
