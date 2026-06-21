@@ -38,10 +38,6 @@ STAGE_CAPTIONS = {
         "in small batches, and explains exactly how an attacker would "
         "exploit each one."
     ),
-    "rule_generation": (
-        "Every confirmed vulnerable wrapper becomes a brand-new Semgrep "
-        "rule recognizing that exact function."
-    ),
     "scan_comparison": (
         "Vanilla Semgrep is structurally blind to your own wrapper "
         "functions. These rules didn't exist anywhere until this scan."
@@ -53,7 +49,6 @@ STAGE_TITLES = {
     "ast_walk": "AST Walk & Wrapper Extraction",
     "llm_phase1": "AI Sink Identification",
     "llm_phase2": "AI Vulnerability Analysis",
-    "rule_generation": "Custom Rule Generation",
     "scan_comparison": "Traditional vs. Dynamic Scan",
 }
 
@@ -93,7 +88,6 @@ def build_trace(
         _build_ast_walk_stage(wd_results),
         _build_llm_phase1_stage(llm_results),
         _build_llm_phase2_stage(llm_results, chunk_stats_raw),
-        _build_rule_generation_stage(llm_results, custom_rules_yaml, rules_count),
         _build_scan_comparison_stage(vulnerabilities),
     ]
 
@@ -161,7 +155,8 @@ def _build_ast_walk_stage(wd_results: Dict[str, Any]) -> Dict[str, Any]:
                 "modules_used": [str(m) for m in (w.get("modules_used") or []) if m],
                 "environment": w.get("environment", "BACKEND"),
                 "has_auth_check": w.get("has_auth_check", False),
-                # NOTE: No source_code — intentionally stripped for trace weight
+                "has_source": bool(w.get("source_code")),
+                "call_details": w.get("call_details", {}),
             })
 
     # Sample representative files/functions for animation

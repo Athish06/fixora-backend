@@ -81,23 +81,29 @@ jobs:
               'fetch', 'XMLHttpRequest'
           ]);
 
-          const DANGEROUS_SINK_METHODS = new Set([
-              // Database / NoSQL (includes legacy driver methods)
-              'query','execute','exec','aggregate','raw',
+          const UNAMBIGUOUS_JS_SINKS = new Set([
+              // Database
+              'query','execute','exec','raw','bulkWrite',
+              // OS / Command execution
+              'execSync','execFile','execFileSync','spawn','spawnSync','fork',
+              // XSS / DOM Manipulation (always dangerous)
+              'write','writeln','insertAdjacentHTML','dangerouslySetInnerHTML',
+              // Deserialization
+              'deserialize','unserialize',
+          ]);
+
+          const AMBIGUOUS_JS_SINKS = new Set([
+              // NoSQL (find, insert, etc. are common method names)
               'find','findOne','findById','findOneAndUpdate','findOneAndDelete',
               'deleteOne','deleteMany','updateOne','updateMany','insertOne','insertMany',
-              'replaceOne','bulkWrite','distinct','countDocuments','insert','update','remove',
-              // OS / Command execution
-              'execSync','spawn','spawnSync','execFile','execFileSync','fork',
-              // File System / Path Traversal
+              'replaceOne','distinct','countDocuments','insert','update','remove','aggregate',
+              // File System (ambiguous names)
               'readFile','readFileSync','writeFile','writeFileSync','appendFile',
               'unlink','unlinkSync','rm','rmdir','mkdir',
-              // SSRF / Network Requests
+              // SSRF / Network (get, post, etc. are extremely common)
               'get','post','put','patch','request','send',
-              // XSS / DOM Manipulation
-              'write','writeln','insertAdjacentHTML','dangerouslySetInnerHTML',
-              // Deserialization & XML/XXE
-              'deserialize','unserialize','parse','parseString','load'
+              // Deserialization (ambiguous)
+              'parse','parseString','load',
           ]);
 
           const PLAINTEXT_PW_RE = /(password|passwd|pwd)\s*={2,3}|={2,3}\s*(password|passwd|pwd)/i;
@@ -306,7 +312,7 @@ jobs:
           }
 
           function findCalls(fnNode, aliasMap) {
-              const calls = {};
+              const calls = {}; // cn -> { module, confidence }
               function visit(node) {
                   if (!node || typeof node !== 'object') return;
                   if (node !== fnNode && isFn(node)) return;
@@ -319,17 +325,20 @@ jobs:
                               (node.callee.type === 'MemberExpression' || node.callee.type === 'OptionalMemberExpression')
                           ) ? memberProp(node.callee) : null;
                           const method = cn.includes('.') ? cn.split('.').pop() : calleeMethod;
-                          if (DANGEROUS_GLOBALS.has(cn) || DANGEROUS_GLOBALS.has(root))
-                              calls[cn] = 'builtins';
-                          else if (aliasMap[root])
-                              calls[cn] = aliasMap[root];
-                          else if (method && DANGEROUS_SINK_METHODS.has(method))
-                              calls[cn] = '<object>.' + method;
+
+                          if (DANGEROUS_GLOBALS.has(cn) || DANGEROUS_GLOBALS.has(root)) {
+                              calls[cn] = { module: 'builtins', confidence: 'builtin' };
+                          } else if (aliasMap[root]) {
+                              calls[cn] = { module: aliasMap[root], confidence: 'import_resolved' };
+                          } else if (method && UNAMBIGUOUS_JS_SINKS.has(method)) {
+                              calls[cn] = { module: '<object>.' + method, confidence: 'name_match_unambiguous' };
+                          }
+                          // Note: AMBIGUOUS_JS_SINKS are ignored unless there's an aliasMap match above
                       }
                   }
                   if (node.type === 'NewExpression') {
                       const cn = callName(node.callee);
-                      if (cn === 'Function') calls['new Function'] = 'builtins';
+                      if (cn === 'Function') calls['new Function'] = { module: 'builtins', confidence: 'builtin' };
                   }
                   if (node.type === 'AssignmentExpression' &&
                       node.left && node.left.type === 'MemberExpression') {
@@ -337,12 +346,13 @@ jobs:
                           (node.left.property.name || node.left.property.value);
                       if (prop === 'innerHTML' || prop === 'outerHTML') {
                           const obj = callName(node.left.object) || '<element>';
-                          calls[obj + '.' + prop] = 'DOM';
+                          calls[obj + '.' + prop] = { module: 'DOM', confidence: 'builtin' };
                       }
                   }
                   if (node.type === 'JSXAttribute' && node.name &&
-                      node.name.name === 'dangerouslySetInnerHTML')
-                      calls['dangerouslySetInnerHTML'] = 'React/DOM';
+                      node.name.name === 'dangerouslySetInnerHTML') {
+                      calls['dangerouslySetInnerHTML'] = { module: 'React/DOM', confidence: 'builtin' };
+                  }
                   for (const k of Object.keys(node)) {
                       if (k==='type'||k==='start'||k==='end'||k==='loc') continue;
                       const v = node[k];
@@ -399,8 +409,9 @@ jobs:
                               has_auth_check: hasAuthCheck,
                               line_start: ls, line_end: le,
                               calls: Object.keys(calls),
-                              modules_used: [...new Set(Object.values(calls))],
+                              modules_used: [...new Set(Object.values(calls).map(c => c.module))],
                               source_code: funcSrc,
+                              call_details: calls,
                           });
                       }
                   }
@@ -744,22 +755,40 @@ jobs:
                       }
                   unique[key]["anchors"].append(a["anchor_path"])
 
-              # Fallback for repos/languages without manifest anchors:
-              # preserve previous behaviour by scanning source-file language at repo root.
-              anchored_languages = {a["language"] for a in found_anchors}
+              # ── NEW: Find uncovered source directories ──────────────────────────
+              def _find_uncovered_source_roots(repo_root, lang, covered_roots):
+                  """Walk the repo for directories containing `lang` source files that
+                  aren't already inside an anchored target's root. Stops descending the
+                  moment it finds one, so it returns `backend/`, not `backend/app/utils/`."""
+                  exts = _lang_exts(lang)
+                  found = []
+
+                  def is_covered(path):
+                      np = _norm_abs(path)
+                      return any(np == c or np.startswith(c + os.sep) for c in covered_roots)
+
+                  for dirpath, dirnames, filenames in os.walk(repo_root):
+                      dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+                      if is_covered(dirpath):
+                          dirnames[:] = []   # already owned by an anchored target
+                          continue
+                      if any(fn.lower().endswith(exts) for fn in filenames):
+                          found.append(dirpath)
+                          dirnames[:] = []   # found a source root, don't fragment further
+                  return found
+
+              # Fallback: find source-containing directories not covered by anchors.
+              covered_roots = {item["root_abs"] for item in unique.values()}
               for lang in ("python", "react"):
-                  if lang in anchored_languages:
-                      continue
-                  if not _repo_has_lang_source(repo_root, lang):
-                      continue
-                  key = (lang, _norm_abs(repo_root))
-                  if key not in unique:
-                      unique[key] = {
-                          "language": lang,
-                          "root_abs": _norm_abs(repo_root),
-                          "anchors": [],
-                          "inferred": True,
-                      }
+                  for src_root in _find_uncovered_source_roots(repo_root, lang, covered_roots):
+                      key = (lang, _norm_abs(src_root))
+                      if key not in unique:
+                          unique[key] = {
+                              "language": lang,
+                              "root_abs": _norm_abs(src_root),
+                              "anchors": [],
+                              "inferred": True,
+                          }
 
               targets = []
               phantom_roots_skipped = []
@@ -767,19 +796,20 @@ jobs:
                   lang = item["language"]
                   root_abs = item["root_abs"]
 
-                  # No Source, No Scan rule: if neither direct source file nor src/lib/app exists, skip.
-                  has_local_source = _has_lang_file_immediate(root_abs, lang)
-                  has_code_dir = any(
-                      os.path.isdir(os.path.join(root_abs, name))
-                      for name in SOURCE_DIR_CANDIDATES
-                  )
-                  if not has_local_source and not has_code_dir:
-                      phantom_roots_skipped.append({
-                          "language": lang,
-                          "root_path": _rel(repo_root, root_abs),
-                          "reason": "config_root_no_source",
-                      })
-                      continue
+                  # Skip phantom-root check for inferred roots — they already have source.
+                  if not item.get("inferred"):
+                      has_local_source = _has_lang_file_immediate(root_abs, lang)
+                      has_code_dir = any(
+                          os.path.isdir(os.path.join(root_abs, name))
+                          for name in SOURCE_DIR_CANDIDATES
+                      )
+                      if not has_local_source and not has_code_dir:
+                          phantom_roots_skipped.append({
+                              "language": lang,
+                              "root_path": _rel(repo_root, root_abs),
+                              "reason": "config_root_no_source",
+                          })
+                          continue
 
                   scan_abs = _pick_scan_path(root_abs, lang)
                   targets.append({
@@ -1061,27 +1091,45 @@ jobs:
                   return ".".join(reversed(parts))
               return None
 
-          # Known dangerous method names — indicate security-relevant operations
-          DANGEROUS_SINK_METHODS = {
-              # Relational Database / SQL
+          # Known dangerous method names — split by confidence
+          # UNAMBIGUOUS: rarely legitimate outside dangerous use, safe to flag on name alone
+          UNAMBIGUOUS_SINK_METHODS = {
+              # SQL
               "execute", "executemany", "executescript", "mogrify", "callproc", "raw", "extra",
-              # NoSQL (MongoDB / CouchDB)
-              "find", "find_one", "aggregate", "insert", "update", "delete_many", "update_one",
               # OS / Command execution
-              "system", "popen", "run", "call", "check_output", "spawn", "fork", "communicate",
-              # Request / SSRF
-              "urlopen", "urlretrieve", "request", "get", "post", "put", "patch",
-              # Deserialization & XXE (XML)
-              "loads", "load", "fromstring", "parse", "XMLParser", "XML", "unpickle", "yaml_load",
-              # File System (Path Traversal / Deletion)
-              "remove", "unlink", "rmdir", "rename", "replace", "mkdir", "makedirs",
-              # PDF / Rendering (XSS)
-              "drawString", "render", "render_template", "Template",
-              # Crypto / Hashing (Weak Crypto)
-              "md5", "sha1", "Cipher", "encrypt", "decrypt",
-              # LDAP & XPath
-              "search_s", "xpath"
+              "system", "popen", "check_output",
+              # Deserialization
+              "unpickle", "yaml_load", "XMLParser", "XML",
+              # SSRF (unambiguous)
+              "urlopen", "urlretrieve",
+              # PDF / Rendering
+              "drawString",
+              # LDAP
+              "search_s",
           }
+
+          # AMBIGUOUS: too generic to trust without import binding (get, find, run, etc.)
+          AMBIGUOUS_SINK_METHODS = {
+              # NoSQL
+              "find", "find_one", "aggregate", "insert", "update", "delete_many", "update_one",
+              # OS (ambiguous names)
+              "run", "call", "communicate", "spawn", "fork",
+              # Request / SSRF
+              "request", "get", "post", "put", "patch", "send",
+              # Deserialization (ambiguous)
+              "loads", "load", "parse", "fromstring",
+              # File System
+              "remove", "unlink", "rmdir", "rename", "replace", "mkdir", "makedirs",
+              # Rendering
+              "render", "render_template", "Template",
+              # Crypto
+              "encrypt", "decrypt", "md5", "sha1", "Cipher",
+              # XPath
+              "xpath",
+          }
+
+          # Combined for backward-compatible checks where needed
+          ALL_SINK_METHODS = UNAMBIGUOUS_SINK_METHODS | AMBIGUOUS_SINK_METHODS
 
           _PLAINTEXT_PW_RE = re.compile(
               r"(password|passwd|pwd)\s*==|==\s*(password|passwd|pwd)",
@@ -1093,7 +1141,8 @@ jobs:
               #   1. Calls any module from all_modules (existing), OR
               #   2. Calls a method on a variable derived from an imported module
               #      (e.g. cursor.execute where cursor = conn.cursor()), OR
-              #   3. Calls a known dangerous method on ANY object (fallback)
+              #   3. Calls an UNAMBIGUOUS dangerous method on ANY object (fallback)
+              #   Note: AMBIGUOUS methods (get, find, etc.) are ONLY flagged with import binding.
               wrappers = []
               target = set(all_modules)
               dangerous_builtins = {"eval", "exec", "__import__", "compile", "open", "globals", "locals", "getattr", "setattr"}
@@ -1133,14 +1182,9 @@ jobs:
                                   )
                               break
                           # ── Pass 1: Track variables derived from imports ──
-                          # Handles chains like:
-                          #   conn = sqlite3.connect(...)   → conn linked to sqlite3
-                          #   cursor = conn.cursor()        → cursor linked to sqlite3
-                          # Two iterations catch A→B→C chains.
                           import_derived = {}
                           for _pass in range(2):
                               for child in ast.walk(node):
-                                  # Simple assignments: x = something.method()
                                   if isinstance(child, ast.Assign):
                                       if isinstance(child.value, ast.Call):
                                           cn = _get_call_name(child.value)
@@ -1151,9 +1195,8 @@ jobs:
                                                   for tgt in child.targets:
                                                       if isinstance(tgt, ast.Name):
                                                           import_derived[tgt.id] = linked
-                                      # x = something (non-call assignment from import alias)
                                       elif isinstance(child.value, ast.Attribute):
-                                          cn = _get_call_name(ast.Call(func=child.value, args=[], keywords=[]))  # reuse helper
+                                          cn = _get_call_name(ast.Call(func=child.value, args=[], keywords=[]))
                                           if cn:
                                               cr = cn.split(".")[0]
                                               linked = imported_names.get(cr) or import_derived.get(cr)
@@ -1170,9 +1213,6 @@ jobs:
                                               for tgt in child.targets:
                                                   if isinstance(tgt, ast.Name):
                                                       import_derived[tgt.id] = import_derived[child.value.id]
-                                  # with-statement context managers:
-                                  #   with sqlite3.connect("db") as conn:
-                                  #   async with aiohttp.ClientSession() as session:
                                   if isinstance(child, (ast.With, ast.AsyncWith)):
                                       for item in child.items:
                                           ctx = item.context_expr
@@ -1184,28 +1224,31 @@ jobs:
                                                   if linked and isinstance(item.optional_vars, ast.Name):
                                                       import_derived[item.optional_vars.id] = linked
 
-                          # ── Pass 2: Collect calls ──────────────────────────
-                          calls_found = {}
+                          # ── Pass 2: Collect calls with confidence ─────────
+                          calls_found = {}   # call_str -> {"module": str, "confidence": str}
                           for child in ast.walk(node):
                               if isinstance(child, ast.Call):
                                   call_str = _get_call_name(child)
                                   if not call_str:
                                       continue
                                   root = call_str.split(".")[0]
-                                  # Direct import call (existing)
+                                  # Direct import call
                                   if root in imported_names:
-                                      calls_found[call_str] = imported_names[root]
-                                  # Dangerous builtins (existing)
+                                      calls_found[call_str] = {"module": imported_names[root], "confidence": "import_resolved"}
+                                  # Dangerous builtins
                                   elif root in dangerous_builtins:
-                                      calls_found[call_str] = "builtins"
-                                  # NEW: Variable derived from an import (cursor.execute, conn.commit)
+                                      calls_found[call_str] = {"module": "builtins", "confidence": "builtin"}
+                                  # Variable derived from an import (cursor.execute, conn.commit)
                                   elif root in import_derived:
-                                      calls_found[call_str] = import_derived[root]
-                                  # NEW: Known dangerous method on any object (fallback)
+                                      calls_found[call_str] = {"module": import_derived[root], "confidence": "import_resolved"}
+                                  # Fallback: method name matching
                                   elif "." in call_str:
                                       method = call_str.rsplit(".", 1)[-1]
-                                      if method in DANGEROUS_SINK_METHODS:
-                                          calls_found[call_str] = f"<object>.{method}"
+                                      # UNAMBIGUOUS sinks → flag even without import binding
+                                      if method in UNAMBIGUOUS_SINK_METHODS:
+                                          calls_found[call_str] = {"module": f"<object>.{method}", "confidence": "name_match_unambiguous"}
+                                      # AMBIGUOUS sinks → DROP (no import binding = too generic)
+                                      # e.g. config.get(), text.replace(), results.find()
                           func_src = ast.get_source_segment(source, node) or ""
                           src_low = func_src.lower()
                           has_auth_check = (
@@ -1238,8 +1281,9 @@ jobs:
                                   "line_start": node.lineno,
                                   "line_end": node.end_lineno,
                                   "calls": list(calls_found.keys()),
-                                  "modules_used": list(set(calls_found.values())),
+                                  "modules_used": list(set(c["module"] for c in calls_found.values())),
                                   "source_code": func_src,
+                                  "call_details": {k: v for k, v in calls_found.items()},
                               })
                   if reached_wrapper_limit:
                       break
