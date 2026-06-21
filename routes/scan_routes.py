@@ -983,7 +983,7 @@ async def _receive_scan_results_impl(
     canonical_by_key = {}
     seen_signature_keys = set()
     for doc in existing_docs:
-        signature_key = f"{doc.get('rule_id', '')}|{doc.get('file_path', '')}"
+        signature_key = f"{doc.get('rule_id', '')}|{doc.get('file_path', '')}|{doc.get('line_number', 0)}"
         if signature_key in seen_signature_keys:
             duplicate_doc_ids.append(doc["id"])
             continue
@@ -1145,7 +1145,7 @@ async def _receive_scan_results_impl(
         impact_summary = metadata.get("impact_summary", None)
 
         # Stable fingerprint to identify the same finding across multiple scans.
-        signature_key = f"{rule_id}|{file_path}"
+        signature_key = f"{rule_id}|{file_path}|{primary_line}"
         legacy_key = signature_key
         fingerprint = hashlib.sha256(signature_key.encode("utf-8")).hexdigest()
 
