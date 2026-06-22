@@ -1013,10 +1013,18 @@ async def _receive_scan_results_impl(
     # ---------------------------------------------------------
     # 1. SMART DE-DUPLICATOR: Group by File Path and Line Number
     # ---------------------------------------------------------
+    # Heuristic: If we have no Python files in the results, drop Django template rules
+    has_python_files = any(r.get("path", "").endswith(".py") for r in semgrep_results)
+    
     grouped_findings = {}
     for result in semgrep_results:
         rule_id = str(result.get("check_id", "unknown-rule") or "unknown-rule").lower()
         file_path = result.get("path", "unknown-file")
+        
+        # False Positive Mitigation: Django template rules firing on Nunjucks/Swig/Generic HTML
+        if "django" in rule_id and file_path.endswith(".html") and not has_python_files:
+            continue
+
         line_num = int(result.get("start", {}).get("line", 0) or 0)
         
         # Group by exact line to merge overlapping rules (e.g., standard vs AI rules on same sink)
