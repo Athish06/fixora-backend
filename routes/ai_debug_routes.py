@@ -27,11 +27,10 @@ async def get_ai_debug_list(
     repo_ids = [r['id'] for r in user_repos]
     repo_names = {r['id']: r.get('full_name') or r.get('name', r['id']) for r in user_repos}
 
-    query = {'repository_id': {'$in': repo_ids}}
     if repository_id:
         if repository_id not in repo_ids:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Access denied')
-        query['repository_id'] = repository_id
+        user_repos = [r for r in user_repos if r['id'] == repository_id]
 
     # Exclude large payload fields from list view
     projection = {
@@ -41,14 +40,28 @@ async def get_ai_debug_list(
         'llm_result': 0,
         'custom_rules_yaml': 0,
     }
-    records = await db.ai_debug.find(
-        query, projection
-    ).sort('created_at', -1).limit(limit).to_list(limit)
+    
+    records = []
+    for repo in user_repos:
+        repo_id = repo['id']
+        repo_name = repo.get('full_name') or repo.get('name', repo_id)
+        
+        latest_debug = await db.ai_debug.find_one(
+            {'repository_id': repo_id},
+            projection,
+            sort=[('created_at', -1)]
+        )
+        
+        if latest_debug:
+            total_scans = await db.scans.count_documents({'repository_id': repo_id})
+            total_vulns = await db.vulnerabilities.count_documents({'repository_id': repo_id})
+            
+            latest_debug['repository_name'] = repo_name
+            latest_debug['total_scans'] = total_scans
+            latest_debug['total_vulnerabilities'] = total_vulns
+            records.append(latest_debug)
 
-    # Annotate each record with the human-readable repo name
-    for rec in records:
-        rec['repository_name'] = repo_names.get(rec.get('repository_id', ''), rec.get('repository_id', ''))
-
+    records.sort(key=lambda x: x.get('created_at', ''), reverse=True)
     return records
 
 
