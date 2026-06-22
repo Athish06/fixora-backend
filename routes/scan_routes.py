@@ -946,6 +946,7 @@ async def _receive_scan_results_impl(
         decoded_bytes = base64.b64decode(payload.encoded_data)
         semgrep_results_dict = json.loads(decoded_bytes)
         semgrep_results = semgrep_results_dict.get("results", [])
+        semgrep_errors = semgrep_results_dict.get("errors", [])
     except Exception as e:
         logger.error(f"Failed to decode base64 payload: {e}")
         raise HTTPException(
@@ -1283,7 +1284,7 @@ async def _receive_scan_results_impl(
             "vulnerability_count": vuln_count,
             "severity_counts": severity_counts,
             "commit_sha": payload.commit_sha,
-            "errors": payload.results.errors
+            "errors": semgrep_errors
         }}
     )
     
