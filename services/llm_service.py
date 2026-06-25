@@ -49,9 +49,9 @@ FRONTEND_IMPOSSIBLE_TYPES = {
 def _format_module_section(lang_key: str, modules: Dict[str, Any]) -> str:
     """Render module lists into a compact, readable string for prompts."""
     lang_label = "PYTHON PROJECT" if lang_key == "python" else "REACT / NODE.JS PROJECT"
-    from_manifest = [str(m) for m in modules.get("from_manifest", []) if m is not None]
-    from_imports  = [str(m) for m in modules.get("from_imports",  []) if m is not None]
-    all_mods      = [str(m) for m in modules.get("all",           []) if m is not None]
+    from_manifest = sorted([str(m) for m in modules.get("from_manifest", []) if m is not None])
+    from_imports  = sorted([str(m) for m in modules.get("from_imports",  []) if m is not None])
+    all_mods      = sorted([str(m) for m in modules.get("all",           []) if m is not None])
 
     shown     = all_mods[:150]
     truncated = len(all_mods) - len(shown)
@@ -592,7 +592,11 @@ SYSTEM_PROMPT_CONTENT = (
     "You are an expert application-security engineer. "
     "You analyze code for vulnerabilities and respond ONLY with valid JSON. "
     "Never include markdown code fences or any text outside the JSON object. "
-    "Do NOT include a \"source_code\" field in your output."
+    "Do NOT include a \"source_code\" field in your output.\n\n"
+    "CRITICAL DETERMINISM CONSTRAINTS:\n"
+    "1. You MUST extract `vulnerable_parameter` EXACTLY as it appears in the source code string. Do not hallucinate or guess parameter names.\n"
+    "2. Your `reason` MUST follow a rigid deterministic structure: '[Vulnerability] identified in [Function Name] due to [Mechanism]'. Do not use creative phrasing.\n"
+    "3. Do not invent payloads unless explicitly requested. Provide exact, reproducible outputs."
 )
 
 
@@ -777,6 +781,12 @@ async def analyze_wrappers_with_llm(
             "wrapper_functions": [],
         }
         if all_wrappers:
+            # Deterministic sorting to guarantee identical chunking and prompt generation
+            all_wrappers.sort(key=lambda w: (
+                str(w.get("file", "")),
+                str(w.get("function_name", "")),
+                int(w.get("line_start", 0) or 0)
+            ))
             lang_chunks = _build_dynamic_chunks(all_wrappers)
             chunks_by_lang[lang_key] = lang_chunks
             total_phase2_chunks += len(lang_chunks)
@@ -1394,7 +1404,9 @@ async def _call_groq_api(
                 },
             ],
             max_tokens=max_completion_tokens,
-            temperature=0.1,
+            temperature=0.0,
+            top_p=0.01,
+            seed=42,
             response_format={"type": "json_object"},
         )
 
