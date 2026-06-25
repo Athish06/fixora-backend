@@ -228,49 +228,49 @@ def _build_wrapper_rule(
 
     # Legacy fallback path
     payload = malicious_payload or str(wrapper.get("example_exploit", "")).strip()
-    generic_placeholder = (
-        not payload
-        or "malicious_payload" in payload.lower()
-        or "user_input" in payload.lower()
-    )
-    if generic_placeholder:
-        default_exploit_map = {
-            "SQL Injection": "bulk_insert(\"users; DROP TABLE users; --\", data)",
-            "Command Injection": "execute_background_task(\"ping -c 1 127.0.0.1; cat /etc/passwd\")",
-            "Path Traversal": "read_report(\"../../../../etc/passwd\")",
-            "XSS": "render_comment(\"<img src=x onerror=alert(document.cookie)>\")",
-            "SSRF": "fetch_remote(\"http://169.254.169.254/latest/meta-data/\")",
-            "Insecure Deserialization": "load_payload(\"gASV...crafted_pickle...\")",
-            "IDOR / Broken Access Control": "get_invoice(\"another-users-invoice-id\")",
-        }
-        payload = default_exploit_map.get(vuln_type, "<malicious_data>")
+    
+    # Do not force fake string payloads for architectural flaws
+    architectural_flaws = {
+        "Plaintext Password", "Broken Authentication", "Missing Authentication",
+        "Debug Mode Enabled", "IDOR / Broken Access Control", "Optimistic UI De-Sync",
+        "Unhandled Promise Rejection"
+    }
+    
+    if vuln_type in architectural_flaws and not malicious_payload:
+        payload = None
+        injected_example = None
+    else:
+        generic_placeholder = (
+            not payload
+            or "malicious_payload" in payload.lower()
+            or "user_input" in payload.lower()
+        )
+        if generic_placeholder:
+            default_exploit_map = {
+                "SQL Injection": "bulk_insert(\"users; DROP TABLE users; --\", data)",
+                "Command Injection": "execute_background_task(\"ping -c 1 127.0.0.1; cat /etc/passwd\")",
+                "Path Traversal": "read_report(\"../../../../etc/passwd\")",
+                "XSS": "render_comment(\"<img src=x onerror=alert(document.cookie)>\")",
+                "SSRF": "fetch_remote(\"http://169.254.169.254/latest/meta-data/\")",
+                "Insecure Deserialization": "load_payload(\"gASV...crafted_pickle...\")",
+            }
+            payload = default_exploit_map.get(vuln_type, "<malicious_data>")
 
     code_lang = "python" if lang_key == "python" else "javascript"
 
     injected_example = str(wrapper.get("exploit_injected_example", "")).strip()
-    if not injected_example:
+    if not injected_example and payload:
         injected_example = f"{func_name}({parameter} = {payload})"
-
-    injected_code_block = (
-        f"```{code_lang}\\n"
-        f"// Target Function: {func_name}()\\n"
-        f"// Parameter: {parameter}\\n\\n"
-        f"// Attacker executes:\\n"
-        f"{injected_example}\\n"
-        f"```"
-    )
+    elif not payload:
+        injected_example = ""
 
     if not impact_summary:
         impact_summary = impact_text
 
-    # 3. The markdown structure
+    # 3. The markdown structure (Simplified to avoid duplication with UI)
     message = (
-        f"### {vuln_type} via `{parameter}`\n\n"
-        f"**Vulnerable Sink:** Passes untrusted data directly to `{wraps_text}`.\n\n"
-        f"**Live Exploit Vector:**\n"
-        f"{injected_code_block}\n\n"
-        f"**Outcome:**\n{explanation}\n\n"
-        f"**Data at Risk (Impact):**\n{impact_summary}"
+        f"{vuln_type} via `{parameter}`\n"
+        f"Vulnerable Sink: Passes untrusted data directly to `{wraps_text}`."
     )
 
     metadata: Dict[str, Any] = {

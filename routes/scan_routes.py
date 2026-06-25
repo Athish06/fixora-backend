@@ -1025,6 +1025,10 @@ async def _receive_scan_results_impl(
         if "django" in rule_id and file_path.endswith(".html") and not has_python_files:
             continue
 
+        # False Positive Mitigation: Operational files (GitHub Actions, etc.)
+        if ".github/workflows" in file_path:
+            continue
+
         line_num = int(result.get("start", {}).get("line", 0) or 0)
         
         # Group by exact line to merge overlapping rules (e.g., standard vs AI rules on same sink)
