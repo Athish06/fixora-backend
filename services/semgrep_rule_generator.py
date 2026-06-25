@@ -237,8 +237,8 @@ def _build_wrapper_rule(
     }
     
     if vuln_type in architectural_flaws and not malicious_payload:
-        payload = None
-        injected_example = None
+        payload = ""
+        injected_example = ""
     else:
         generic_placeholder = (
             not payload
