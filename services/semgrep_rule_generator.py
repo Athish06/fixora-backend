@@ -118,9 +118,9 @@ def generate_custom_rules(
         wrapper_functions = section.get("wrapper_functions", [])
 
         for wrapper in wrapper_functions:
-            rule = _build_wrapper_rule(wrapper, semgrep_langs, lang_key)
-            if rule:
-                rules.append(rule)
+            wrapper_rules = _build_wrapper_rule(wrapper, semgrep_langs, lang_key)
+            if wrapper_rules:
+                rules.extend(wrapper_rules)
 
     # ── Manually-flagged functions (AI inconclusive / 413 too large) ──────
     for entry in (manual_review_required or []):
@@ -166,12 +166,12 @@ def _build_wrapper_rule(
     wrapper: Dict[str, Any],
     semgrep_langs: List[str],
     lang_key: str,
-) -> Dict[str, Any] | None:
-    """Build a single Semgrep rule dict for a vulnerable wrapper function."""
+) -> List[Dict[str, Any]]:
+    """Build Semgrep rule dicts (Definition + Taint Caller) for a vulnerable wrapper function."""
 
     func_name = wrapper.get("function_name", "").strip()
     if not func_name:
-        return None
+        return []
 
     vuln_type   = wrapper.get("vulnerability_type", "Security Issue")
     severity    = wrapper.get("severity", "MEDIUM").upper()
@@ -399,7 +399,54 @@ def _build_wrapper_rule(
                 "metadata": metadata,
             }
 
-    return rule
+    rules_list = [rule]
+
+    # ── Build the Taint Rule (Rule B) ──
+    # This traces generic web inputs into the vulnerable wrapper.
+    taint_rule_id = f"fixora-taint-{safe_name}"
+    
+    # Define broad, framework-agnostic pattern-sources
+    if lang_key == "python":
+        sources = [
+            {"pattern": "request.$W(...)("},
+            {"pattern": "request.$W"},
+            {"pattern": "req.$W"},
+            {"pattern": "flask.request.$W"},
+            {"pattern": "django.http.HttpRequest.$W"},
+            # Also catch function parameters to support multi-hop deep taint
+            {"pattern": "$ARG", "pattern-inside": "def $FUNC(..., $ARG, ...): ..."}
+        ]
+        sinks = [{"pattern": f"{func_name}(...)"}, {"pattern": f"$OBJ.{func_name}(...)"}]
+    else:
+        sources = [
+            {"pattern": "req.$W"},
+            {"pattern": "request.$W"},
+            {"pattern": "req.body.$W"},
+            {"pattern": "req.query.$W"},
+            {"pattern": "req.params.$W"},
+            # Also catch function parameters
+            {"pattern": "$ARG", "pattern-inside": "function $FUNC(..., $ARG, ...) { ... }"},
+            {"pattern": "$ARG", "pattern-inside": "$FUNC = (..., $ARG, ...) => { ... }"}
+        ]
+        clean_name = func_name.replace("()", "").strip()
+        sinks = [
+            {"pattern": f"{clean_name}(...)"},
+            {"pattern": f"$OBJ.{clean_name}(...)"}
+        ]
+
+    taint_rule = {
+        "id": taint_rule_id,
+        "mode": "taint",
+        "pattern-sources": sources,
+        "pattern-sinks": sinks,
+        "message": f"Taint tracked to vulnerable wrapper `{func_name}`.\n{message}",
+        "severity": semgrep_severity,
+        "languages": rule["languages"],
+        "metadata": metadata,
+    }
+    rules_list.append(taint_rule)
+
+    return rules_list
 
 
 # ─────────────────────────────────────────────────────────────────────────────

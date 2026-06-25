@@ -963,6 +963,79 @@ async def _receive_scan_results_impl(
     
     logger.info(f"Processing {len(semgrep_results)} Semgrep results")
 
+    # ---------------------------------------------------------
+    # 0. AI-VERIFIED SAFE WRAPPER SUPPRESSION (CATEGORY-AWARE)
+    # ---------------------------------------------------------
+    try:
+        # Fetch the wrapper hunter results and AI vulnerability analysis
+        ai_cache = await db.ai_debug.find_one({"scan_id": payload.scan_id})
+        if ai_cache and "wrapper_hunter_results" in ai_cache and "llm_result" in ai_cache:
+            wrapper_data = ai_cache["wrapper_hunter_results"]
+            if not wrapper_data.get("_truncated"):
+                ai_results = ai_cache["llm_result"].get("results", {})
+                
+                # 1. Collect all vulnerable wrappers the AI identified
+                vuln_wrappers = set()
+                for lang_key, section in ai_results.items():
+                    if isinstance(section, dict):
+                        for w in section.get("wrapper_functions", []):
+                            # Composite key: file path + start + end + vuln_type
+                            vuln_wrappers.add((
+                                w.get("file"),
+                                w.get("line_start"),
+                                w.get("line_end"),
+                                w.get("vulnerability_type", "").lower()
+                            ))
+                
+                # 2. Collect ALL wrappers found by the hunter
+                all_wrappers = []
+                hunter_langs = wrapper_data.get("results", {})
+                for lang, ldata in hunter_langs.items():
+                    all_wrappers.extend(ldata.get("wrapper_functions", []))
+                
+                # 3. Filter semgrep_results
+                filtered_results = []
+                for finding in semgrep_results:
+                    rule_id = str(finding.get("check_id", "")).lower()
+                    file_path = finding.get("path", "")
+                    line_start = int(finding.get("start", {}).get("line", 0) or 0)
+                    
+                    is_safe = False
+                    for w in all_wrappers:
+                        w_file = w.get("file")
+                        w_start = w.get("line_start")
+                        w_end = w.get("line_end")
+                        
+                        # If the Semgrep finding falls inside a wrapper boundary
+                        if file_path == w_file and w_start <= line_start <= w_end:
+                            # Category-Aware Check: Only suppress if it's an injection/logic flaw.
+                            # We DO NOT suppress Hardcoded Secrets, Missing Auth, or framework misconfigs
+                            # unless the AI explicitly evaluated the wrapper for that specific flaw.
+                            is_injection_rule = any(x in rule_id for x in [
+                                'sql', 'injection', 'ssrf', 'xxe', 'traversal', 'exec', 'deserialization', 'xss'
+                            ])
+                            
+                            # Was this wrapper marked vulnerable by the AI for this category?
+                            was_flagged_for_injection = any(
+                                vw[0] == w_file and vw[1] == w_start and vw[2] == w_end and 
+                                any(x in vw[3] for x in ['sql', 'injection', 'ssrf', 'xxe', 'traversal', 'exec', 'deserialization', 'xss'])
+                                for vw in vuln_wrappers
+                            )
+                            
+                            # If Semgrep says it's SQLi, but the AI mathematically cleared this wrapper for SQLi...
+                            if is_injection_rule and not was_flagged_for_injection:
+                                is_safe = True
+                                logger.info(f"SUPPRESSED false positive {rule_id} in {file_path}:{line_start} (AI cleared this wrapper)")
+                                break
+                    
+                    if not is_safe:
+                        filtered_results.append(finding)
+                
+                logger.info(f"AI Category-Aware Suppression: Dropped {len(semgrep_results) - len(filtered_results)} false positives.")
+                semgrep_results = filtered_results
+    except Exception as e:
+        logger.error(f"Error during AI Safe Wrapper suppression: {e}")
+
     # Build lookup maps for existing vulnerabilities in this repository so
     # rescans update existing findings instead of creating duplicates.
     existing_docs = await db.vulnerabilities.find(
