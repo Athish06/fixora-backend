@@ -1800,7 +1800,7 @@ jobs:
             echo "Found Fixora custom rules from AI analysis, including in scan..."
             EXTRA_CONFIG="--config .fixora-rules.yml"
           fi
-          FIXORA_EXCLUDE="--exclude '.github/workflows/fixora-scan.yml' --exclude '.github/workflows/fixora-wrapper-hunter.yml' --exclude '.fixora-rules.yml' --exclude '.semgrep.yml' --exclude 'semgrep_rules.yml' --exclude 'fixora_wrapper_hunter.yml' --exclude '**/fixora_wrapper_hunter.yml' --exclude '**/semgrep_rules.yml'"
+          FIXORA_EXCLUDE="--exclude .github/workflows/fixora-scan.yml --exclude .github/workflows/fixora-wrapper-hunter.yml --exclude .fixora-rules.yml --exclude .semgrep.yml --exclude semgrep_rules.yml --exclude fixora_wrapper_hunter.yml --exclude **/fixora_wrapper_hunter.yml --exclude **/semgrep_rules.yml"
           semgrep scan --config "p/default" --config "p/security-audit" --config "p/owasp-top-ten" --config "p/python" --config "p/flask" --config "p/django" --config "p/jwt" --config "p/secrets" --config "p/javascript" --config "p/nodejs" --config "p/react" $EXTRA_CONFIG $FIXORA_EXCLUDE --json --output semgrep-results.json . || true
 
       - name: Run Semgrep Scan (Diff)
@@ -1815,7 +1815,7 @@ jobs:
           git diff --name-only $BASE_COMMIT HEAD > all_changed_files.txt
           # Exclude Fixora scanner/config files so Semgrep doesn't flag them
           grep -v -E 'fixora-scan\.yml|fixora-wrapper-hunter\.yml|fixora_wrapper_hunter\.yml|\.fixora-rules\.yml|\.semgrep\.yml|semgrep_rules\.yml' all_changed_files.txt > changed_files.txt || true
-          FIXORA_EXCLUDE="--exclude '.github/workflows/fixora-scan.yml' --exclude '.github/workflows/fixora-wrapper-hunter.yml' --exclude '.fixora-rules.yml' --exclude '.semgrep.yml' --exclude 'semgrep_rules.yml' --exclude 'fixora_wrapper_hunter.yml' --exclude '**/fixora_wrapper_hunter.yml' --exclude '**/semgrep_rules.yml'"
+          FIXORA_EXCLUDE="--exclude .github/workflows/fixora-scan.yml --exclude .github/workflows/fixora-wrapper-hunter.yml --exclude .fixora-rules.yml --exclude .semgrep.yml --exclude semgrep_rules.yml --exclude fixora_wrapper_hunter.yml --exclude **/fixora_wrapper_hunter.yml --exclude **/semgrep_rules.yml"
           if [ -s changed_files.txt ]; then
             semgrep scan --config "p/default" --config "p/security-audit" --config "p/owasp-top-ten" --config "p/python" --config "p/flask" --config "p/django" --config "p/jwt" --config "p/secrets" --config "p/javascript" --config "p/nodejs" --config "p/react" $EXTRA_CONFIG $FIXORA_EXCLUDE --json --output semgrep-results.json $(cat changed_files.txt | tr '\n' ' ') || true
           else
