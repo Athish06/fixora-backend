@@ -958,6 +958,9 @@ async def _receive_scan_results_impl(
     current_scan_vulnerabilities = []
     now_iso = datetime.now().isoformat()
     
+    if semgrep_errors:
+        logger.error(f"SEMGREP ERRORS FROM GITHUB RUNNER: {semgrep_errors}")
+    
     logger.info(f"Processing {len(semgrep_results)} Semgrep results")
 
     # Build lookup maps for existing vulnerabilities in this repository so
