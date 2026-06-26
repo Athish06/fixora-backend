@@ -412,7 +412,15 @@ def _build_wrapper_rule(
             {"pattern": "request.$W"},
             {"pattern": "req.$W"},
             {"pattern": "flask.request.$W"},
-            {"pattern": "django.http.HttpRequest.$W"}
+            {"pattern": "django.http.HttpRequest.$W"},
+            # Robust, timeout-free routing parameter extraction for FastAPI, Flask, etc.
+            {
+                "patterns": [
+                    {"pattern-inside": "@$APP.$METHOD(...)\ndef $FUNC(..., $ARG, ...):\n    ..."},
+                    {"metavariable-regex": {"metavariable": "$METHOD", "regex": "(?i)^(get|post|put|delete|patch|route)$"}},
+                    {"pattern": "$ARG"}
+                ]
+            }
         ]
         sinks = [{"pattern": f"{func_name}(...)"}, {"pattern": f"$OBJ.{func_name}(...)"}]
     else:
