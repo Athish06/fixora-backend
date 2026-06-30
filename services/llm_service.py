@@ -716,8 +716,8 @@ def _build_dynamic_chunks(all_wrappers: list) -> list:
             # alone exceeds the budget (will be marked oversized on flush).
             current_funcs = [func]
             current_tokens = func_tokens
-        elif current_tokens + func_tokens <= FUNCTION_BUDGET_PER_CHUNK:
-            # Fits in the current chunk — append.
+        elif current_tokens + func_tokens <= FUNCTION_BUDGET_PER_CHUNK and len(current_funcs) < 8:
+            # Fits in the current chunk (and under the 8 function limit to prevent LLM truncation)
             current_funcs.append(func)
             current_tokens += func_tokens
         else:
