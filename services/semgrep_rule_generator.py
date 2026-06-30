@@ -162,6 +162,47 @@ def generate_custom_rules(
     return yaml_output
 
 
+def _is_valid_semgrep_pattern(pattern) -> bool:
+    """Basic validation: pattern must be non-empty and look like valid Semgrep syntax."""
+    if not pattern or not isinstance(pattern, str):
+        return False
+    p = pattern.strip()
+    if not p or len(p) < 2:
+        return False
+    return True
+
+
+def _get_fallback_sources(lang_key: str) -> List[Dict[str, Any]]:
+    """Framework-agnostic hardcoded source patterns — used as fallback when AI doesn't provide sources."""
+    if lang_key == "python":
+        return [
+            {"pattern": "request.$W(...)"},
+            {"pattern": "request.$W"},
+            {"pattern": "req.$W"},
+            {"pattern": "flask.request.$W"},
+            {"pattern": "django.http.HttpRequest.$W"},
+            {
+                "patterns": [
+                    {"pattern-inside": "@$APP.$METHOD(...)\ndef $FUNC(..., $ARG, ...):\n    ..."},
+                    {"metavariable-regex": {"metavariable": "$METHOD", "regex": "(?i)^(get|post|put|delete|patch|route)$"}},
+                    {"pattern": "$ARG"}
+                ]
+            }
+        ]
+    else:
+        return [
+            {"pattern": "req.$W"},
+            {"pattern": "request.$W"},
+            {"pattern": "req.body.$W"},
+            {"pattern": "req.query.$W"},
+            {"pattern": "req.params.$W"},
+            {"pattern": "window.location.$W"},
+            {"pattern": "document.cookie"},
+            {"pattern": "fetch(...)"},
+            {"pattern": "axios(...)"}
+        ]
+
+
 def _build_wrapper_rule(
     wrapper: Dict[str, Any],
     semgrep_langs: List[str],
@@ -319,9 +360,14 @@ def _build_wrapper_rule(
                 sink_patterns.append({"pattern": direct})
                 seen_sink.add(direct)
 
-    # ── Build language-specific patterns ──
-    # Any non-python key (react, javascript, node, etc.) uses JS patterns.
-    if lang_key == "python":
+    # ── Special handling for <module_global> (global-scope code, no function def) ──
+    is_module_global = func_name == "<module_global>"
+
+    if is_module_global:
+        # Skip Definition Rule (Rule A) entirely — there is no function to match.
+        # Only generate the Taint Rule (Rule B) for global-scope sinks.
+        rules_list = []
+    elif lang_key == "python":
         if sink_patterns:
             rule = {
                 "id": rule_id,
@@ -399,48 +445,49 @@ def _build_wrapper_rule(
                 "metadata": metadata,
             }
 
-    rules_list = [rule]
+    if not is_module_global:
+        rules_list = [rule]
 
     # ── Build the Taint Rule (Rule B) ──
     # This traces generic web inputs into the vulnerable wrapper.
     taint_rule_id = f"fixora-taint-{safe_name}"
     
-    # Define broad, framework-agnostic pattern-sources
+    # ── Step 1: Build Sources (AI-dynamic with fallback) ──
+    ai_sources = wrapper.get("source_patterns", [])
+    if ai_sources and isinstance(ai_sources, list):
+        # Use AI-provided sources — these are repo-specific
+        sources = [{"pattern": p} for p in ai_sources if _is_valid_semgrep_pattern(p)]
+        # Also merge in fallback sources so Semgrep catches both AI-identified
+        # AND standard web framework inputs (belt + suspenders approach)
+        fallback = _get_fallback_sources(lang_key)
+        existing_patterns = {s.get("pattern") for s in sources if "pattern" in s}
+        for fb in fallback:
+            if fb.get("pattern") not in existing_patterns:
+                sources.append(fb)
+    else:
+        # No AI sources available — use hardcoded fallback
+        sources = _get_fallback_sources(lang_key)
+
+    # ── Step 2: Build Sinks (AI-dynamic + wrapper name) ──
+    ai_sinks = wrapper.get("sink_patterns", [])
     if lang_key == "python":
-        sources = [
-            {"pattern": "request.$W(...)("},
-            {"pattern": "request.$W"},
-            {"pattern": "req.$W"},
-            {"pattern": "flask.request.$W"},
-            {"pattern": "django.http.HttpRequest.$W"},
-            # Robust, timeout-free routing parameter extraction for FastAPI, Flask, etc.
-            {
-                "patterns": [
-                    {"pattern-inside": "@$APP.$METHOD(...)\ndef $FUNC(..., $ARG, ...):\n    ..."},
-                    {"metavariable-regex": {"metavariable": "$METHOD", "regex": "(?i)^(get|post|put|delete|patch|route)$"}},
-                    {"pattern": "$ARG"}
-                ]
-            }
-        ]
         sinks = [{"pattern": f"{func_name}(...)"}, {"pattern": f"$OBJ.{func_name}(...)"}]
     else:
-        sources = [
-            {"pattern": "req.$W"},
-            {"pattern": "request.$W"},
-            {"pattern": "req.body.$W"},
-            {"pattern": "req.query.$W"},
-            {"pattern": "req.params.$W"},
-            # Frontend specific sources
-            {"pattern": "window.location.$W"},
-            {"pattern": "document.cookie"},
-            {"pattern": "fetch(...)"},
-            {"pattern": "axios(...)"}
-        ]
-        clean_name = func_name.replace("()", "").strip()
-        sinks = [
-            {"pattern": f"{clean_name}(...)"},
-            {"pattern": f"$OBJ.{clean_name}(...)"}
-        ]
+        clean_fn = func_name.replace("()", "").strip()
+        sinks = [{"pattern": f"{clean_fn}(...)"}, {"pattern": f"$OBJ.{clean_fn}(...)"}]
+
+    if ai_sinks and isinstance(ai_sinks, list):
+        existing_sink_patterns = {s.get("pattern") for s in sinks}
+        for p in ai_sinks:
+            if _is_valid_semgrep_pattern(p) and p not in existing_sink_patterns:
+                sinks.append({"pattern": p})
+                existing_sink_patterns.add(p)
+
+    # ── Step 3: Build Sanitizers (COMPLETELY NEW — AI-dynamic) ──
+    ai_sanitizers = wrapper.get("sanitizer_patterns", [])
+    sanitizers = []
+    if ai_sanitizers and isinstance(ai_sanitizers, list):
+        sanitizers = [{"pattern": p} for p in ai_sanitizers if _is_valid_semgrep_pattern(p)]
 
     taint_rule = {
         "id": taint_rule_id,
@@ -449,9 +496,14 @@ def _build_wrapper_rule(
         "pattern-sinks": sinks,
         "message": f"Taint tracked to vulnerable wrapper `{func_name}`.\n{message}",
         "severity": semgrep_severity,
-        "languages": rule["languages"],
+        "languages": list(semgrep_langs),
         "metadata": metadata,
     }
+
+    # Only add sanitizers if the AI identified them — avoids empty array
+    if sanitizers:
+        taint_rule["pattern-sanitizers"] = sanitizers
+
     rules_list.append(taint_rule)
 
     return rules_list

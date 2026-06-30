@@ -197,6 +197,22 @@ def build_function_chunk_prompt(
         "E. ANTI-PATTERN DETECTION: Some wrappers are marked with anti_pattern field. If anti_pattern == 'plaintext_password_comparison', classify as 'Plaintext Password' with HIGH severity. If anti_pattern == 'missing_authentication', classify as 'Missing Authentication' with HIGH severity without further analysis needed.\n"
         "F. MASS ASSIGNMENT DETECTION: If a function accepts **kwargs, request.json, request.form, or a dict of user-provided fields and passes it to Model(...) / .update(**data) / .create(**data) without explicit field filtering, classify as 'Mass Assignment'.\n"
         "G. CONFIGURATION DETECTION: If a function runs the app/server in debug mode (for example app.run(debug=True), app.run(host='0.0.0.0', debug=True), or equivalent JS dev debug exposure in production), classify as 'Debug Mode Enabled'.\n\n"
+        "=== DYNAMIC PATTERN EXTRACTION (CRITICAL FOR RULE GENERATION) ===\n"
+        "For EACH vulnerable wrapper, you MUST also provide these 4 fields:\n\n"
+        "1. \"source_patterns\": Array of Semgrep-compatible patterns showing where untrusted data enters this function. "
+        "Use $METAVAR for variable parts. Examples: [\"request.args.get(...)\", \"req.body.$FIELD\", \"event['queryStringParameters']\"].\n"
+        "   If the function parameter itself is the source (no direct web input visible), use the exact parameter name as a pattern, e.g. [\"user_id\", \"query\"].\n"
+        "   IMPORTANT: These must be real patterns from the code you see. Do NOT hallucinate sources that don't exist in the snippet.\n\n"
+        "2. \"sink_patterns\": Array of Semgrep-compatible patterns for the exact dangerous call INSIDE the wrapper. "
+        "Use $OBJ for object metavariables. Examples: [\"cursor.execute(...)\", \"$DB.query(...)\", \"subprocess.run(...)\"]. "
+        "These MUST match the actual sink calls visible in the source code.\n\n"
+        "3. \"sanitizer_patterns\": Array of functions/calls that WOULD make this input safe IF they were applied. "
+        "If the code already sanitizes properly, do NOT flag the function as vulnerable at all. "
+        "Only list sanitizers here if the code is MISSING them (i.e., what the developer SHOULD have used). "
+        "Examples: [\"int(...)\", \"bleach.clean(...)\", \"parameterized_query(...)\"]. If no known sanitizer applies, return empty array [].\n\n"
+        "4. \"skip_sanitizer_patterns\": Array of functions that LOOK like sanitizers but are BYPASSABLE "
+        "(e.g., custom URL validators vulnerable to DNS rebinding, incomplete regex filters). "
+        "Examples: [\"is_safe_url(...)\", \"basic_filter(...)\"]. If none, return empty array [].\n\n"
         "SEVERITY GUIDELINES:\n"
         "  HIGH   - Direct path from user input to sink, no sanitisation\n"
         "  MEDIUM - Partial sanitisation, indirect taint path, or probable taint from unsanitized function parameters\n"
@@ -227,7 +243,11 @@ def build_function_chunk_prompt(
         '          "vulnerable_parameter": "user_id",\n'
         '          "malicious_payload": "1 OR 1=1 --",\n'
         '          "exploit_explanation": "The attacker-controlled user_id is concatenated into the SQL WHERE clause, so the payload converts the predicate into an always-true condition.",\n'
-        '          "impact_summary": "Attackers can exfiltrate all rows from the table and bypass authorization checks tied to user scoping."\n'
+        '          "impact_summary": "Attackers can exfiltrate all rows from the table and bypass authorization checks tied to user scoping.",\n'
+        '          "source_patterns": ["request.args.get(...)"],\n'
+        '          "sink_patterns": ["cursor.execute(...)"],\n'
+        '          "sanitizer_patterns": ["int(...)"],\n'
+        '          "skip_sanitizer_patterns": []\n'
         '        }\n'
         '      ]\n'
         '    }\n'
@@ -348,6 +368,12 @@ def _coalesce_wrapper_fields(row: Dict[str, Any]) -> Dict[str, Any]:
 
     if not item.get("exploit_explanation") and item.get("vulnerability_mechanism"):
         item["exploit_explanation"] = item.get("vulnerability_mechanism")
+
+    # Dynamic pattern fields — safe defaults for backward compatibility
+    item.setdefault("source_patterns", [])
+    item.setdefault("sink_patterns", [])
+    item.setdefault("sanitizer_patterns", [])
+    item.setdefault("skip_sanitizer_patterns", [])
 
     return item
 

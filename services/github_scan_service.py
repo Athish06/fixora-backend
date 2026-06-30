@@ -423,6 +423,63 @@ jobs:
                   }
               }
               visit(ast.program || ast, null);
+
+              // ── Module-level (global scope) sink detection for JS ──
+              const globalCalls = {};
+              function visitGlobal(node) {
+                  if (!node || typeof node !== 'object') return;
+                  if (isFn(node) || node.type === 'ClassDeclaration' || node.type === 'ClassExpression') return;
+                  
+                  if (node.type === 'CallExpression') {
+                      const calleeName = callName(node.callee);
+                      if (calleeName) {
+                          const root = calleeName.split('.')[0];
+                          const method = calleeName.includes('.') ? calleeName.split('.').pop() : null;
+                          const isDangerous = (
+                              importsList.includes(root) ||
+                              (aliasMap && aliasMap[root]) ||
+                              (method && UNAMBIGUOUS_JS_SINKS.has(method)) ||
+                              UNAMBIGUOUS_JS_SINKS.has(root) ||
+                              DANGEROUS_GLOBALS.has(root)
+                          );
+                          if (isDangerous) {
+                              globalCalls[calleeName] = { module: (aliasMap && aliasMap[root]) ? aliasMap[root] : (importsList.includes(root) ? root : 'builtins'), confidence: 'module_level' };
+                          }
+                      }
+                  }
+                  for (const k of Object.keys(node)) {
+                      if (k==='type'||k==='start'||k==='end'||k==='loc') continue;
+                      const v = node[k];
+                      if (Array.isArray(v)) v.forEach(c => { if (c&&c.type) visitGlobal(c); });
+                      else if (v && typeof v==='object' && v.type) visitGlobal(v);
+                  }
+              }
+
+              if (ast.program && Array.isArray(ast.program.body)) {
+                  ast.program.body.forEach(node => {
+                      if (!isFn(node) && node.type !== 'ClassDeclaration') visitGlobal(node);
+                  });
+              } else {
+                  visitGlobal(ast.program || ast);
+              }
+              
+              if (Object.keys(globalCalls).length > 0) {
+                  let globalSrc = src;
+                  if (globalSrc.length > 3000) globalSrc = globalSrc.substring(0, 3000) + "\n// ... truncated ...";
+                  wrappers.push({
+                      function_name: '<module_global>',
+                      file: relPath,
+                      environment: detectEnvironment(relPath, importsList),
+                      has_auth_check: false,
+                      line_start: 1,
+                      line_end: src.split('\n').length,
+                      calls: Object.keys(globalCalls),
+                      modules_used: [...new Set(Object.values(globalCalls).map(c => c.module))],
+                      source_code: globalSrc,
+                      call_details: globalCalls,
+                  });
+              }
+
               return wrappers;
           }
 
@@ -1285,6 +1342,52 @@ jobs:
                                   "source_code": func_src,
                                   "call_details": {k: v for k, v in calls_found.items()},
                               })
+                  # ── Module-level (global scope) sink detection ──
+                  # Code like: db.execute(request.args.get("q")) at the top level
+                  # has no FunctionDef parent, so it was previously invisible.
+                  module_level_calls = {}
+                  for node in ast.iter_child_nodes(tree):
+                      # Skip FunctionDefs and ClassDefs — we already handled those
+                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                          continue
+                      # Walk this top-level statement for dangerous calls
+                      for child in ast.walk(node):
+                          if isinstance(child, ast.Call):
+                              call_str = _get_call_name(child)
+                              if not call_str:
+                                  continue
+                              root = call_str.split(".")[0]
+                              method = call_str.rsplit(".", 1)[-1] if "." in call_str else None
+                              
+                              is_dangerous = (
+                                  root in imported_names or
+                                  root in dangerous_builtins or
+                                  root in import_derived or
+                                  (method and method in UNAMBIGUOUS_SINK_METHODS)
+                              )
+                              if is_dangerous:
+                                  module_name = imported_names.get(root) or import_derived.get(root) or "builtins"
+                                  module_level_calls[call_str] = {"module": module_name, "confidence": "module_level"}
+
+                  if module_level_calls:
+                      # Bundle all module-level dangerous calls as a single "<module_global>" wrapper
+                      global_src = source  # Send the entire file as context (it's a script)
+                      if len(global_src) > 3000:
+                          global_src = global_src[:3000] + "\n# ... truncated ..."
+                      
+                      wrappers.append({
+                          "function_name": "<module_global>",
+                          "file": rel,
+                          "environment": detect_environment(rel),
+                          "has_auth_check": False,
+                          "line_start": 1,
+                          "line_end": len(source.splitlines()),
+                          "calls": list(module_level_calls.keys()),
+                          "modules_used": list(set(c["module"] for c in module_level_calls.values())),
+                          "source_code": global_src,
+                          "call_details": module_level_calls,
+                      })
+
                   if reached_wrapper_limit:
                       break
               return wrappers
