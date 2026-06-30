@@ -479,9 +479,35 @@ def _build_wrapper_rule(
     if ai_sinks and isinstance(ai_sinks, list):
         existing_sink_patterns = {s.get("pattern") for s in sinks}
         for p in ai_sinks:
-            if _is_valid_semgrep_pattern(p) and p not in existing_sink_patterns:
-                sinks.append({"pattern": p})
-                existing_sink_patterns.add(p)
+            if not _is_valid_semgrep_pattern(p):
+                continue
+            
+            if is_module_global:
+                # Global scope: add the sink directly without function boundary
+                if p not in existing_sink_patterns:
+                    sinks.append({"pattern": p})
+                    existing_sink_patterns.add(p)
+            else:
+                # Function scope: bind the sink strictly INSIDE the wrapper function
+                # to prevent this rule from globally flagging every call in the repo.
+                if lang_key == "python":
+                    sinks.append({
+                        "patterns": [
+                            {"pattern-inside": f"def {func_name}(...):\n  ..."},
+                            {"pattern": p}
+                        ]
+                    })
+                else:
+                    # JavaScript requires checking multiple function definition styles
+                    inside_patterns = []
+                    for dp in def_patterns:
+                        inside_patterns.append({"pattern-inside": dp["pattern"]})
+                    sinks.append({
+                        "patterns": [
+                            {"pattern-either": inside_patterns},
+                            {"pattern": p}
+                        ]
+                    })
 
     # ── Step 3: Build Sanitizers (COMPLETELY NEW — AI-dynamic) ──
     ai_sanitizers = wrapper.get("sanitizer_patterns", [])
