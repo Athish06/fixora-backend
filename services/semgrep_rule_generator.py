@@ -221,9 +221,14 @@ def _build_wrapper_rule(
     calls       = wrapper.get("calls", [])
     modules     = wrapper.get("modules_used", [])
 
-    # Sanitise function name for rule ID (alphanumeric + hyphens only)
+    # Sanitise function name and vuln type for rule ID to prevent collisions
     safe_name = "".join(c if c.isalnum() else "-" for c in func_name).strip("-").lower()
-    rule_id = f"fixora-wrapper-{safe_name}"
+    safe_vuln = "".join(c if c.isalnum() else "-" for c in vuln_type).strip("-").lower()
+    # Add a short fallback if vuln_type is missing
+    if not safe_vuln:
+        safe_vuln = "vuln"
+        
+    rule_id = f"fixora-wrapper-{safe_name}-{safe_vuln}"
 
     semgrep_severity = SEVERITY_TO_SEMGREP.get(severity, "WARNING")
     cwe  = VULN_TYPE_TO_CWE.get(vuln_type, [])
@@ -333,6 +338,9 @@ def _build_wrapper_rule(
         metadata["cwe"] = cwe
     if owasp:
         metadata["owasp"] = owasp
+    if wrapper.get("cross_file"):
+        metadata["cross_file"] = True
+        metadata["promoted_from"] = wrapper.get("promoted_from", "")
 
     def _safe_ident(name: str) -> bool:
         return bool(name) and name.replace("_", "a").isalnum() and not name[0].isdigit()
@@ -450,7 +458,7 @@ def _build_wrapper_rule(
 
     # ── Build the Taint Rule (Rule B) ──
     # This traces generic web inputs into the vulnerable wrapper.
-    taint_rule_id = f"fixora-taint-{safe_name}"
+    taint_rule_id = f"fixora-taint-{safe_name}-{safe_vuln}"
     
     # ── Step 1: Build Sources (AI-dynamic with fallback) ──
     ai_sources = wrapper.get("source_patterns", [])

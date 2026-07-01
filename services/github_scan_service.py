@@ -1497,6 +1497,79 @@ jobs:
 
               return findings
 
+          # ─── PYTHON CALL GRAPH BUILDER ─────────────────────────────────────────
+          def build_python_call_graph(scan_root, display_root, target_files=None, limit_state=None):
+              """
+              Build a global call graph for all Python functions in the repo.
+              
+              Returns:
+                  call_graph: {"func_name|file_path": ["callee_func1", "callee_func2"]}
+                  route_map:  {"func_name|file_path": {"method": "GET", "path": "/users/{id}", "params": ["user_id"]}}
+              """
+              ROUTE_METHODS = {"get", "post", "put", "delete", "patch", "route"}
+              NOISE_BUILTINS = {
+                  "print", "len", "str", "int", "float", "bool",
+                  "list", "dict", "set", "tuple", "type", "isinstance",
+                  "range", "enumerate", "zip", "map", "filter", "sorted",
+                  "super", "hasattr", "getattr", "setattr", "delattr",
+                  "append", "extend", "keys", "values", "items", "format",
+              }
+              call_graph = {}
+              route_map = {}
+              
+              for fp in _iter_target_python_files(scan_root, target_files=target_files, limit_state=limit_state):
+                  try:
+                      with open(fp, "r", errors="ignore") as f:
+                          source = f.read()
+                      tree = ast.parse(source, filename=fp)
+                  except Exception:
+                      continue
+                  
+                  rel = os.path.relpath(fp, display_root).replace("\\\\", "/")
+                  
+                  for node in ast.walk(tree):
+                      if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                          continue
+                      
+                      func_key = f"{node.name}|{rel}"
+                      
+                      # ── Detect route decorators ──
+                      for dec in node.decorator_list:
+                          if isinstance(dec, ast.Call):
+                              dec_name = _get_call_name(dec)
+                              if dec_name:
+                                  parts = dec_name.split(".")
+                                  method_part = parts[-1].lower() if len(parts) > 1 else ""
+                                  if method_part in ROUTE_METHODS:
+                                      path = ""
+                                      if dec.args and isinstance(dec.args[0], ast.Constant):
+                                          path = str(dec.args[0].value)
+                                      params = [
+                                          arg.arg for arg in node.args.args
+                                          if arg.arg not in ("self", "cls", "request", "db")
+                                      ]
+                                      route_map[func_key] = {
+                                          "method": method_part.upper(),
+                                          "path": path,
+                                          "params": params,
+                                      }
+                      
+                      # ── Extract ALL function calls inside this function ──
+                      calls_in_func = set()
+                      for child in ast.walk(node):
+                          if isinstance(child, ast.Call):
+                              call_name = _get_call_name(child)
+                              if call_name:
+                                  # Strip module prefix: "controllers.get_user" → "get_user"
+                                  clean_name = call_name.rsplit(".", 1)[-1]
+                                  if clean_name not in NOISE_BUILTINS:
+                                      calls_in_func.add(clean_name)
+                      
+                      if calls_in_func:
+                          call_graph[func_key] = sorted(calls_in_func)
+              
+              return call_graph, route_map
+
           # ─── ORCHESTRATOR ─────────────────────────────────────────────────────────────
           def _ensure_lang_section(results, lang):
               if lang not in results:
@@ -1566,6 +1639,8 @@ jobs:
               repo_limit_errors = []
               extractor_warnings = []
               total_wrappers = 0
+              py_call_graph = {}
+              py_route_map = {}
 
               for t in targets:
                   lang = t["language"]
@@ -1622,6 +1697,15 @@ jobs:
                               if key not in local_seen:
                                   local_seen.add(key)
                                   wrappers.append(route)
+
+                      # ── Build call graph for cross-file analysis ──
+                      cg, rm = build_python_call_graph(
+                          scan_abs, repo_root,
+                          target_files=(changed_for_target if changed_files_abs else None),
+                          limit_state=wrapper_limit_state,
+                      )
+                      py_call_graph.update(cg)
+                      py_route_map.update(rm)
 
                       if import_limit_state.get("exceeded"):
                           repo_limit_errors.append({
@@ -1748,6 +1832,8 @@ jobs:
                   "language": language,
                   "results": results,
                   "scan_targets": scan_targets,
+                  "call_graph": py_call_graph,
+                  "route_map": py_route_map,
                   "orchestrator": {
                       "anchors_found": len(found_anchors),
                       "targets_selected": len(scan_targets),
