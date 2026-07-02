@@ -169,15 +169,31 @@ def build_function_chunk_prompt(
             f"    source:\n```{code_fence}\n{w.get('source_code', '')}\n```\n\n"
         )
 
+    if lang_key == "python":
+        task_section = (
+            f"=== TASK ===\n"
+            f"Analyse the {lang_display} wrapper functions below. You have TWO MANDATES:\n"
+            "MANDATE 1 (Smart Auditor): Look for structural and logic flaws (e.g., IDOR, Missing Auth, Mass Assignment, Plaintext Passwords).\n"
+            "MANDATE 2 (Mechanical Terminator): Map Terminal Sinks for our Cross-File Taint Resolver. If a function is a generic wrapper around a dangerous module (e.g., executing SQL, running OS commands, making network requests, opening files), you MUST flag it as a HIGH severity injection vulnerability (e.g., SQL Injection, Command Injection). Do NOT evaluate web context for Mandate 2; assume all arguments to these generic utility functions are maliciously tainted.\n"
+            "For each function, determine if it violates either Mandate 1 or Mandate 2.\n"
+            "  - If YES -> include it in the output with vulnerability_type, severity, reason, vulnerable_parameter, malicious_payload, exploit_explanation, and impact_summary.\n"
+            "  - If NO  -> skip it entirely.\n\n"
+        )
+        rule_c = "C. TERMINAL SINK IDENTIFICATION (CRITICAL FOR MANDATE 2): By flagging a generic utility wrapper (like `def run_query(self, query): db.execute(query)`), you are NOT accusing the utility of being poorly written. You are simply creating a mandatory hook for our mathematical Graph Engine to trace backwards. If you skip a utility wrapper because it 'looks safe' or 'lacks HTTP context', you break the entire scanning pipeline. You MUST flag them as Injections (SQLi, Command Injection, SSRF, Path Traversal).\n"
+    else:
+        task_section = (
+            f"=== TASK ===\n"
+            f"Analyse the {lang_display} wrapper functions below.  "
+            "For each function, determine:\n"
+            "  - Does it pass user-controlled data (or likely user-controlled function parameters) to a dangerous sink WITHOUT sanitisation?\n"
+            "  - If YES -> include it in the output with vulnerability_type, severity, reason, vulnerable_parameter, malicious_payload, exploit_explanation, and impact_summary.\n"
+            "  - If NO  -> skip it entirely.\n\n"
+        )
+        rule_c = "C. CROSS-FILE & UTILITY METHODS (CRITICAL): If a function is a generic database/system wrapper (e.g. `def run_query(self, query): db.execute(query)`), you MUST flag it as vulnerable! Even if there is no HTTP request visible in the snippet, assume `query` is tainted from a higher-level API route. We rely on you to flag these deep sinks so our Call Graph Resolver can trace them backwards. DO NOT SKIP utility functions just because they lack web context!\n"
+
     return (
         "You are an expert application-security engineer performing static analysis.\n\n"
-        f"=== TASK ===\n"
-        f"Analyse the {lang_display} wrapper functions below. You have TWO MANDATES:\n"
-        "MANDATE 1 (Smart Auditor): Look for structural and logic flaws (e.g., IDOR, Missing Auth, Mass Assignment, Plaintext Passwords).\n"
-        "MANDATE 2 (Mechanical Terminator): Map Terminal Sinks for our Cross-File Taint Resolver. If a function is a generic wrapper around a dangerous module (e.g., executing SQL, running OS commands, making network requests, opening files), you MUST flag it as a HIGH severity injection vulnerability (e.g., SQL Injection, Command Injection). Do NOT evaluate web context for Mandate 2; assume all arguments to these generic utility functions are maliciously tainted.\n"
-        "For each function, determine if it violates either Mandate 1 or Mandate 2.\n"
-        "  - If YES -> include it in the output with vulnerability_type, severity, reason, vulnerable_parameter, malicious_payload, exploit_explanation, and impact_summary.\n"
-        "  - If NO  -> skip it entirely.\n\n"
+        + task_section +
         "=== STRICT TAXONOMY & EXCLUSION RULES ===\n"
         "1. ALLOWED CATEGORIES: You MUST classify vulnerabilities into exactly one of these types: ['SQL Injection', 'Command Injection', 'Path Traversal', 'XSS', 'SSRF', 'Insecure Deserialization', 'IDOR / Broken Access Control', 'Cryptographic Failure', 'Hardcoded Secret', 'Security Misconfiguration', 'Business Logic Flaw', 'Plaintext Password', 'Broken Authentication', 'Missing Authentication', 'Mass Assignment', 'Input Validation Failure', 'Debug Mode Enabled'].\n"
         "2. BUSINESS LOGIC FLAWS: Use this category for logic/workflow bypasses, unhandled promise rejections, state race conditions, and UI de-sync bugs. Do NOT use this for injections.\n"
@@ -193,7 +209,7 @@ def build_function_chunk_prompt(
         "=== TAINT INFERENCE RULES (IMPORTANT) ===\n"
         "A. These functions are pre-filtered wrappers that already call dangerous sinks; assume they are reachable unless code clearly proves internal-only constant input.\n"
         "B. For backend code, treat function parameters as potentially user-controlled by default unless strict sanitisation/allowlisting is present.\n"
-        "C. TERMINAL SINK IDENTIFICATION (CRITICAL FOR MANDATE 2): By flagging a generic utility wrapper (like `def run_query(self, query): db.execute(query)`), you are NOT accusing the utility of being poorly written. You are simply creating a mandatory hook for our mathematical Graph Engine to trace backwards. If you skip a utility wrapper because it 'looks safe' or 'lacks HTTP context', you break the entire scanning pipeline. You MUST flag them as Injections (SQLi, Command Injection, SSRF, Path Traversal).\n"
+        + rule_c +
         "D. You do NOT need full caller-graph proof. If unsanitized parameters are concatenated/interpolated/formatted into SQL/command/path/URL sinks, mark vulnerable.\n"
         "E. If taint source is probable but not explicit in the snippet, still report with severity MEDIUM and explain the assumption clearly.\n"
         "F. ANTI-PATTERN DETECTION: Some wrappers are marked with anti_pattern field. If anti_pattern == 'plaintext_password_comparison', classify as 'Plaintext Password' with HIGH severity. If anti_pattern == 'missing_authentication', classify as 'Missing Authentication' with HIGH severity without further analysis needed.\n"
