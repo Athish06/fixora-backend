@@ -1070,6 +1070,8 @@ async def _receive_scan_results_impl(
                                 'sql', 'injection', 'ssrf', 'xxe', 'traversal', 'exec', 'deserialization', 'xss'
                             ])
                             
+                            is_fixora_custom = rule_id.startswith('fixora-taint-') or rule_id.startswith('fixora-wrapper-')
+                            
                             # Was this wrapper marked vulnerable by the AI for this category?
                             was_flagged_for_injection = any(
                                 vw[0] == w_file and vw[1] == w_start and vw[2] == w_end and 
@@ -1078,7 +1080,8 @@ async def _receive_scan_results_impl(
                             )
                             
                             # If Semgrep says it's SQLi, but the AI mathematically cleared this wrapper for SQLi...
-                            if is_injection_rule and not was_flagged_for_injection:
+                            # We NEVER suppress our own dynamically generated BFS rules (fixora_custom).
+                            if is_injection_rule and not was_flagged_for_injection and not is_fixora_custom:
                                 is_safe = True
                                 logger.info(f"SUPPRESSED false positive {rule_id} in {file_path}:{line_start} (AI cleared this wrapper)")
                                 break
