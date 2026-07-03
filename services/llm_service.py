@@ -174,12 +174,13 @@ def build_function_chunk_prompt(
             f"=== TASK ===\n"
             f"Analyse the {lang_display} wrapper functions below. You have TWO MANDATES:\n"
             "MANDATE 1 (Smart Auditor): Look for structural and logic flaws (e.g., IDOR, Missing Auth, Mass Assignment, Plaintext Passwords).\n"
-            "MANDATE 2 (Mechanical Terminator): Map Terminal Sinks for our Cross-File Taint Resolver. If a function is a generic wrapper around a dangerous module (e.g., executing SQL, running OS commands, making network requests, opening files), you MUST flag it as a HIGH severity injection vulnerability (e.g., SQL Injection, Command Injection). Do NOT evaluate web context for Mandate 2; assume all arguments to these generic utility functions are maliciously tainted.\n"
+            "MANDATE 2 (Pipeline Integrator): You are Step 1 in a larger scanning architecture. Your output is fed directly into Semgrep for cross-file taint analysis. If you see a generic utility function (e.g., executing SQL, running OS commands, making network requests), you MUST flag it as a HIGH severity injection vulnerability. Flagging it does NOT mean it is a vulnerability; it simply registers the function as a Terminal Sink for Semgrep to hook into. You are strictly forbidden from skipping utility functions to avoid 'false positives'—our Graph Engine handles false positives later in the pipeline.\n"
             "For each function, determine if it violates either Mandate 1 or Mandate 2.\n"
             "  - If YES -> include it in the output with vulnerability_type, severity, reason, vulnerable_parameter, malicious_payload, exploit_explanation, and impact_summary.\n"
             "  - If NO  -> skip it entirely.\n\n"
         )
-        rule_c = "C. TERMINAL SINK IDENTIFICATION (CRITICAL FOR MANDATE 2): By flagging a generic utility wrapper (like `def run_query(self, query): db.execute(query)`), you are NOT accusing the utility of being poorly written. You are simply creating a mandatory hook for our mathematical Graph Engine to trace backwards. If you skip a utility wrapper because it 'looks safe' or 'lacks HTTP context', you break the entire scanning pipeline. You MUST flag them as Injections (SQLi, Command Injection, SSRF, Path Traversal).\n"
+        rule_c = "C. TERMINAL SINK JSON OVERRIDE (CRITICAL FOR MANDATE 2): Because you must flag safe-looking utility wrappers to feed our pipeline, you are permitted to use placeholder explanations. When flagging a generic utility wrapper (like `def raw_execute`), use exactly this JSON output for the explanatory fields to avoid hallucinations: Set `malicious_payload` to `\"<SEMGREP_TAINT_SINK>\"`. Set `exploit_explanation` to `\"Terminal sink identified for Semgrep cross-file taint engine.\"` Set `impact_summary` to `\"Depends on the upstream caller.\"` Do NOT skip the function!\n"
+        json_payload_rule = "IMPORTANT: malicious_payload MUST contain ONLY the raw payload value (string/object/array). No comments, no surrounding function call code. If the vulnerability is an architectural flaw (e.g., IDOR, Missing Auth), set malicious_payload to null. If it is a Mandate 2 Terminal Sink, set it to \"<SEMGREP_TAINT_SINK>\". Do NOT hallucinate payloads.\n"
     else:
         task_section = (
             f"=== TASK ===\n"
@@ -190,6 +191,7 @@ def build_function_chunk_prompt(
             "  - If NO  -> skip it entirely.\n\n"
         )
         rule_c = "C. CROSS-FILE & UTILITY METHODS (CRITICAL): If a function is a generic database/system wrapper (e.g. `def run_query(self, query): db.execute(query)`), you MUST flag it as vulnerable! Even if there is no HTTP request visible in the snippet, assume `query` is tainted from a higher-level API route. We rely on you to flag these deep sinks so our Call Graph Resolver can trace them backwards. DO NOT SKIP utility functions just because they lack web context!\n"
+        json_payload_rule = "IMPORTANT: malicious_payload MUST contain ONLY the raw payload value (string/object/array). No comments, no surrounding function call code. If the vulnerability is an architectural flaw (e.g., IDOR, Missing Auth, Plaintext Password) and no specific string payload exists, set malicious_payload to null. Do NOT hallucinate payloads.\n"
 
     return (
         "You are an expert application-security engineer performing static analysis.\n\n"
@@ -241,7 +243,7 @@ def build_function_chunk_prompt(
         + "RESPOND WITH ONLY VALID JSON. No markdown, no text outside the JSON.\n"
         "IMPORTANT: Do NOT include \"source_code\" in your output - I already have it.\n"
         "IMPORTANT: vulnerable_parameter MUST be the exact tainted argument/path (e.g., 'user_id', 'req.body.username', 'request.query_params[\"id\"]').\n"
-        "IMPORTANT: malicious_payload MUST contain ONLY the raw payload value (string/object/array). No comments, no surrounding function call code. If the vulnerability is an architectural flaw (e.g., IDOR, Missing Auth, Plaintext Password) and no specific string payload exists, set malicious_payload to null. Do NOT hallucinate payloads.\n"
+        + json_payload_rule +
         "IMPORTANT: Do not hallucinate affected parameters. If the vulnerability is structural, explain the architecture flaw in exploit_explanation and leave malicious_payload as null.\n"
         "IMPORTANT: exploit_explanation MUST be 1-2 short sentences that explain exactly how this payload is inserted into the vulnerable flow and reaches the sink.\n"
         "IMPORTANT: impact_summary MUST clearly state what data can be leaked/lost/modified and the likely business impact.\n"
