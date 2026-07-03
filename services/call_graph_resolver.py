@@ -124,7 +124,7 @@ def resolve_vulnerable_chains(
                         "function_name": caller_func,
                         "file": caller_file,
                         "cross_file": True,
-                        "promoted_from": vuln_func_name,
+                        "promoted_from": current_name,
                         "vulnerability_type": original_wrapper.get("vulnerability_type", ""),
                         "severity": original_wrapper.get("severity", "MEDIUM"),
                         "reason": (
@@ -133,7 +133,7 @@ def resolve_vulnerable_chains(
                             f"({original_wrapper.get('vulnerability_type', 'unknown')})"
                         ),
                         "source_patterns": original_wrapper.get("source_patterns", []),
-                        "sink_patterns": [f"{vuln_func_name}(...)"],
+                        "sink_patterns": [f"{current_name}(...)"],
                         "sanitizer_patterns": original_wrapper.get("sanitizer_patterns", []),
                         "skip_sanitizer_patterns": [],
                         "vulnerable_parameter": "cross_file_taint",

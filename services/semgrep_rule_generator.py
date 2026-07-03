@@ -138,12 +138,32 @@ def generate_custom_rules(
         return ""
 
     # De-duplicate by rule id (same function name in multiple wrappers → one rule)
-    seen_ids = set()
-    unique_rules = []
+    unique_rules_map = {}
     for rule in rules:
-        if rule["id"] not in seen_ids:
-            seen_ids.add(rule["id"])
-            unique_rules.append(rule)
+        rule_id = rule["id"]
+        if rule_id not in unique_rules_map:
+            unique_rules_map[rule_id] = rule
+        else:
+            existing_rule = unique_rules_map[rule_id]
+            
+            # Merge pattern-sinks
+            if "pattern-sinks" in rule and "pattern-sinks" in existing_rule:
+                for new_sink in rule["pattern-sinks"]:
+                    if new_sink not in existing_rule["pattern-sinks"]:
+                        existing_rule["pattern-sinks"].append(new_sink)
+            
+            # Merge pattern-sources (just in case)
+            if "pattern-sources" in rule and "pattern-sources" in existing_rule:
+                for new_source in rule["pattern-sources"]:
+                    if new_source not in existing_rule["pattern-sources"]:
+                        existing_rule["pattern-sources"].append(new_source)
+                        
+            # Override metadata and message if the new rule is a BFS cross_file rule
+            if rule.get("metadata", {}).get("cross_file"):
+                existing_rule["metadata"] = rule["metadata"]
+                existing_rule["message"] = rule["message"]
+                
+    unique_rules = list(unique_rules_map.values())
 
     yaml_output = yaml.dump(
         {"rules": unique_rules},
