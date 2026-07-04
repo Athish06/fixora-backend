@@ -26,6 +26,7 @@ from services.llm_service import (
 )
 from services.semgrep_rule_generator import generate_custom_rules, count_generated_rules
 from services.call_graph_resolver import resolve_vulnerable_chains
+from utils.encryption import decrypt_api_key
 
 router = APIRouter(prefix='/scan', tags=['Scans'])
 logger = logging.getLogger(__name__)
@@ -404,8 +405,25 @@ async def _process_wrapper_results_in_background(
             msg["scan_id"] = scan_id
             await ws_manager.send_to_scan(scan_id, msg)
 
+        # ── RESOLVE USER'S GROQ API KEY ──────────────────────────────────────
+        user_groq_key = None
+        if user_id:
+            user_doc = await db.users.find_one(
+                {"id": user_id}, {"_id": 0, "encrypted_groq_key": 1}
+            )
+            enc_key = (user_doc or {}).get("encrypted_groq_key")
+            if enc_key:
+                try:
+                    user_groq_key = decrypt_api_key(enc_key)
+                    logger.info(f"[BG] Using user-specific Groq API key for scan {scan_id}")
+                except Exception as key_err:
+                    logger.warning(
+                        f"[BG] Failed to decrypt user Groq key for scan {scan_id}: {key_err}. "
+                        f"Falling back to global key."
+                    )
+
         llm_result = await analyze_wrappers_with_llm(
-            wrapper_data, progress_callback=_chunk_progress
+            wrapper_data, progress_callback=_chunk_progress, api_key=user_groq_key
         )
 
         # Extract chunk metadata before stripping it from the LLM result

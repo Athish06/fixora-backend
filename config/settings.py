@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     
     # Groq (free LLM API - get key at console.groq.com)
     groq_api_key: str = os.environ.get('GROQ_API_KEY', '')
+    groq_encryption_key: str = os.environ.get('GROQ_ENCRYPTION_KEY', '')
     
     # GitHub App
     github_client_id: str = os.environ.get('GITHUB_CLIENT_ID', '')

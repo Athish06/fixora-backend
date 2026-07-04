@@ -772,6 +772,7 @@ def _build_dynamic_chunks(all_wrappers: list) -> list:
 async def analyze_wrappers_with_llm(
     wrapper_data: Dict[str, Any],
     progress_callback=None,
+    api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Two-phase LLM analysis of wrapper functions.
@@ -891,7 +892,7 @@ async def analyze_wrappers_with_llm(
         # ── PHASE 1: identify dangerous sink modules ──────────────────────
         logger.info(f"[{lang_key}] === Phase 1: module sink identification ===")
         sink_modules, sink_reason = await _call_groq_module_phase(
-            lang_key, modules, rate_state
+            lang_key, modules, rate_state, api_key=api_key
         )
         # Store Phase 1 sinks in the merged result immediately
         final_merged_result["results"][lang_key]["modules"]["sink_modules"] = sink_modules
@@ -985,6 +986,7 @@ async def analyze_wrappers_with_llm(
                 chunk_result, meta = await _call_groq_with_retry(
                     chunk_payload, prompt, chunk_idx, len(chunks), lang_key,
                     estimated_tokens, max_completion_tokens, rate_state,
+                    api_key=api_key,
                 )
 
             # Annotate meta with chunk-level details before storing
@@ -1010,6 +1012,7 @@ async def analyze_wrappers_with_llm(
                     chunk_idx=chunk_idx,
                     total_chunks=len(chunks),
                     rate_state=rate_state,
+                    api_key=api_key,
                 )
 
                 if recovered_wrappers:
@@ -1237,6 +1240,7 @@ async def _call_groq_module_phase(
     lang_key: str,
     modules: Dict[str, Any],
     rate_state: dict,
+    api_key: Optional[str] = None,
 ) -> tuple:
     """
     PHASE 1 — identify dangerous sink modules for one language.
@@ -1264,6 +1268,7 @@ async def _call_groq_module_phase(
             prompt,
             context_payload,
             max_completion_tokens=max_completion_tokens,
+            api_key=api_key,
         )
         _record_request(rate_state, estimated_tokens)
 
@@ -1316,6 +1321,7 @@ async def _call_groq_with_retry(
     estimated_tokens: int,
     max_completion_tokens: int,
     rate_state: dict,
+    api_key: Optional[str] = None,
 ) -> tuple:
     """
     Call Groq for a single chunk with up to MAX_RETRIES attempts.
@@ -1351,6 +1357,7 @@ async def _call_groq_with_retry(
             prompt,
             chunk_payload,
             max_completion_tokens=max_completion_tokens,
+            api_key=api_key,
         )
 
         # ── Success ───────────────────────────────────────────────────────
@@ -1405,6 +1412,7 @@ async def _call_groq_api(
     prompt: str,
     context_payload: Dict[str, Any],
     max_completion_tokens: Optional[int] = None,
+    api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Make a single Groq API call with the pre-built *prompt*.
 
@@ -1420,9 +1428,9 @@ async def _call_groq_api(
     """
     from openai import AsyncOpenAI, RateLimitError, APIStatusError
 
-    groq_token = settings.groq_api_key
+    groq_token = api_key or settings.groq_api_key
     if not groq_token:
-        logger.error("GROQ_API_KEY not configured.")
+        logger.error("GROQ_API_KEY not configured — neither user key nor global key available.")
         return _empty_result(context_payload, error="GROQ_API_KEY not configured")
 
     try:
@@ -1523,6 +1531,7 @@ async def _recover_too_large_chunk(
     chunk_idx: int,
     total_chunks: int,
     rate_state: dict,
+    api_key: Optional[str] = None,
 ) -> tuple[list, list]:
     """
     Try to recover a 413/manual-review chunk using tighter source truncation.
@@ -1578,6 +1587,7 @@ async def _recover_too_large_chunk(
             retry_tokens,
             retry_max_completion,
             rate_state,
+            api_key=api_key,
         )
         _record_request(rate_state, retry_tokens)
 
@@ -1641,6 +1651,7 @@ async def _recover_too_large_chunk(
             micro_tokens,
             micro_max_completion,
             rate_state,
+            api_key=api_key,
         )
         _record_request(rate_state, micro_tokens)
 
