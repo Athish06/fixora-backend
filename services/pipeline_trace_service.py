@@ -3,6 +3,7 @@
 
 import logging
 from typing import Dict, Any, List, Optional
+from services.call_graph_resolver import generate_call_graph_trace, get_sample_call_graph_trace
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,10 @@ STAGE_CAPTIONS = {
         "in small batches, and explains exactly how an attacker would "
         "exploit each one."
     ),
+    "bfs_call_graph": (
+        "BFS traverses the call graph backwards from dangerous sinks "
+        "to find which HTTP route handlers can reach them across files."
+    ),
     "scan_comparison": (
         "Vanilla Semgrep is structurally blind to your own wrapper "
         "functions. These rules didn't exist anywhere until this scan."
@@ -49,6 +54,7 @@ STAGE_TITLES = {
     "ast_walk": "AST Walk & Wrapper Extraction",
     "llm_phase1": "AI Sink Identification",
     "llm_phase2": "AI Vulnerability Analysis",
+    "bfs_call_graph": "BFS Call Graph Resolution",
     "scan_comparison": "Traditional vs. Dynamic Scan",
 }
 
@@ -88,6 +94,7 @@ def build_trace(
         _build_ast_walk_stage(wd_results),
         _build_llm_phase1_stage(llm_results),
         _build_llm_phase2_stage(llm_results, chunk_stats_raw),
+        _build_bfs_call_graph_stage(wrapper_data, llm_results, ai_debug_doc),
         _build_scan_comparison_stage(vulnerabilities),
     ]
 
@@ -248,6 +255,48 @@ def _build_llm_phase2_stage(
         "findings": all_findings[:MAX_SAMPLED_FINDINGS],
         "total_findings": len(all_findings),
         "sampled_findings": min(len(all_findings), MAX_SAMPLED_FINDINGS),
+    }
+
+
+def _build_bfs_call_graph_stage(
+    wrapper_data: Dict[str, Any],
+    llm_results: Dict[str, Any],
+    ai_debug_doc: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Stage 5 — BFS Call Graph Resolution.
+    Traces forward adjacency, index inversion, and backward BFS search from sinks to routes.
+    """
+    call_graph = (
+        wrapper_data.get("call_graph")
+        or ai_debug_doc.get("call_graph")
+        or {}
+    )
+    route_map = (
+        wrapper_data.get("route_map")
+        or ai_debug_doc.get("route_map")
+        or {}
+    )
+
+    all_vuln_wrappers = []
+    for lang_key, section in (llm_results or {}).items():
+        if isinstance(section, dict):
+            all_vuln_wrappers.extend(section.get("wrapper_functions") or [])
+
+    if call_graph and all_vuln_wrappers:
+        trace_data = generate_call_graph_trace(
+            call_graph=call_graph,
+            route_map=route_map,
+            vulnerable_wrappers=all_vuln_wrappers,
+        )
+    else:
+        trace_data = get_sample_call_graph_trace()
+
+    return {
+        "id": "bfs_call_graph",
+        "title": STAGE_TITLES["bfs_call_graph"],
+        "caption": STAGE_CAPTIONS["bfs_call_graph"],
+        **trace_data,
     }
 
 

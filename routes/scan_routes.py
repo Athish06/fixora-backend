@@ -461,6 +461,10 @@ async def _process_wrapper_results_in_background(
                 call_graph, route_map_data, all_vuln_wrappers
             )
 
+            if isinstance(wrapper_data, dict):
+                wrapper_data["verified_chains"] = chains
+                wrapper_data["promoted_wrappers"] = promoted
+
             if promoted:
                 logger.info(
                     f"[BG] Call graph promoted {len(promoted)} cross-file wrapper(s) "
@@ -725,6 +729,8 @@ async def _store_ai_debug(
             "failed_chunks": failed_chunks,
             # Functions too large for AI — user must inspect manually
             "manual_review_required": manual_review_required,
+            "verified_chains": wrapper_data.get("verified_chains", []) if isinstance(wrapper_data, dict) else [],
+            "promoted_wrappers": wrapper_data.get("promoted_wrappers", []) if isinstance(wrapper_data, dict) else [],
         }
 
         # MongoDB hard limit is 16 MB per document.  For large repos (e.g. Apache

@@ -65,6 +65,55 @@ async def get_pipeline_trace(
     return trace
 
 
+@router.get('/bfs-trace/{scan_id}')
+async def get_bfs_trace_endpoint(
+    scan_id: str,
+    current_user: TokenData = Depends(get_current_user),
+    db=Depends(get_database)
+):
+    """
+    On-demand endpoint to get detailed BFS call graph execution trace.
+    """
+    ai_debug_doc = await db.ai_debug.find_one({'scan_id': scan_id}, {'_id': 0})
+    if not ai_debug_doc:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    repo = await db.repositories.find_one({'id': ai_debug_doc.get('repository_id'), 'user_id': current_user.user_id})
+    if not repo:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    from services.call_graph_resolver import generate_call_graph_trace, get_sample_call_graph_trace
+
+    wrapper_data = ai_debug_doc.get("wrapper_hunter_results") or {}
+    llm_result = ai_debug_doc.get("llm_result") or {}
+
+    call_graph = wrapper_data.get("call_graph") or ai_debug_doc.get("call_graph") or {}
+    route_map = wrapper_data.get("route_map") or ai_debug_doc.get("route_map") or {}
+
+    all_vuln_wrappers = []
+    for lang_key, section in (llm_result.get("results") or {}).items():
+        if isinstance(section, dict):
+            all_vuln_wrappers.extend(section.get("wrapper_functions") or [])
+
+    if call_graph and all_vuln_wrappers:
+        trace = generate_call_graph_trace(call_graph, route_map, all_vuln_wrappers)
+    else:
+        trace = get_sample_call_graph_trace()
+        trace["no_call_graph_in_scan"] = True
+    return trace
+
+
+@router.get('/bfs-demo')
+async def get_bfs_demo_trace(
+    current_user: TokenData = Depends(get_current_user)
+):
+    """
+    Returns the rich sample BFS trace for demonstration and educational walkthroughs.
+    """
+    from services.call_graph_resolver import get_sample_call_graph_trace
+    return get_sample_call_graph_trace()
+
+
 @router.get('/ast-tree/{scan_id}')
 async def get_ast_tree(
     scan_id: str,
